@@ -160,7 +160,7 @@ This repository was extracted, with full git history, from the
 [MaximEremenko/Utilities](https://github.com/MaximEremenko/Utilities)
 monorepo, where the tool lived at `RMCProfileUtilities/Format_Converter`.
 `js/unified_hdf5.js` originates in this project and is also vendored into
-the companion `3DSCalc` and `diffuse-vis` (DiffuseVis)
+the companion `3DSCalc` and `3DSView`
 repositories.
 
 ## License
