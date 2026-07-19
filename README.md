@@ -50,7 +50,7 @@ automatically from the file content.
 
 ## Getting started
 
-Open `Format_Converter.html` in any modern browser — double-clicking the
+Open `index.html` in any modern browser — double-clicking the
 file works, no web server is required. The app is fully self-contained:
 the HDF5 engine ([h5wasm](https://github.com/usnistgov/h5wasm), WebAssembly)
 is vendored in `js/h5wasm.js` with the `.wasm` binary embedded directly in
@@ -62,7 +62,7 @@ locally:
 python -m http.server
 ```
 
-then browse to `http://localhost:8000/Format_Converter.html`.
+then browse to `http://localhost:8000/`.
 
 ## Usage
 
@@ -115,7 +115,7 @@ in all files, so results are easy to compare.
 
 ## Repository layout
 
-- `Format_Converter.html` — the browser app (UI and conversion driver).
+- `index.html` — the browser app (UI and conversion driver).
 - `js/converter.js` — format readers/writers and the cell/reciprocal-space
   math. Plain JavaScript with a UMD wrapper, also loadable from Node.js for
   testing.
