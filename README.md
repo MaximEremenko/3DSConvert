@@ -1,4 +1,4 @@
-# DiffuseConvert
+# 3DSConvert
 
 A browser-based converter for 3-D single-crystal diffuse-scattering data.
 It translates the same intensity grid between the file formats used by
