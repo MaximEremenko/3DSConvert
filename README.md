@@ -81,7 +81,7 @@ then browse to `http://localhost:8000/Format_Converter.html`.
    `_calc.h5` output), it is used automatically and this section can be left
    empty.
 3. **Output**: pick the target format, optionally set the radiation metadata
-   for HDF5 output, and press "Convert and download". Large `.dat` output is
+   for HDF5 output, and press "Convert & download". Large `.dat` output is
    streamed directly to disk in browsers that support the File System Access
    API (Chromium); elsewhere a chunked in-memory download is used.
 
