@@ -1,5 +1,7 @@
 # 3DSConvert
 
+**Live tool:** https://maximeremenko.github.io/3DSConvert/
+
 A browser-based converter for 3-D single-crystal diffuse-scattering data.
 It translates the same intensity grid between the file formats used by
 RMCProfile, DISCUS, Yell, Meerkat, and Scatty — entirely client-side.
