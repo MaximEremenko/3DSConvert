@@ -25,6 +25,15 @@ function grid(r, s, fn, dims, corner) {
     return model;
 }
 const value = (m, ih, ik, il) => m.values[(il * m.dims[1] + ik) * m.dims[0] + ih];
+// fn(index, h, k, l) over an axis-aligned grid
+const forHkl = (m, fn) => {
+    let i = 0;
+    for (let il = 0; il < m.dims[2]; il++)
+        for (let ik = 0; ik < m.dims[1]; ik++)
+            for (let ih = 0; ih < m.dims[0]; ih++, i++) {
+                fn(i, m.corner[0] + ih * m.vectors[0][0], m.corner[1] + ik * m.vectors[1][1], m.corner[2] + il * m.vectors[2][2]);
+            }
+};
 const run = (model, steps, ctx) => Processing.applyRecipe(model, { steps }, Object.assign({ cell: cubic(4) }, ctx));
 
 test('Laue groups have the right orders and contain the inversion', () => {
@@ -455,4 +464,31 @@ test('maskRings: aluminium powder lines from the lattice parameter', async () =>
     await assert.rejects(run(m, [{ op: 'maskRings', width: 0.01 }], { cell }), /no rings/);
     assert.match(Processing.describeStep(Processing.normalizeRecipe({ steps: [{ op: 'maskRings', powder: 'aluminium', width: 0.03 }] }).steps[0]),
         /of aluminium \(a = 4\.0495 A\) \+\/- 0\.03/);
+});
+
+test('removeRings: sharp rings go by Fourier filtering of the |Q| profile, the diffuse stays', async () => {
+    const a = 4, n = 61, st = 2 / 30, Qof = (h, k, l) => 2 * Math.PI * Math.hypot(h, k, l) / a;
+    let seed = 11;
+    const rnd = () => ((seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0) / 4294967296);
+    const ring = q => 40 * Math.exp(-0.5 * ((q - 2) / 0.01) ** 2);
+    const clean = grid(2, st, (h, k, l) => 10 + Qof(h, k, l) + 3 * Math.cos(Math.PI * h) * Math.cos(Math.PI * k), [n, n, n]);
+    const ringed = grid(2, st, (h, k, l) => 10 + Qof(h, k, l) + 3 * Math.cos(Math.PI * h) * Math.cos(Math.PI * k) +
+        ring(Qof(h, k, l)) + (rnd() - 0.5), [n, n, n]);
+    const logs = [];
+    const out = await run(ringed, [{ op: 'removeRings', width: 0.005, cutoff: 0.05 }], { log: t => logs.push(t) });
+    assert.match(logs.join(' '), /sharpest rings at \|Q\| 2\.00/);
+    const excess = (m, lo, hi) => {
+        let s = 0, c = 0;
+        forHkl(m, (i, h, k, l) => {
+            const q = Qof(h, k, l);
+            if (q >= lo && q < hi) { s += m.values[i] - clean.values[i]; c++; }
+        });
+        return s / c;
+    };
+    assert.ok(excess(ringed, 1.99, 2.01) > 25);
+    assert.ok(Math.abs(excess(out, 1.99, 2.01)) < 0.1 * excess(ringed, 1.99, 2.01), 'the ring is gone');
+    assert.ok(Math.abs(excess(out, 2.4, 3)) < 0.1, 'the rest stays');
+    // only near the lines of a named powder: aluminium has none at 2.00 1/A
+    const kept = await run(ringed, [{ op: 'removeRings', width: 0.005, cutoff: 0.05, powder: 'aluminium', near: 0.03 }]);
+    assert.ok(excess(kept, 1.99, 2.01) > 25);
 });

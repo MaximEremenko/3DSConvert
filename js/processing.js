@@ -290,6 +290,7 @@
         combine: { scale: 1 },
         clip: { below: 0, to: 0 },
         symmetrize: { mode: 'average', expand: true, k: 3 },
+        removeRings: { width: 0.005, cutoff: 0.05, sectors: 1, coverage: 0.25, positive: true, powder: 'none', near: 0 },
         deltaPdf: { taper: 0, engine: 'cpu', fill: 0 },
         normalize: { background: '', backgroundNorm: '', scale: 1, fitScale: false, laue: 'none' },
     };
@@ -599,6 +600,212 @@
         ctx.log('B(|Q|) at ' + table.filter((_, i) => i % every === 0)
             .map(([q, b]) => `${q.toFixed(2)}: ${b.toPrecision(4)}`).join(', '));
         return subtractCurve(model, ctx.cell, backgroundCurve('table', table));
+    }
+
+    // In-place radix-2 FFT of interleaved complex data (length a power of 2).
+    function fft1(re, im, inverse) {
+        const n = re.length;
+        for (let i = 1, j = 0; i < n; i++) {
+            let bit = n >> 1;
+            for (; j & bit; bit >>= 1) j ^= bit;
+            j ^= bit;
+            if (i < j) {
+                [re[i], re[j]] = [re[j], re[i]];
+                [im[i], im[j]] = [im[j], im[i]];
+            }
+        }
+        for (let len = 2; len <= n; len <<= 1) {
+            const ang = (inverse ? 2 : -2) * Math.PI / len, wr = Math.cos(ang), wi = Math.sin(ang);
+            for (let i = 0; i < n; i += len) {
+                let cr = 1, ci = 0;
+                for (let j = 0; j < len / 2; j++) {
+                    const a = i + j, b = a + len / 2;
+                    const xr = re[b] * cr - im[b] * ci, xi = re[b] * ci + im[b] * cr;
+                    re[b] = re[a] - xr;
+                    im[b] = im[a] - xi;
+                    re[a] += xr;
+                    im[a] += xi;
+                    const t = cr * wr - ci * wi;
+                    ci = cr * wi + ci * wr;
+                    cr = t;
+                }
+            }
+        }
+        if (inverse) for (let i = 0; i < n; i++) { re[i] /= n; im[i] /= n; }
+    }
+
+    // Gaussian low-pass of a profile sampled every `step`, sigma in the same
+    // units, as a product in Fourier space. The straight line between the
+    // end values is taken out first and the rest mirrored at the ends, so
+    // nothing wraps round and a sloping profile keeps its ends.
+    function lowPass(p, step, sigma) {
+        const n = p.length;
+        const trend = i => (n > 1 ? p[0] + (p[n - 1] - p[0]) * i / (n - 1) : p[0]);
+        let L = 1;
+        while (L < 2 * n) L <<= 1;
+        const re = new Float64Array(L), im = new Float64Array(L);
+        for (let i = 0; i < L; i++) {
+            const j = i < n ? i : i < 2 * n ? 2 * n - 1 - i : -1;
+            re[i] = j < 0 ? 0 : p[j] - trend(j);
+        }
+        fft1(re, im, false);
+        const s = sigma / step;
+        for (let k = 0; k < L; k++) {
+            const f = Math.min(k, L - k) / L;                    // cycles per sample
+            const g = Math.exp(-2 * Math.PI * Math.PI * s * s * f * f);
+            re[k] *= g;
+            im[k] *= g;
+        }
+        fft1(re, im, true);
+        return Float64Array.from({ length: n }, (_, i) => re[i] + trend(i));
+    }
+
+    // Unit directions spread evenly over the sphere (a Fibonacci lattice).
+    function sphereDirections(n) {
+        const out = [], golden = Math.PI * (3 - Math.sqrt(5));
+        for (let i = 0; i < n; i++) {
+            const z = 1 - (2 * i + 1) / n, r = Math.sqrt(1 - z * z), t = golden * i;
+            out.push([r * Math.cos(t), r * Math.sin(t), z]);
+        }
+        return out;
+    }
+
+    // Powder rings removed by Fourier filtering of the |Q| profile: the
+    // median of every |Q| bin (per direction sector when sectors > 1) is
+    // split into a smooth part and what is sharper than `cutoff` (1/A) by a
+    // Gaussian low-pass in Fourier space, run again on the profile clipped
+    // to that smooth part until it passes under the rings. The sharp,
+    // positive remainder - the rings - is subtracted from every voxel at
+    // that |Q|; anisotropic diffuse scattering is untouched. With a powder,
+    // only near its lines (within `near` 1/A).
+    function stepRemoveRings(model, step, ctx) {
+        needCell(ctx.cell, 'ring removal');
+        const w = step.width, nsec = Math.max(1, Math.round(step.sectors));
+        const Q = qMatrix(ctx.cell), dirs = nsec > 1 ? sphereDirections(nsec) : null;
+        const N = voxelCount(model), v = model.values;
+        const bin = new Int32Array(N).fill(-1), sec = nsec > 1 ? new Uint16Array(N) : null, qs = new Float32Array(N);
+        const q0 = mulMV(Q, model.corner), [qa, qb, qc] = model.vectors.map(u => mulMV(Q, u));
+        const [nh, nk, nl] = model.dims;
+        let nb = 0, i = 0;
+        for (let il = 0; il < nl; il++)
+            for (let ik = 0; ik < nk; ik++)
+                for (let ih = 0; ih < nh; ih++, i++) {
+                    const x = q0[0] + ih * qa[0] + ik * qb[0] + il * qc[0];
+                    const y = q0[1] + ih * qa[1] + ik * qb[1] + il * qc[1];
+                    const z = q0[2] + ih * qa[2] + ik * qb[2] + il * qc[2];
+                    const q = Math.sqrt(x * x + y * y + z * z);
+                    qs[i] = q;
+                    if (sec && q > 0) {
+                        let best = 0, bd = -2;
+                        for (let d = 0; d < nsec; d++) {
+                            const c = (dirs[d][0] * x + dirs[d][1] * y + dirs[d][2] * z) / q;
+                            if (c > bd) { bd = c; best = d; }
+                        }
+                        sec[i] = best;
+                    }
+                    if (v[i] === v[i]) {
+                        bin[i] = Math.floor(q / w);
+                        if (bin[i] + 1 > nb) nb = bin[i] + 1;
+                    }
+                }
+        if (!nb) throw new Error('ring removal: no finite values');
+        // medians per (sector, bin), by a counting sort of the values
+        const key = j => (sec ? sec[j] : 0) * nb + bin[j];
+        const counts = new Int32Array(nsec * nb + 1);
+        for (let j = 0; j < N; j++) if (bin[j] >= 0) counts[key(j) + 1]++;
+        for (let t = 0; t < nsec * nb; t++) counts[t + 1] += counts[t];
+        const sorted = new Float32Array(counts[nsec * nb]), at = counts.slice(0, nsec * nb);
+        for (let j = 0; j < N; j++) if (bin[j] >= 0) sorted[at[key(j)]++] = v[j];
+        const lines = step.powder && step.powder !== 'none'
+            ? powderLines(step.powder, step.a, (nb + 1) * w) : null;
+        const near = step.near > 0 ? step.near : 2 * step.cutoff;
+        // voxels a whole shell (of this sector) would hold: 4 pi q^2 w over
+        // the Q volume of a voxel (2 pi q w over its area for a single layer)
+        const flat = [0, 1, 2].filter(a => model.dims[a] <= 1);
+        const cellQ = flat.length ? Math.hypot(...cross(...[qa, qb, qc].filter((_, a) => !flat.includes(a)).slice(0, 2)))
+            : Math.abs(det3([qa, qb, qc]));
+        const fullShell = b => ((flat.length ? 2 * Math.PI * (b + 0.5) * w : 4 * Math.PI * ((b + 0.5) * w) ** 2) * w) / cellQ / nsec;
+        const ringAt = new Float64Array(nsec * nb);
+        let strongest = [];
+        for (let s = 0; s < nsec; s++) {
+            // the median of each bin and its uncertainty, 1.2533 x 1.4826 x
+            // MAD / sqrt(n): a bin with few voxels or spread values (partial
+            // shells in the corners, strong anisotropic diffuse) needs more
+            // to count as a ring
+            const p = new Float64Array(nb).fill(NaN), err = new Float64Array(nb).fill(Infinity);
+            for (let b = 0; b < nb; b++) {
+                const part = sorted.subarray(counts[s * nb + b], counts[s * nb + b + 1]);
+                if (part.length < 3) continue;
+                p[b] = medianOf(part, part.length);
+                if (part.length < step.coverage * fullShell(b)) continue;         // too little of the shell to judge
+                const dev = Float64Array.from(part, x => Math.abs(x - p[b]));
+                err[b] = 1.2533 * 1.4826 * medianOf(dev, dev.length) / Math.sqrt(part.length);
+            }
+            const known = [];
+            for (let b = 0; b < nb; b++) if (p[b] === p[b]) known.push(b);
+            if (known.length < 8) continue;
+            // gaps bridged linearly, ends held, for the transform only
+            const full = new Float64Array(nb);
+            for (let t = 0, b = 0; b < nb; b++) {
+                while (t + 1 < known.length && known[t + 1] <= b) t++;
+                const lo = known[t], hi = known[Math.min(known.length - 1, t + 1)];
+                full[b] = b <= lo || hi === lo ? p[lo] : p[lo] + (p[hi] - p[lo]) * (b - lo) / (hi - lo);
+                if (b < known[0]) full[b] = p[known[0]];
+            }
+            // only excess above four times that is clipped and counts as a ring
+            const typical = medianOf(Float64Array.from(known, b => Math.abs(p[b])), known.length);
+            const tol = Float64Array.from(err, e => Math.max(4 * (e < Infinity ? e : 0), 1e-3 * typical));
+            for (let b = 0; b < nb; b++) if (!(err[b] < Infinity)) tol[b] = Infinity;
+            let smooth = lowPass(full, w, step.cutoff);
+            for (let it = 0; it < 12; it++) {
+                const clipped = Float64Array.from(full, (x, b) => Math.min(x, smooth[b] + (tol[b] < Infinity ? tol[b] : 0)));
+                smooth = lowPass(clipped, w, step.cutoff);
+            }
+            const r = new Float64Array(nb);
+            for (let b = 0; b < nb; b++) {
+                if (p[b] !== p[b]) continue;
+                r[b] = p[b] - smooth[b];
+                if (step.positive && r[b] < 0) r[b] = 0;
+            }
+            // runs of positive excess that rise above the noise are rings,
+            // subtracted whole (their tails too); the rest is left
+            for (let b = 0; b < nb;) {
+                if (!(r[b] > 0)) {
+                    b++;
+                    continue;
+                }
+                let e = b, top = 0, qtop = 0, above = false;
+                while (e < nb && r[e] > 0) {
+                    if (r[e] > top) { top = r[e]; qtop = (e + 0.5) * w; }
+                    if (r[e] > tol[e]) above = true;
+                    e++;
+                }
+                const keep = above && (!lines || lines.some(l => Math.abs(qtop - l) <= near));
+                for (let t = b; t < e; t++) ringAt[s * nb + t] = keep ? r[t] : 0;
+                if (keep) strongest.push([top, qtop]);
+                b = e;
+            }
+            if (!step.positive) {
+                for (let b = 0; b < nb; b++) if (r[b] < 0 && -r[b] > tol[b]) ringAt[s * nb + b] = r[b];
+            }
+        }
+        // subtracted with linear interpolation between bin centres
+        const values = copyValues(model);
+        for (let j = 0; j < N; j++) {
+            if (values[j] !== values[j]) continue;
+            const f = qs[j] / w - 0.5, b0 = Math.max(0, Math.min(nb - 1, Math.floor(f))), b1 = Math.min(nb - 1, b0 + 1);
+            const t = Math.min(1, Math.max(0, f - b0)), base = (sec ? sec[j] : 0) * nb;
+            values[j] -= (1 - t) * ringAt[base + b0] + t * ringAt[base + b1];
+        }
+        strongest = strongest.sort((x, y) => y[0] - x[0]);
+        const peaks = [];
+        for (const [r, q] of strongest) {
+            if (peaks.length >= 6) break;
+            if (!peaks.some(([, p]) => Math.abs(p - q) < 3 * w)) peaks.push([r, q]);
+        }
+        ctx.log(peaks.length ? 'sharpest rings at |Q| ' + peaks.map(([r, q]) => `${q.toFixed(3)} (${r.toPrecision(3)})`).join(', ') + ' 1/A'
+            : 'no ring sharper than the cutoff found');
+        return withValues(model, values);
     }
 
     // Combine with another volume, sampled onto this grid.
@@ -1314,7 +1521,7 @@
     // ------------------------------------------------------------------ recipe
 
     // Steps that act on hkl / |Q| and so need reciprocal-space data.
-    const RECIPROCAL_ONLY = new Set(['maskBragg', 'maskRings', 'backgroundFunction', 'backgroundShells', 'deltaPdf']);
+    const RECIPROCAL_ONLY = new Set(['maskBragg', 'maskRings', 'backgroundFunction', 'backgroundShells', 'deltaPdf', 'removeRings']);
 
     const STEPS = {
         crop: { run: stepCrop, fields: { h: 'range?', k: 'range?', l: 'range?' } },
@@ -1323,6 +1530,13 @@
         maskBragg: { run: stepMaskBragg, fields: { shape: 'string', size: 'positive', centring: 'string' } },
         maskRings: { run: stepMaskRings, fields: { q: 'numbers?', width: 'positive', powder: 'powder', a: 'number?' } },
         maskRange: { run: stepMaskRange, fields: { min: 'number?', max: 'number?' } },
+        removeRings: {
+            run: stepRemoveRings,
+            fields: {
+                width: 'positive', cutoff: 'positive', sectors: 'sectors', coverage: 'fraction', positive: 'boolean',
+                powder: 'powder', a: 'number?', near: 'number',
+            },
+        },
         scale: { run: stepScale, fields: { factor: 'number', offset: 'number', positive: 'boolean' } },
         smooth: { run: stepSmooth, fields: { sigma: 'positive' } },
         fill: { run: stepFill, fields: { passes: 'passes' } },
@@ -1358,6 +1572,8 @@
             'string?': v => v === undefined || v === null || typeof v === 'string',
             'laue?': v => v === 'none' || LAUE_GROUPS.includes(v),
             symMode: v => ['average', 'fill', 'median', 'clip'].includes(v),
+            sectors: v => Number.isInteger(v) && v >= 1 && v <= 256,
+            fraction: v => finite(v) && v >= 0 && v <= 1,
             any: v => v !== undefined,
         }[kind];
         if (!ok(value)) throw new Error(`${where}: invalid value ${JSON.stringify(value)}`);
@@ -1399,6 +1615,9 @@
                 (step.powder && step.powder !== 'none'
                     ? `${(step.q || []).length ? ' and' : ''} of ${step.powder} (a = ${step.a > 0 ? step.a : POWDER[step.powder].a} A)` : '') +
                 ` +/- ${step.width} 1/A`;
+            case 'removeRings': return `remove rings sharper than ${step.cutoff} 1/A by Fourier filtering of the |Q| profile ` +
+                `(bins of ${step.width} 1/A${step.sectors > 1 ? `, ${step.sectors} direction sectors` : ''}` +
+                (step.powder && step.powder !== 'none' ? `, only near the ${step.powder} lines` : '') + ')';
             case 'maskRange': return `mask values outside ${step.min === undefined || step.min === null ? '-inf' : step.min}..${step.max === undefined || step.max === null ? 'inf' : step.max}`;
             case 'scale': return `scale: I * ${step.factor} + ${step.offset}` + (step.positive ? ', then shift up to positive' : '');
             case 'smooth': return `Gaussian smoothing, sigma ${step.sigma} voxel${step.sigma === 1 ? '' : 's'} (empty voxels left out)`;
