@@ -362,10 +362,13 @@ NaN marks masked or missing voxels throughout, and |Q| is Cartesian in
 | Resample | NaN-aware trilinear interpolation onto a new axis-aligned hkl grid |
 | Rebin | averages blocks of voxels, skipping NaN |
 | Mask Bragg positions | boxes (half-width in r.l.u.) or spheres (radius in 1/Angstrom) around integer hkl, for P, I, F, C, A, B or R lattices |
-| Mask powder rings | voxels within ±w of given \|Q\| values |
+| Mask powder rings | voxels within ±w of given \|Q\| values, or of the powder lines of an aluminium, copper or vanadium sample holder (from its lattice parameter, room temperature by default) |
 | Mask values | values outside a range |
-| Scale and offset | I × factor + offset |
-| Background B(\|Q\|) | subtracts a constant, linear, a − b·c^\|Q\| or tabulated function of \|Q\| |
+| Fill empty voxels | empty voxels next to data take the mean of their measured neighbours, n layers deep |
+| Scale and offset | I × factor + offset; optionally then shifted up by 1.01 × the lowest value, so every value is positive (RMCProfile reads I = 0 as masked) |
+| Smooth | Gaussian, σ in voxels; empty voxels neither count nor get filled; uncertainties are dropped |
+| Normalize by Mantid norms | Σdata/Σnorm − s·Σbkg/Σbkg_norm from MDNorm's component volumes, summed over Laue equivalents if asked; s given, or fitted by least squares of data/norm against bkg/bkg_norm (on real CORELLI data the fit comes out near 0, so check it) |
+| Background B(\|Q\|) | subtracts a constant, linear, a − b·c^\|Q\| or tabulated function of \|Q\| (two table rows at one \|Q\| make a step) |
 | Background from \|Q\| shells | subtracts the minimum or a percentile of each \|Q\| shell, optionally smoothed over neighbouring shells |
 | Combine | subtracts, adds, multiplies or divides by another volume (times a factor), interpolated onto this grid if the grids differ |
 | Replace low values | sets values below a threshold to a number or NaN |

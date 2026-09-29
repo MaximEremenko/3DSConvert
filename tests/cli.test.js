@@ -110,3 +110,20 @@ test('cli: streamed text (hkl list for Spinteract, binary VTK)', () => {
     const grid = H.Converter.readVtkBinary(bytes);
     assert.deepEqual(grid.dims, [5, 5, 5]);
 });
+
+test('cli: --zero-empty reads the zeros of an RMCProfile .dat as no data', () => {
+    const rows = ['8 1'];
+    let n = 0;
+    for (let k = 1; k <= 2; k++) for (let j = 1; j <= 2; j++) for (let i = 1; i <= 2; i++) {
+        rows.push(`${i} ${j} ${k} ${0.5 * i} ${0.5 * j} ${0.5 * k} ${n++ === 3 ? 0 : n}`);
+    }
+    const dat = path.join(work, 'zeros.dat');
+    fs.writeFileSync(dat, rows.join('\n') + '\n');
+    const nan = file => Array.from(H.Converter.readNpz(fs.readFileSync(file)).values).filter(x => Number.isNaN(x)).length;
+    const plain = path.join(work, 'zeros_plain.npz'), empty = path.join(work, 'zeros_empty.npz');
+    assert.equal(cli(dat, '--to', 'npz', '--cell', '4,4,4,90,90,90', '-o', plain).code, 0);
+    const r = cli(dat, '--to', 'npz', '--cell', '4,4,4,90,90,90', '--zero-empty', '-o', empty);
+    assert.equal(r.code, 0, r.err);
+    assert.match(r.err, /1 voxels holding 0 read as no data/);
+    assert.deepEqual([nan(plain), nan(empty)], [0, 1]);
+});

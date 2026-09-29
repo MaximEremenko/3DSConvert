@@ -131,6 +131,21 @@ function converterWorker(self, h5wasm, Converter, Processing, wgpuFftWeb) {
         return readTextVolume(file, opts);
     }
 
+    // 0 as "no data": RMCProfile .dat files, and Scatty's and Spinteract's
+    // VTK, write empty or masked points as 0. Those voxels become NaN.
+    function zeroesToEmpty(volume) {
+        const src = volume.model || volume.grid, v = src.values;
+        let n = 0;
+        for (let i = 0; i < v.length; i++) {
+            if (v[i] === 0) {
+                v[i] = NaN;
+                n++;
+            }
+        }
+        src.notes = (src.notes || []).concat(`${n} voxels holding 0 read as no data`);
+        return volume;
+    }
+
     // Old-format .dat, VTK or an hkl list, parsed as a stream: { kind, grid }
     // or, for an hkl list (placed on opts.grid when a config gives one),
     // { kind, model }.
@@ -629,7 +644,7 @@ function converterWorker(self, h5wasm, Converter, Processing, wgpuFftWeb) {
         // files: the selected data file, or a NeXus file plus the files its
         // external links point to; paths: their folder-relative paths (may be
         // empty); nexusPath: the NXdata group to read (default: @default).
-        async loadData({ files, paths, yellSpace, nexusPath, crop, readSigma, grid }, ctx) {
+        async loadData({ files, paths, yellSpace, nexusPath, crop, readSigma, grid, zeroEmpty }, ctx) {
             state.data = null;
             state.plan = null;
             state.processed = null;
@@ -661,6 +676,7 @@ function converterWorker(self, h5wasm, Converter, Processing, wgpuFftWeb) {
             const opts = { size: file.size, tick: ctx.tick, progress: f => ctx.progress('Reading', f), crop, sigma: !!readSigma, grid };
             if (!hdf5[main]) {
                 state.data = await readOtherVolume(file, opts);
+                if (zeroEmpty) zeroesToEmpty(state.data);
                 return { result: Object.assign(summarize(state.data), { main: file.name }) };
             }
 
@@ -700,6 +716,7 @@ function converterWorker(self, h5wasm, Converter, Processing, wgpuFftWeb) {
                     extra.nexusPath = path;
                 }
                 state.data = { kind, model };
+                if (zeroEmpty) zeroesToEmpty(state.data);
             } finally {
                 if (f) f.close();
             }
@@ -737,7 +754,7 @@ function converterWorker(self, h5wasm, Converter, Processing, wgpuFftWeb) {
         // Volumes for the recipe's combine steps, named by their file names.
         // They are read whole and kept; Q-space text grids get their hkl
         // axes from the parent cell when a recipe uses them.
-        async loadExtras({ files, readSigma }, ctx) {
+        async loadExtras({ files, readSigma, zeroEmpty }, ctx) {
             state.extras = {};
             state.extrasVersion++;
             state.files.extras = (files || []).filter(Boolean);
@@ -758,6 +775,7 @@ function converterWorker(self, h5wasm, Converter, Processing, wgpuFftWeb) {
                         f.close();
                     }
                 }
+                if (zeroEmpty) zeroesToEmpty(volume);
                 state.extras[file.name] = volume;
                 out.push(Object.assign({ name: file.name }, summarize(volume)));
             }

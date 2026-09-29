@@ -349,6 +349,7 @@
       const s = await run('Reading…', 'loadData', {
         files, paths: files.map(f => f.webkitRelativePath || ''),
         yellSpace: $('yellSpace').value, nexusPath: nexusPath || null, crop: readCrop(), readSigma: $('readSigma').checked,
+        zeroEmpty: $('zeroEmpty').checked,
         grid: state.gridConfig ? state.gridConfig.grids[pickGrid(state.gridConfig, files[0] && files[0].name)] : null,
       });
       if (!s) return;
@@ -424,10 +425,12 @@
     }
     return Object.keys(crop).length ? crop : null;
   }
-  $('readSigma').addEventListener('change', () => {
-    if (state.dataFiles.length && !current) loadDataFile(state.data && state.data.nexusPath);
-    if (state.extraFiles.length && !current) loadExtras(state.extraFiles);
-  });
+  for (const id of ['readSigma', 'zeroEmpty']) {
+    $(id).addEventListener('change', () => {
+      if (state.dataFiles.length && !current) loadDataFile(state.data && state.data.nexusPath);
+      if (state.extraFiles.length && !current) loadExtras(state.extraFiles);
+    });
+  }
   for (const input of $('cropRow').querySelectorAll('input')) {
     input.addEventListener('change', () => {
       if (state.dataFiles.length && !current) loadDataFile(state.data && state.data.nexusPath);
@@ -1191,7 +1194,7 @@
     state.extraNames = [];
     renderExtras();
     try {
-      const list = await run('Reading volumes…', 'loadExtras', { files, readSigma: $('readSigma').checked });
+      const list = await run('Reading volumes…', 'loadExtras', { files, readSigma: $('readSigma').checked, zeroEmpty: $('zeroEmpty').checked });
       state.extraNames = list.map(x => x.name);
       for (const x of list) {
         log(`Volume "${x.name}": grid ${x.dims.join(' x ')}` + (x.frame === 'q' ? ' in Q' : ''), 'ok');
@@ -2334,7 +2337,7 @@
         const cfg = state.gridConfig;
         const s = await run(`Reading ${i + 1}/${files.length}…`, 'loadData', {
           files: [file], paths: [''], yellSpace: $('yellSpace').value, nexusPath: null, crop: readCrop(),
-          readSigma: $('readSigma').checked, grid: cfg ? cfg.grids[pickGrid(cfg, file.name)] : null,
+          readSigma: $('readSigma').checked, zeroEmpty: $('zeroEmpty').checked, grid: cfg ? cfg.grids[pickGrid(cfg, file.name)] : null,
         });
         if (!s || !s.dims) throw new Error(s && s.cellFiles ? 'the file holds a unit cell, not a volume' : 'no data read');
         log(`${label}: ${KIND_LABEL[s.kind] || s.kind} | grid ${s.dims.join(' x ')}`, 'ok');

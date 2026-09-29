@@ -1286,7 +1286,9 @@
             case 'resample': return 'resample onto' + ['h', 'k', 'l'].map(n => ` ${n} ${step[n][0]}..${step[n][1]} step ${step[n][2]}`).join(',');
             case 'rebin': return `rebin by ${step.factors.join(' x ')}`;
             case 'maskBragg': return `mask Bragg positions (${step.shape} ${step.size}${step.shape === 'sphere' ? ' 1/A' : ' r.l.u.'}, centring ${step.centring})`;
-            case 'maskRings': return 'mask powder rings' + ((step.q || []).length ? ` at |Q| ${step.q.join(', ')}` : '') +
+            case 'maskRings': return 'mask powder rings' + ((step.q || []).length > 6
+                ? ` at ${step.q.length} |Q| from ${+Math.min(...step.q).toFixed(4)} to ${+Math.max(...step.q).toFixed(4)}`
+                : (step.q || []).length ? ` at |Q| ${step.q.join(', ')}` : '') +
                 (step.powder && step.powder !== 'none'
                     ? `${(step.q || []).length ? ' and' : ''} of ${step.powder} (a = ${step.a > 0 ? step.a : POWDER[step.powder].a} A)` : '') +
                 ` +/- ${step.width} 1/A`;

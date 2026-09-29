@@ -49,6 +49,7 @@ Unit cell (for Q-space inputs and outputs)
 Input
       --crop h=LO:HI,k=LO:HI,l=LO:HI  read only this hkl box (HDF5, .npz, .json)
       --sigma             read uncertainties where the file has them
+      --zero-empty        0 means no data (RMCProfile .dat, Scatty/Spinteract VTK)
       --nexus-path P      the NXdata group to read
       --linked FILE       a file an input's external links point to (repeat)
       --yell-space reciprocal   read a Yell file with a corrupted is_direct
@@ -93,6 +94,7 @@ function parseArgs(argv) {
             case '--cell-source': o.cellSource = take(a); break;
             case '--crop': o.crop = take(a); break;
             case '--sigma': o.sigma = true; break;
+            case '--zero-empty': o.zeroEmpty = true; break;
             case '--nexus-path': o.nexusPath = take(a); break;
             case '--linked': o.linked.push(take(a)); break;
             case '--yell-space': o.yellSpace = take(a); break;
@@ -327,7 +329,7 @@ async function main(argv) {
         say(`Structure ${path.basename(o.structure)}: cell ${s.lengths.map(x => +x.toFixed(5)).join(' ')} / ${s.angles.map(x => +x.toFixed(3)).join(' ')}`);
     }
     if (o.extra.length) {
-        const vols = await engine.call('loadExtras', { files: o.extra.map(f => new DiskFile(f)), readSigma: !!o.sigma });
+        const vols = await engine.call('loadExtras', { files: o.extra.map(f => new DiskFile(f)), readSigma: !!o.sigma, zeroEmpty: !!o.zeroEmpty });
         for (const v of vols) say(`Volume ${v.name}: grid ${v.dims.join(' x ')}`);
     }
     const outDir = o.outDir || '.';
@@ -344,7 +346,7 @@ async function main(argv) {
             const grid = gridConfig ? gridConfig.grids[Math.min(gridConfig.grids.length - 1, gridIndex(gridConfig, input))] : null;
             const data = await engine.call('loadData', {
                 files, paths: files.map(() => ''), yellSpace: o.yellSpace || 'auto', nexusPath: o.nexusPath || null,
-                crop, readSigma: !!o.sigma, grid,
+                crop, readSigma: !!o.sigma, grid, zeroEmpty: !!o.zeroEmpty,
             }, hooks);
             endProgress();
             if (!data || !data.dims) throw new Error(data && data.cellFiles ? 'this file holds a unit cell, not a volume; pass it with --structure' : 'no data read');
