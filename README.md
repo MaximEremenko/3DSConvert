@@ -59,9 +59,12 @@ automatically from the file content.
   of the parent cell. Files with several symmetry sections are read using
   the section 1 coordinates. RMCProfile's `*_calc.dat` output adds
   `scale offset` to the header; they are logged and the intensities are
-  kept as stored. Fortran `D` exponents are accepted. On output, NaN or
-  infinite intensities are written as 0.0, which RMCProfile treats as a
-  masked point (points with I = 0 are left out of the fit).
+  kept as stored. Fortran `D` exponents are accepted, and a row may wrap
+  over several lines. Grid points missing from a file are read as NaN; when
+  pixel (1,1,1) or its neighbours are among them, the grid geometry is
+  fitted to all rows. On output, NaN or infinite intensities are written as
+  0.0, which RMCProfile treats as a masked point (points with I = 0 are left
+  out of the fit).
 - **VTK**: ASCII `STRUCTURED_POINTS`. In Scatty (`*_sc.vtk`) and Spinteract
   (`*_img_NN.vtk`) output, `ORIGIN` and `SPACING` are cartesian Q in
   1/Angstrom (2*pi convention, the same as the old text format); values run
@@ -93,8 +96,10 @@ file works, no web server is required. The app is fully self-contained:
 the HDF5 engine ([h5wasm](https://github.com/usnistgov/h5wasm), WebAssembly)
 is vendored in `js/h5wasm.js` with the `.wasm` binary embedded directly in
 the script, so nothing is fetched at runtime and the page works from a
-`file://` URL as well as from any static host. If you prefer serving it
-locally:
+`file://` URL as well as from any static host. The reading and conversion
+run in a Web Worker that the page builds from the loaded scripts, so the
+page stays responsive and this also works from `file://`. If you prefer
+serving it locally:
 
 ```
 python -m http.server
@@ -121,9 +126,29 @@ then browse to `http://localhost:8000/`.
    `_calc.h5` output), it is used automatically and this section can be left
    empty.
 3. **Output**: pick the target format, optionally set the radiation metadata
-   for HDF5 output, and press "Convert & download". Large `.dat` output is
-   streamed directly to disk in browsers that support the File System Access
-   API (Chromium); elsewhere a chunked in-memory download is used.
+   for HDF5 output, and press "Convert & download". For HDF5 output you can
+   also choose
+   - the precision of the data array: the same as the input (float32 data
+     stay float32), float64, or float32;
+   - the unified layout: both `/scattering/data` and `/entry/data` (the
+     default), or `/entry/data` only, which halves the file;
+   - gzip compression, which is slower to write.
+
+   Text output (`.dat`, `.vtk`) is streamed directly to disk in browsers
+   that support the File System Access API (Chromium); elsewhere a chunked
+   in-memory download is used. The log reports the expected output size
+   first, and reading and writing show progress and can be cancelled.
+
+### Large files
+
+Data files are read without first loading them into memory: HDF5 files
+are mounted in the worker and read slab by slab, and text files are parsed
+as a stream (an 860 MB, 10-million-row `.dat` reads in about 5 s). Text
+files are parsed once when loaded; changing the cell afterwards needs no
+re-read. The limits are the browser's: the volume itself must fit in
+memory, and an HDF5 output file is assembled in memory, which Chrome and
+Edge cap at about 2 GB; float32, the `/entry/data`-only layout or
+compression reduce it. Text output streamed to disk has no such limit.
 
 ### When is the unit cell required?
 
@@ -156,7 +181,9 @@ in all files, so results are easy to compare.
 
 ## Repository layout
 
-- `index.html` — the browser app (UI and conversion driver).
+- `index.html` — the browser app (UI); it starts the conversion worker.
+- `js/worker.js` — the conversion worker: file mounting, loading, conversion
+  planning and output, driven by messages from the page.
 - `js/converter.js` — format readers/writers and the cell/reciprocal-space
   math. Plain JavaScript with a UMD wrapper, also loadable from Node.js for
   testing.
@@ -166,7 +193,7 @@ in all files, so results are easy to compare.
   (see Provenance).
 - `js/h5wasm.js` — vendored h5wasm bundle (see Third-party code).
 - `Examples/` — the example dataset described above.
-- `tests/` — Node.js regression tests (see Validation).
+- `tests/` — Node.js regression tests and a browser test (see Validation).
 
 ## Validation
 
@@ -196,8 +223,16 @@ npm test
 ```
 
 They round-trip the examples through every format and cover the reader
-edge cases described under Format notes. GitHub Actions runs them on every
-push.
+edge cases described under Format notes. A browser test drives
+`index.html` from `file://` in headless Chrome or Edge through the
+DevTools protocol, feeding files into the page and checking the downloads
+(set `CHROME` to the browser executable if it is not found):
+
+```
+npm run test:e2e
+```
+
+GitHub Actions runs both on every push.
 
 ## Third-party code
 
@@ -205,7 +240,9 @@ push.
 [h5wasm](https://github.com/usnistgov/h5wasm) 0.10.3 (the HDF5 library
 compiled to WebAssembly; this bundle embeds libhdf5 2.0.0). It is
 distributed under the NIST and HDF5 license terms reproduced in
-[`js/h5wasm-LICENSE.txt`](js/h5wasm-LICENSE.txt).
+[`js/h5wasm-LICENSE.txt`](js/h5wasm-LICENSE.txt). The only change is a
+wrapper: the bundle's code sits inside a function, `h5wasmModule()`, whose
+source text the page uses to start the HDF5 engine in its Web Worker.
 
 ## Provenance
 
