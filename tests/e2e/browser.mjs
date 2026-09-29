@@ -12,6 +12,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const require = createRequire(import.meta.url);
 const H = require('../helpers.js');
+const NX = require('../nexus-fixtures.js');
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 
 // CHROME, else the usual install folders (from the environment) and PATH.
@@ -40,6 +41,20 @@ fs.writeFileSync(path.join(work, 'rotated_sc.vtk'), H.vtkText('TITLE diffuse sca
     [-t, -t, -t].map(x => x.toFixed(6)), [t * Math.SQRT2 / 2, t, 0].map(x => x.toFixed(6)),
     Array.from({ length: 15 }, (_, i) => i + 1)));
 fs.writeFileSync(path.join(work, 'scatty_config.txt'), 'CENTRE 0 0 0\nX_AXIS 1 1 0 2\nY_AXIS 0 0 1 1\nZ_AXIS 0 0 0 0\n');
+
+// NeXus inputs: a Mantid MDHistoWorkspace with a [H,H,0] projection, and an
+// NXrefine-like entry whose data sit in a second file behind an external link.
+const h5wasm = await H.loadH5wasm();
+async function saveH5(filePromise, name) {
+    const file = await filePromise;
+    fs.writeFileSync(path.join(work, name), h5wasm.FS.readFile(file.filename));
+    file.close();
+}
+await saveH5(NX.mantidFile({ W: [1, -1, 0, 1, 1, 0, 0, 0, 1], names: ['[H,H,0]', '[-H,H,0]', '[0,0,L]'] }), 'projected.nxs');
+await saveH5(H.buildH5(f => f.create_group('entry').create_group('data').create_dataset({
+    name: 'v', data: NX.fastestFirst(5, 4, 3, Float32Array), shape: [3, 4, 5], dtype: '<f',
+})), 't.nxs');
+await saveH5(NX.nxrefineFile({ link: 'scan/t.nxs' }), 'wrapper.nxs');
 
 const port = 9300 + Math.floor(Math.random() * 600);
 const args = ['--headless=new', `--remote-debugging-port=${port}`, `--user-data-dir=${path.join(work, 'profile')}`,
@@ -112,7 +127,7 @@ async function fresh() {
 async function setFile(selector, file) {
     const doc = await send('DOM.getDocument', {});
     const q = await send('DOM.querySelector', { nodeId: doc.result.root.nodeId, selector });
-    const r = await send('DOM.setFileInputFiles', { files: [file], nodeId: q.result.nodeId });
+    const r = await send('DOM.setFileInputFiles', { files: [].concat(file), nodeId: q.result.nodeId });
     if (r.error) throw new Error(r.error.message);
 }
 const setValue = (id, v) => evaluate(`(() => { const e = document.getElementById(${JSON.stringify(id)});
@@ -170,6 +185,25 @@ const scenarios = [
     ['plugin-compressed HDF5 is refused', async () => {
         await setFile('#dataFile', path.join(ROOT, 'tests/fixtures/yell_lzf.h5'));
         await waitLog(/compressed with LZF \(filter id 32000\)/);
+    }],
+    ['Mantid MDHistoWorkspace with a [H,H,0] projection -> Yell', async () => {
+        await setFile('#dataFile', path.join(work, 'projected.nxs'));
+        await waitLog(/Mantid MDHistoWorkspace \| grid 4 x 3 x 2/);
+        await setValue('outFormat', 'yell');
+        const model = await H.Converter.readYell(await H.openH5Bytes(fs.readFileSync(await convert('projected_yell.h5'))));
+        if (H.maxAbsDiff(model.vectors.flat(), [0.5, 0.5, 0, -2, 2, 0, 0, 0, 1]) > 1e-12) {
+            throw new Error('wrong grid vectors ' + JSON.stringify(model.vectors));
+        }
+        if (NX.at(model, 3, 2, 1) !== NX.code(3, 2, 1)) throw new Error('values out of place');
+    }],
+    ['NeXus entry + externally linked data file -> unified', async () => {
+        await setFile('#dataFile', [path.join(work, 'wrapper.nxs'), path.join(work, 't.nxs')]);
+        await waitLog(/linked files: t\.nxs as scan\/t\.nxs/);
+        await waitLog(/NeXus \/entry\/transform \| grid 5 x 4 x 3/);
+        await setValue('outFormat', 'unified');
+        const model = await H.Converter.readUnifiedData(await H.openH5Bytes(fs.readFileSync(await convert('wrapper_unified.h5'))));
+        if (NX.at(model, 4, 3, 2) !== NX.code(4, 3, 2)) throw new Error('values out of place');
+        if (H.maxAbsDiff(model.corner, [-1, -1.5, 0]) > 1e-12) throw new Error('corner ' + model.corner);
     }],
 ];
 
