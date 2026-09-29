@@ -126,6 +126,232 @@
   });
   showTheme();
 
+  // ------------------------------------------------------------ layout
+  // The panels' columns and order, the first column's width, the log's
+  // height and which side the columns are on: changed by dragging (or the
+  // keyboard) and kept in this browser.
+  const LAYOUT_KEY = '3dsconvert-layout';
+  const workspace = document.querySelector('.workspace');
+  const COLUMNS = [document.querySelector('.flow'), document.querySelector('.side')];
+  const PANELS = ['dataCard', 'cellCard', 'procCard', 'outCard', 'previewCard', 'logCard'];
+  const defaultLayout = () => ({
+    cols: [['dataCard', 'cellCard', 'procCard', 'outCard'], ['previewCard', 'logCard']], flowW: null, logH: null, swapped: false,
+  });
+  let layout = defaultLayout();
+  try {
+    const saved = JSON.parse(localStorage.getItem(LAYOUT_KEY) || 'null');
+    const ids = saved && Array.isArray(saved.cols) && saved.cols.length === 2 && saved.cols.every(Array.isArray) ? saved.cols.flat() : [];
+    if (ids.length === PANELS.length && PANELS.every(id => ids.includes(id))) {
+      const size = (x, lo, hi) => (Number.isFinite(x) && x >= lo && x <= hi ? Math.round(x) : null);
+      layout = { cols: saved.cols, flowW: size(saved.flowW, 280, 4000), logH: size(saved.logH, 80, 4000), swapped: !!saved.swapped };
+    }
+  } catch (_) {
+    // no saved layout
+  }
+  function saveLayout() {
+    try {
+      localStorage.setItem(LAYOUT_KEY, JSON.stringify(layout));
+    } catch (_) {
+      // the layout is not kept
+    }
+  }
+  const setVar = (node, name, px) => (px ? node.style.setProperty(name, `${px}px`) : node.style.removeProperty(name));
+  function applyLayout() {
+    layout.cols.forEach((ids, c) => ids.forEach(id => COLUMNS[c].appendChild($(id))));
+    setVar(workspace, '--flow-w', layout.flowW);
+    setVar(workspace, '--log-h', layout.logH);
+    workspace.classList.toggle('swapped', layout.swapped);
+    $('colSplit').setAttribute('aria-valuenow', String(Math.round(COLUMNS[0].getBoundingClientRect().width)));
+  }
+  // The order as the page shows it, after a move.
+  function readLayout() {
+    layout.cols = COLUMNS.map(col => Array.from(col.children).filter(n => PANELS.includes(n.id)).map(n => n.id));
+    saveLayout();
+  }
+  applyLayout();
+
+  // Dragging a bar: onMove gets the pointer's offset from where it started.
+  function dragBar(bar, onStart, onMove) {
+    bar.addEventListener('pointerdown', ev => {
+      if (ev.button !== 0) return;
+      ev.preventDefault();
+      const x0 = ev.clientX, y0 = ev.clientY, start = onStart();
+      bar.classList.add('dragging');
+      try {
+        bar.setPointerCapture(ev.pointerId);
+      } catch (_) {
+        // not a live pointer (synthetic events)
+      }
+      const move = e => onMove(start, e.clientX - x0, e.clientY - y0);
+      const up = () => {
+        bar.classList.remove('dragging');
+        bar.removeEventListener('pointermove', move);
+        bar.removeEventListener('pointerup', up);
+        bar.removeEventListener('pointercancel', up);
+        saveLayout();
+      };
+      bar.addEventListener('pointermove', move);
+      bar.addEventListener('pointerup', up);
+      bar.addEventListener('pointercancel', up);
+    });
+  }
+  // The first column's width, leaving the other at least 360 px.
+  function setFlowWidth(w) {
+    const room = workspace.clientWidth - 48 - 20;
+    layout.flowW = Math.round(Math.max(320, Math.min(room - 360, w)));
+    applyLayout();
+  }
+  const flowWidth = () => COLUMNS[0].getBoundingClientRect().width;
+  dragBar($('colSplit'), flowWidth, (w0, dx) => setFlowWidth(w0 + (layout.swapped ? -dx : dx)));
+  $('colSplit').addEventListener('keydown', ev => {
+    const step = { ArrowLeft: -24, ArrowRight: 24 }[ev.key];
+    if (step) {
+      ev.preventDefault();
+      setFlowWidth(flowWidth() + (layout.swapped ? -step : step));
+      saveLayout();
+    } else if (ev.key === 'Enter' || ev.key === 'Home') {
+      ev.preventDefault();
+      layout.flowW = null;
+      applyLayout();
+      saveLayout();
+    }
+  });
+  $('colSplit').addEventListener('dblclick', () => {
+    layout.flowW = null;
+    applyLayout();
+    saveLayout();
+  });
+  // The log's height; in the preview's column the preview keeps 380 px.
+  function setLogHeight(h) {
+    const col = $('logCard').parentElement;
+    const room = col === COLUMNS[1] && $('previewCard').parentElement === col && window.innerWidth > 1100
+      ? col.clientHeight - 380 - 14 : 2000;
+    layout.logH = Math.round(Math.max(90, Math.min(room, h)));
+    applyLayout();
+  }
+  const logHeight = () => $('logCard').getBoundingClientRect().height;
+  dragBar($('logSplit'), logHeight, (h0, dx, dy) => setLogHeight(h0 - dy));
+  $('logSplit').addEventListener('keydown', ev => {
+    const step = { ArrowUp: 24, ArrowDown: -24 }[ev.key];
+    if (step) {
+      ev.preventDefault();
+      setLogHeight(logHeight() + step);
+      saveLayout();
+    } else if (ev.key === 'Enter' || ev.key === 'Home') {
+      ev.preventDefault();
+      layout.logH = null;
+      applyLayout();
+      saveLayout();
+    }
+  });
+  $('logSplit').addEventListener('dblclick', () => {
+    layout.logH = null;
+    applyLayout();
+    saveLayout();
+  });
+
+  // Moving a panel: drag its grip onto a column (before the panel under the
+  // pointer), or focus the grip and press the arrow keys (up and down within
+  // the column, left and right to the other one).
+  let movingPanel = null;
+  const clearDropMarks = () => {
+    for (const n of document.querySelectorAll('.drop-before, .drop-end')) n.classList.remove('drop-before', 'drop-end');
+  };
+  // The panel of this column the pointer is above the middle of (null: the end).
+  const panelAt = (col, y) => Array.from(col.children).find(n => PANELS.includes(n.id) && n !== movingPanel &&
+    y < n.getBoundingClientRect().top + n.getBoundingClientRect().height / 2) || null;
+  for (const id of PANELS) {
+    const panel = $(id), grip = panel.querySelector('.grip');
+    grip.addEventListener('dragstart', ev => {
+      movingPanel = panel;
+      ev.dataTransfer.effectAllowed = 'move';
+      ev.dataTransfer.setData('text/plain', 'panel');
+      ev.dataTransfer.setDragImage(panel, 28, 22);
+      panel.classList.add('moving');
+    });
+    grip.addEventListener('dragend', () => {
+      movingPanel = null;
+      panel.classList.remove('moving');
+      clearDropMarks();
+    });
+    grip.addEventListener('keydown', ev => {
+      const col = panel.parentElement, c = COLUMNS.indexOf(col);
+      if (ev.key === 'ArrowUp' || ev.key === 'ArrowDown') {
+        const sib = ev.key === 'ArrowUp' ? panel.previousElementSibling : panel.nextElementSibling;
+        if (!sib || !PANELS.includes(sib.id)) return;
+        ev.preventDefault();
+        col.insertBefore(panel, ev.key === 'ArrowUp' ? sib : sib.nextElementSibling);
+      } else if (ev.key === 'ArrowLeft' || ev.key === 'ArrowRight') {
+        const other = COLUMNS[1 - c];
+        const toward = (ev.key === 'ArrowRight') !== layout.swapped ? 1 : 0;
+        if (COLUMNS.indexOf(other) !== toward) return;
+        ev.preventDefault();
+        other.appendChild(panel);
+      } else {
+        return;
+      }
+      readLayout();
+      grip.focus();
+      panel.scrollIntoView({ block: 'nearest' });
+    });
+  }
+  for (const col of COLUMNS) {
+    col.addEventListener('dragover', ev => {
+      if (!movingPanel) return;
+      ev.preventDefault();
+      ev.dataTransfer.dropEffect = 'move';
+      clearDropMarks();
+      const at = panelAt(col, ev.clientY);
+      if (at) at.classList.add('drop-before');
+      else col.classList.add('drop-end');
+    });
+    col.addEventListener('drop', ev => {
+      if (!movingPanel) return;
+      ev.preventDefault();
+      const at = panelAt(col, ev.clientY);
+      col.insertBefore(movingPanel, at);
+      clearDropMarks();
+      readLayout();
+    });
+  }
+  COLUMNS.forEach(col => col.addEventListener('dragleave', ev => {
+    if (!col.contains(ev.relatedTarget)) clearDropMarks();
+  }));
+
+  const layoutMenu = $('layoutMenu');
+  function closeLayoutMenu() {
+    layoutMenu.hidden = true;
+    $('layoutBtn').setAttribute('aria-expanded', 'false');
+  }
+  $('layoutBtn').addEventListener('click', ev => {
+    ev.stopPropagation();
+    const open = layoutMenu.hidden;
+    layoutMenu.hidden = !open;
+    $('layoutBtn').setAttribute('aria-expanded', String(open));
+    if (open) layoutMenu.querySelector('button').focus();
+  });
+  layoutMenu.addEventListener('keydown', ev => {
+    if (ev.key === 'Escape') {
+      closeLayoutMenu();
+      $('layoutBtn').focus();
+    }
+  });
+  document.addEventListener('click', ev => {
+    if (!layoutMenu.hidden && !layoutMenu.contains(ev.target)) closeLayoutMenu();
+  });
+  $('layoutSwap').addEventListener('click', () => {
+    layout.swapped = !layout.swapped;
+    applyLayout();
+    saveLayout();
+    closeLayoutMenu();
+  });
+  $('layoutReset').addEventListener('click', () => {
+    layout = defaultLayout();
+    applyLayout();
+    saveLayout();
+    closeLayoutMenu();
+  });
+
   // ------------------------------------------------------------ worker
   // All reading, processing and writing run in a Web Worker built from the
   // source of h5wasmModule, ConverterFactory, ProcessingFactory,
@@ -214,8 +440,10 @@
 
   let seriesRunning = false;
   function updateButton() {
-    $('convertBtn').disabled = !state.data || !!current || seriesRunning;
-    $('seriesBtn').disabled = !!current || seriesRunning;
+    const busy = !!current || seriesRunning;
+    $('convertBtn').disabled = !state.data || busy;
+    $('processBtn').disabled = !state.data || busy || !activeRecipe().length;
+    $('seriesBtn').disabled = busy;
     updateOutput();
   }
 
@@ -1049,7 +1277,7 @@
   // The recipe, cell or volumes changed: the output choices and a processed
   // preview may no longer hold.
   function stepsChanged() {
-    updateOutput();
+    updateButton();
     markPreviewStale();
     if (preview.view === 'profile' && preview.stage === 'input') {
       clearTimeout(preview.ptimer);
@@ -1228,8 +1456,10 @@
     // slice zoom (scale and offset in CSS pixels of the plot) and its plane;
     // the |Q| range shown in the profile (null: all)
     zoom: { z: 1, x: 0, y: 0, key: '' }, qRange: null,
-    // a custom plane: its normal and level; the frame ('grid' or 'cartesian')
-    vector: [1, -1, 0], level: null, frame: 'grid',
+    // a custom plane: its normal, the point it goes through (null: the
+    // middle of the data) and its offset t along the unit normal (null: from
+    // the slider index, else 0); the frame ('grid' or 'cartesian')
+    vector: [1, -1, 0], origin: null, offset: null, frame: 'grid',
     ready: false, stale: false, seq: 0, timer: 0, ptimer: 0,
   };
 
@@ -1246,7 +1476,8 @@
     preview.ready = false;
     preview.stale = false;
     preview.index = null;
-    preview.level = null;
+    preview.origin = null;
+    preview.offset = null;
     preview.normal = s ? (s.dims.indexOf(1) >= 0 ? s.dims.indexOf(1) : 2) : 2;
     $('customRow').hidden = true;
     preview.profile = null;
@@ -1287,9 +1518,9 @@
 
   function markPreviewStale() {
     setPreviewButtons();
-    if (preview.stage !== 'processed' || preview.stale) return;
+    if (!preview.ready || preview.stale) return;
     preview.stale = true;
-    $('previewSub').textContent = 'the recipe changed · press After recipe to update';
+    if (preview.stage === 'processed') $('previewSub').textContent = 'the recipe changed · press Process to update';
   }
 
   async function loadSlice() {
@@ -1304,18 +1535,26 @@
         cell: previewCell(), ub: currentUB(), point: preview.index === null ? point : null,
       };
       if (preview.normal === 'custom') {
+        const o = preview.origin;
         args.vector = preview.vector;
-        args.level = preview.level;
+        args.origin = o && names && names.every(k => k in o) ? names.map(k => o[k]) : null;
+        args.offset = preview.offset;
       }
       const plane = await client.call('slice', args).promise;
       if (token !== preview.seq) return;
       preview.plane = plane;
       preview.index = plane.normal.index;
       if (preview.normal === 'custom') {
-        preview.level = plane.normal.level;
-        $('normalNote').textContent = `layers ${plane.normal.name} = const · x ∥ ${plane.x.name}, y ∥ ${plane.y.name}`;
+        const n = plane.normal, xyz = v => v.map(x => fmtNum(x)).join(' ');
+        preview.offset = n.level;
+        ['origin0', 'origin1', 'origin2'].forEach((id, i) => {
+          if (document.activeElement !== $(id)) $(id).value = fmtNum(n.origin[i]);
+        });
+        $('normalNote').textContent = `${plane.x.name} ∥ ${n.text.u}, ${plane.y.name} ∥ ${n.text.v}` +
+          `${plane.skew ? ' (square to u in Q)' : ''} · centre ${xyz(n.centre)} · t along n̂`;
       }
-      const zoomKey = `${plane.width}x${plane.height} ${plane.x.name} ${plane.y.name}`;
+      const zoomKey = `${plane.width}x${plane.height} ${plane.x.name} ${plane.y.name}` +
+        (plane.general && plane.normal.unit ? ` ${plane.normal.unit.join(' ')}` : '');
       if (zoomKey !== preview.zoom.key) {
         preview.zoom.key = zoomKey;
         resetZoom();
@@ -1406,8 +1645,16 @@
     const p = preview.plane, x = pixelPoint(p, ix, iy);
     preview.point = Object.fromEntries((p.names || ['h', 'k', 'l']).map((n, i) => [n, x[i]]));
     preview.cursor = null;
+    // custom planes go through it too; this one (it lies on it) now from t = 0
+    preview.origin = Object.assign({}, preview.point);
     placeMark();
-    $('readout').textContent = readoutAt(ix, iy) + '   · pinned; the other planes go through it';
+    const text = readoutAt(ix, iy) + '   · pinned; the other planes go through it';
+    $('readout').textContent = text;
+    if (preview.normal === 'custom') {
+      preview.offset = null;
+      preview.index = null;
+      loadSlice().then(() => { $('readout').textContent = text; });
+    }
   }
 
   function percentile(sorted, p) {
@@ -1420,10 +1667,8 @@
     const canvas = $('sliceCanvas'), w = p.width, h = p.height, v = p.values;
     canvas.width = w;
     canvas.height = h;
-    const spanX = Math.abs(p.x.to - p.x.from) || 1, spanY = Math.abs(p.y.to - p.y.from) || 1;
-    canvas.style.aspectRatio = String(Math.min(4, Math.max(0.25, spanX / spanY)));
-    applyZoom();                                // also picks the rendering: voxels when coarse or zoomed
-    const direct = [p.x.name, p.y.name, p.normal.name].includes('u');
+    fitCanvas();                                // also picks the rendering: voxels when coarse or zoomed
+    const direct = (p.names || [])[0] === 'u';
     const logScale = $('logScale').checked && !direct;
     $('logScale').disabled = direct;
     // Robust range from a sample of the finite values.
@@ -1571,7 +1816,7 @@
     } else if (ev.key === 'PageUp' || ev.key === 'PageDown') {
       ev.preventDefault();
       preview.index = Math.min(p.normal.n - 1, Math.max(0, p.normal.index + (ev.key === 'PageUp' ? 1 : -1)));
-      preview.level = null;
+      preview.offset = null;
       loadSlice();
     } else if (ev.key === '+' || ev.key === '=' || ev.key === '-' || ev.key === '_') {
       ev.preventDefault();
@@ -1590,6 +1835,32 @@
   // middle), dragging pans, 0 or a double-click shows the whole plane. The
   // canvas keeps its voxels; the layer holding it and the pin is scaled.
   const drag = { at: null, moved: false };
+  // The largest box of the plane's proportions (its spans, so lengths stay
+  // true) that fits the plot area; the zoom works inside it.
+  // In the column that stays in view the area fills the preview panel;
+  // elsewhere it is as high as the plot, up to 64 % of the window.
+  const wideWindow = window.matchMedia('(min-width: 1101px)');
+  function fitCanvas() {
+    const area = $('plotArea'), wrap = $('canvasWrap'), p = preview.plane;
+    const fill = wideWindow.matches && $('previewCard').parentElement === COLUMNS[1];
+    const W = area.clientWidth, H = fill ? area.clientHeight : Math.min(0.64 * window.innerHeight, 560);
+    if (p && W && H) {
+      const spanX = Math.abs(p.x.to - p.x.from) || 1, spanY = Math.abs(p.y.to - p.y.from) || 1;
+      const ratio = Math.min(4, Math.max(0.25, spanX / spanY));
+      const w = Math.max(40, Math.floor(Math.min(W, H * ratio))), h = Math.max(40, Math.floor(Math.min(H, W / ratio)));
+      wrap.style.width = `${w}px`;
+      wrap.style.height = `${h}px`;
+      area.style.height = fill ? '' : `${h}px`;
+    }
+    applyZoom();
+  }
+  new ResizeObserver(() => {
+    if (preview.view === 'slice') fitCanvas();
+    else if (preview.profile) drawProfile();
+  }).observe($('plotArea'));
+  new ResizeObserver(() => {
+    if (preview.view === 'profile' && preview.profile) drawProfile();
+  }).observe($('profileCanvas'));
   function applyZoom() {
     const wrap = $('canvasWrap'), zm = preview.zoom, W = wrap.clientWidth, H = wrap.clientHeight;
     zm.z = Math.min(64, Math.max(1, zm.z));
@@ -1656,7 +1927,7 @@
   window.addEventListener('resize', applyZoom);
   $('sliceIndex').addEventListener('input', () => {
     preview.index = Number($('sliceIndex').value);
-    preview.level = null;
+    preview.offset = null;
     clearTimeout(preview.timer);
     preview.timer = setTimeout(loadSlice, 40);
   });
@@ -1669,7 +1940,7 @@
       return;
     }
     if (preview.normal === 'custom') {
-      preview.level = x;
+      preview.offset = x;
       preview.index = null;
     } else {
       preview.index = Math.min(p.normal.n - 1, Math.max(0, indexOf(p.normal, x)));
@@ -1705,23 +1976,41 @@
     b.addEventListener('click', () => {
       preview.normal = b.dataset.normal === 'custom' ? 'custom' : Number(b.dataset.normal);
       preview.index = null;
-      preview.level = null;
+      preview.offset = null;
       $('customRow').hidden = preview.normal !== 'custom';
       setPreviewButtons();
       loadSlice();
     });
   }
-  // A typed normal: its layers through the pinned point, else through 0.
+  // A typed normal: its plane through the origin (t = 0).
   const readNormal = () => {
     const v = ['normal0', 'normal1', 'normal2'].map(id => parseNum($(id).value));
     if (!v.every(Number.isFinite) || v.every(x => x === 0)) return;
     preview.vector = v;
     preview.index = null;
-    preview.level = null;
+    preview.offset = null;
     clearTimeout(preview.timer);
     preview.timer = setTimeout(loadSlice, 200);
   };
   for (const id of ['normal0', 'normal1', 'normal2']) $(id).addEventListener('input', readNormal);
+  // A typed point the plane goes through (t = 0 there); middle: the data's.
+  const readOrigin = () => {
+    const v = ['origin0', 'origin1', 'origin2'].map(id => parseNum($(id).value));
+    const names = preview.plane && preview.plane.names;
+    if (!v.every(Number.isFinite) || !names) return;
+    preview.origin = Object.fromEntries(names.map((k, i) => [k, v[i]]));
+    preview.index = null;
+    preview.offset = null;
+    clearTimeout(preview.timer);
+    preview.timer = setTimeout(loadSlice, 200);
+  };
+  for (const id of ['origin0', 'origin1', 'origin2']) $(id).addEventListener('input', readOrigin);
+  $('originMiddle').addEventListener('click', () => {
+    preview.origin = null;
+    preview.index = null;
+    preview.offset = null;
+    loadSlice();
+  });
   $('cartesian').addEventListener('change', () => {
     preview.frame = $('cartesian').checked ? 'cartesian' : 'grid';
     loadSlice();
@@ -1751,22 +2040,33 @@
         refreshPreview();
         return;
       }
-      const params = checkedParams();
-      if (!params) return;
-      try {
-        const r = await run('Processing for the preview…', 'previewRecipe', params);
-        preview.stage = 'processed';
-        preview.ready = true;
-        preview.stale = false;
-        preview.index = null;
-        log(`Preview of the processed data: grid ${r.dims.join(' x ')}` + (r.axesType === 'uvw' ? ' in direct space (u, v, w)' : ''), 'ok');
-        setPreviewButtons();
-        await refreshPreview();
-      } catch (e) {
-        log(e.cancelled ? 'Cancelled.' : 'Error: ' + e.message, e.cancelled ? 'warn' : 'err');
-      }
+      processForPreview();
     });
   }
+
+  // Run the recipe and show its result in the preview (the stage buttons
+  // compare it with the data as read). The worker keeps the result, so a
+  // Download with the same data, cell and recipe writes it as it is.
+  async function processForPreview() {
+    const params = checkedParams();
+    if (!params) return;
+    try {
+      const r = await run('Processing…', 'previewRecipe', params);
+      preview.stage = 'processed';
+      preview.ready = true;
+      preview.stale = false;
+      preview.index = null;
+      log(`Preview of the processed data: grid ${r.dims.join(' x ')}` + (r.axesType === 'uvw' ? ' in direct space (u, v, w)' : ''), 'ok');
+      setPreviewButtons();
+      await refreshPreview();
+    } catch (e) {
+      log(e.cancelled ? 'Cancelled.' : 'Error: ' + e.message, e.cancelled ? 'warn' : 'err');
+    }
+  }
+  $('processBtn').addEventListener('click', () => {
+    clearLog();
+    processForPreview();
+  });
 
   // ------------------------------------------------------------ |Q| profile
   function showView() {
@@ -1833,7 +2133,7 @@
 
   function drawProfile() {
     const canvas = $('profileCanvas'), p = preview.profile, dpr = window.devicePixelRatio || 1;
-    const W = Math.max(200, Math.round(canvas.clientWidth * dpr)), H = Math.round(380 * dpr);
+    const W = Math.max(200, Math.round(canvas.clientWidth * dpr)), H = Math.round(Math.max(200, canvas.clientHeight || 380) * dpr);
     canvas.width = W;
     canvas.height = H;
     const ctx = canvas.getContext('2d');
@@ -2301,6 +2601,14 @@
     try {
       const outName = await convertLoaded(params, state.data.baseName || 'converted', state.data.axesType, BROWSER_SAVER);
       $('outDetail').textContent = `Saved ${outName}`;
+      // the worker now holds this recipe's result: the processed preview is current
+      if (params.recipe && (!preview.ready || preview.stale)) {
+        const shown = preview.stage === 'processed';
+        preview.ready = true;
+        preview.stale = false;
+        setPreviewButtons();
+        if (shown) refreshPreview();
+      }
     } catch (e) {
       if (e.cancelled) log('Cancelled.', 'warn');
       else log('Error: ' + e.message, 'err');

@@ -46,6 +46,8 @@
   <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 4v11M7.5 10.5 12 15l4.5-4.5M4 20h16"/></symbol>
   <symbol id="i-undo" viewBox="0 0 24 24"><path d="M9 14 4 9l5-5M4 9h10.5a5.5 5.5 0 0 1 0 11H11"/></symbol>
   <symbol id="i-code" viewBox="0 0 24 24"><path d="M9 7 4 12l5 5M15 7l5 5-5 5"/></symbol>
+  <symbol id="i-grip" viewBox="0 0 24 24"><path d="M9 6h.01M15 6h.01M9 12h.01M15 12h.01M9 18h.01M15 18h.01" stroke-width="3.2"/></symbol>
+  <symbol id="i-columns" viewBox="0 0 24 24"><path d="M5 4h14a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2zM10 4v16"/></symbol>
   <symbol id="i-copy" viewBox="0 0 24 24"><path d="M10 8h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2h-8a2 2 0 0 1-2-2v-8a2 2 0 0 1 2-2zM4 16V6a2 2 0 0 1 2-2h10"/></symbol>
 </svg>
 
@@ -59,6 +61,15 @@
   <span class="pill ok"><svg class="i s15"><use href="#i-lock"/></svg>Runs locally · files never leave this computer</span>
   <a class="toplink" href="https://github.com/MaximEremenko/3DSConvert#readme" target="_blank" rel="noopener">
     <svg class="i s16"><use href="#i-help"/></svg><span>Guide</span></a>
+  <div class="anchor">
+    <button type="button" id="layoutBtn" class="btn theme-btn" aria-haspopup="true" aria-expanded="false" aria-label="Panel layout" title="Panel layout">
+      <svg class="i"><use href="#i-columns"/></svg></button>
+    <div class="menu" id="layoutMenu" hidden>
+      <button type="button" id="layoutSwap"><span>Swap the columns</span><small>the preview on the other side</small></button>
+      <button type="button" id="layoutReset"><span>Reset the layout</span><small>panels, widths and heights as they came</small></button>
+      <p class="sub">Drag a panel by its grip to move it (or focus the grip and use the arrow keys); drag the bars between the columns and above the log to resize.</p>
+    </div>
+  </div>
   <button type="button" id="themeBtn" class="btn theme-btn" aria-label="Switch to the dark theme">
     <svg class="i"><use href="#i-moon"/></svg></button>
 </header>
@@ -68,6 +79,7 @@
 
   <section class="card" id="dataCard">
     <div class="card-head">
+      <button type="button" class="grip" draggable="true" aria-label="Move the Data panel" title="Drag to move the panel (arrow keys too)"><svg class="i s16"><use href="#i-grip"/></svg></button>
       <span class="num">1</span><h2>Data</h2><span class="sub">format detected from the file content</span>
       <div class="spacer"></div>
       <button type="button" class="btn" id="replaceBtn" hidden><svg class="i s16"><use href="#i-folder"/></svg>Replace</button>
@@ -121,9 +133,9 @@
     </details>
   </section>
 
-  <div class="waiting-group" id="afterData">
   <section class="card" id="cellCard">
     <div class="card-head">
+      <button type="button" class="grip" draggable="true" aria-label="Move the Unit cell panel" title="Drag to move the panel (arrow keys too)"><svg class="i s16"><use href="#i-grip"/></svg></button>
       <span class="num">2</span><h2>Unit cell</h2><span class="sub" id="cellNote">used for |Q|, Q axes and text output</span>
       <div class="spacer"></div>
       <div class="seg" role="group" aria-label="Cell source" id="cellSource">
@@ -168,6 +180,7 @@
 
   <section class="card" id="procCard">
     <div class="card-head">
+      <button type="button" class="grip" draggable="true" aria-label="Move the Processing panel" title="Drag to move the panel (arrow keys too)"><svg class="i s16"><use href="#i-grip"/></svg></button>
       <span class="num">3</span><h2>Processing</h2><span class="sub" id="stepSummary">optional; the steps run in order</span>
       <div class="spacer"></div>
       <button type="button" class="btn icon" id="undoBtn" aria-label="Undo the last recipe change" title="Undo (Ctrl+Z)" disabled><svg class="i s16"><use href="#i-undo"/></svg></button>
@@ -208,6 +221,7 @@
 
   <section class="card" id="outCard">
     <div class="card-head">
+      <button type="button" class="grip" draggable="true" aria-label="Move the Output panel" title="Drag to move the panel (arrow keys too)"><svg class="i s16"><use href="#i-grip"/></svg></button>
       <span class="num">4</span><h2>Output</h2><span class="sub">pick a format; options it does not use are greyed out</span>
     </div>
     <div class="formats" id="formatCards">
@@ -250,12 +264,15 @@
       <select id="compression" hidden><option value="0">none</option><option value="4">gzip</option></select>
     </div>
   </section>
-  </div>
 </div>
+
+<div class="colsplit" id="colSplit" role="separator" aria-orientation="vertical" aria-label="Resize the columns" tabindex="0"
+  title="Drag to resize the columns; double-click resets"></div>
 
 <aside class="side">
   <section class="card" id="previewCard">
     <div class="card-head">
+      <button type="button" class="grip" draggable="true" aria-label="Move the Preview panel" title="Drag to move the panel (arrow keys too)"><svg class="i s16"><use href="#i-grip"/></svg></button>
       <h2>Preview</h2><span class="sub" id="previewSub"></span>
       <div class="spacer"></div>
       <div class="seg" role="group" aria-label="View" id="viewSeg">
@@ -264,13 +281,13 @@
       </div>
       <div class="seg" role="group" aria-label="Stage" id="stageSeg">
         <button type="button" data-stage="input" aria-pressed="true">As read</button>
-        <button type="button" data-stage="processed" aria-pressed="false">After recipe</button>
+        <button type="button" data-stage="processed" aria-pressed="false" title="The data after the recipe (runs it when needed)">Processed</button>
       </div>
       <div class="seg" role="group" aria-label="Plane" id="planeSeg">
         <button type="button" data-normal="2" aria-pressed="true">(h k 0)</button>
         <button type="button" data-normal="1" aria-pressed="false">(h 0 l)</button>
         <button type="button" data-normal="0" aria-pressed="false">(0 k l)</button>
-        <button type="button" data-normal="custom" aria-pressed="false" title="A plane of any orientation: the layers of a normal you type">custom</button>
+        <button type="button" data-normal="custom" aria-pressed="false" title="A plane of any orientation: a normal, a point it goes through, and t along the normal">custom</button>
       </div>
     </div>
     <div class="empty-preview" id="previewEmpty">
@@ -282,9 +299,9 @@
       <div class="previewbody">
         <div class="plot">
           <span class="ax y" id="axisY"></span>
-          <div class="canvaswrap" id="canvasWrap"><div class="zoomlayer" id="zoomLayer"><canvas id="sliceCanvas" width="1" height="1" tabindex="0" role="img"
+          <div class="plotarea" id="plotArea"><div class="canvaswrap" id="canvasWrap"><div class="zoomlayer" id="zoomLayer"><canvas id="sliceCanvas" width="1" height="1" tabindex="0" role="img"
             aria-label="Slice of the data; click or press Enter to pin a point, arrow keys move it, Page Up and Page Down change the plane, plus and minus zoom, 0 shows the whole plane"></canvas><div class="mark" id="sliceMark" hidden></div></div>
-            <div class="zoombar"><button type="button" id="zoomIn" title="Zoom in (+, or the mouse wheel)" aria-label="Zoom in">+</button><button type="button" id="zoomOut" title="Zoom out (−)" aria-label="Zoom out">−</button><button type="button" id="zoomReset" title="The whole plane (0, or double-click)" aria-label="Show the whole plane">1:1</button></div></div>
+            <div class="zoombar"><button type="button" id="zoomIn" title="Zoom in (+, or the mouse wheel)" aria-label="Zoom in">+</button><button type="button" id="zoomOut" title="Zoom out (−)" aria-label="Zoom out">−</button><button type="button" id="zoomReset" title="The whole plane (0, or double-click)" aria-label="Show the whole plane">1:1</button></div></div></div>
           <span class="ax x" id="axisX"></span>
         </div>
         <div class="colorbar"><i id="colorbar"></i><div id="colorTicks"></div></div>
@@ -298,10 +315,15 @@
         <label class="check" title="Draw the plane in Cartesian space - Q = 2π UB hkl, or the cell with a along x - so angles and lengths are true"><input type="checkbox" id="cartesian">Cartesian (UB)</label>
       </div>
       <div class="slicer customrow" id="customRow" hidden>
-        <span>Normal</span>
+        <span title="The plane's normal n in the grid coordinates; t moves the plane along it">Normal</span>
         <input id="normal0" class="text nrm" inputmode="decimal" value="1" aria-label="Normal, first component">
         <input id="normal1" class="text nrm" inputmode="decimal" value="-1" aria-label="Normal, second component">
         <input id="normal2" class="text nrm" inputmode="decimal" value="0" aria-label="Normal, third component">
+        <span title="The point the plane goes through at t = 0: the middle of the data, a pinned point or one you type">through</span>
+        <input id="origin0" class="text nrm" inputmode="decimal" aria-label="Plane origin, first coordinate">
+        <input id="origin1" class="text nrm" inputmode="decimal" aria-label="Plane origin, second coordinate">
+        <input id="origin2" class="text nrm" inputmode="decimal" aria-label="Plane origin, third coordinate">
+        <button type="button" class="btn ghost small" id="originMiddle" title="Through the middle of the data">middle</button>
         <span class="lvlnote" id="normalNote"></span>
       </div>
       <div class="slicer levels">
@@ -331,8 +353,11 @@
       <div class="readout" id="profileReadout">Point at the curve to read values</div>
     </div>
   </section>
-  <section class="card logcard">
+  <section class="card logcard" id="logCard">
+    <div class="rowsplit" id="logSplit" role="separator" aria-orientation="horizontal" aria-label="Resize the log" tabindex="0"
+      title="Drag to share the height between the log and the panel above; double-click resets"></div>
     <div class="card-head">
+      <button type="button" class="grip" draggable="true" aria-label="Move the Log panel" title="Drag to move the panel (arrow keys too)"><svg class="i s16"><use href="#i-grip"/></svg></button>
       <h2>Log</h2><div class="spacer"></div>
       <button type="button" class="btn ghost icon" id="copyLog" aria-label="Copy the log" title="Copy the log"><svg class="i s16"><use href="#i-copy"/></svg></button>
       <button type="button" class="btn ghost icon" id="saveLog" aria-label="Download the log" title="Download the log"><svg class="i s16"><use href="#i-download"/></svg></button>
@@ -350,7 +375,8 @@
   <button type="button" class="btn big" id="cancelBtn" hidden>Cancel</button>
   <input type="file" id="seriesFiles" multiple hidden>
   <button type="button" class="btn big" id="seriesBtn" title="Convert several files, one by one, with these settings"><svg class="i"><use href="#i-layers"/></svg>Series…</button>
-  <button type="button" class="btn primary big" id="convertBtn" disabled><svg class="i"><use href="#i-download"/></svg>Convert &amp; download</button>
+  <button type="button" class="btn big" id="processBtn" disabled title="Run the recipe and show the result in the preview; Download then writes it without running it again"><svg class="i"><use href="#i-wand"/></svg>Process</button>
+  <button type="button" class="btn primary big" id="convertBtn" disabled title="Write the output file, processed by the recipe (reusing Process when nothing changed since)"><svg class="i"><use href="#i-download"/></svg>Download</button>
 </footer>
 <div class="toasts" id="toasts" aria-live="assertive"></div>
 <div class="dropveil" id="dropVeil" hidden><div><svg class="i"><use href="#i-upload"/></svg>Drop to load</div></div>

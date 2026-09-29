@@ -242,11 +242,24 @@ files are kept unless `--force` is given.
 
 ## Usage
 
-The page is a workspace: four cards on the left (data, unit cell,
-processing, output), a preview and the log on the right, and a bar at the
-bottom with the output file name, progress, Cancel and **Convert &
-download**. The theme button switches between light and dark (the choice is
+The page is a workspace: four panels on the left (data, unit cell,
+processing, output), the preview and the log on the right, and a bar at the
+bottom with the output file name, progress, Cancel, **Series…**,
+**Process** and **Download**. **Process** runs the recipe and shows the
+result in the preview; **Download** writes the output file, running the
+recipe first unless Process already did with the same data, cell and
+recipe. The theme button switches between light and dark (the choice is
 remembered; by default the page follows the system).
+
+The layout is yours to change, and this browser keeps it: drag the bar
+between the columns to share the width, and the bar above the log to share
+the height with the preview (a double-click on a bar resets it). A panel
+moves by the grip at the left of its title: drag it to another place in
+either column, or focus the grip and use the arrow keys (up and down in the
+column, left and right to the other one). The layout button in the top bar
+swaps the columns or resets everything. In the column that stays in view,
+the preview takes the height the other panels leave, and the plot grows
+with it.
 
 1. **Data**: drop files anywhere on the page, or choose them. The format is
    detected from the content; the card then shows the grid, its hkl range
@@ -285,7 +298,8 @@ remembered; by default the page follows the system).
    of the mean and the voxel count (`Q mean_I sigma_of_mean n_voxels`).
 
 **Preview**: the planes of the grid as read, and after the recipe
-(*After recipe* runs it once; Convert then reuses the result). A slider
+(*Processed*, or Process in the bottom bar, runs it once; Download then
+reuses the result, and a recipe change marks it out of date). A slider
 moves through the planes, and the box beside it takes a typed position. The
 colour scale is viridis on a log or linear range, blue–orange and centred on
 zero for a 3D-ΔPDF, and grey marks voxels without data; a histogram of the
@@ -293,11 +307,19 @@ slice sits under it. The levels come from the whole volume and stay while
 you move through the planes; typed levels stay likewise until *auto*, and
 *per slice* scales each plane on its own.
 
-- **Custom** planes are the layers u h + v k + w l = t of a normal you type:
-  [0 0 1] gives the (h k 0) planes, [1 −1 0] the (h h l) ones (for a 3D-ΔPDF
-  the normal is in hkl and the layers are in u, v, w). They are sampled by
-  interpolation, a voxel per pixel; the slider steps through the layers and
-  a typed level may fall between them.
+- **Custom** planes are cut as 3DSCalculator and 3DSView cut them: a
+  normal n you type (in the grid coordinates: [0 0 1] gives the (h k 0)
+  planes, [1 −1 0] the (h h l) ones; for a 3D-ΔPDF they are u, v, w), a
+  point the plane goes through (the middle of the data, a pinned point, or
+  one typed under *through*), and t, the distance along the unit normal
+  from that point. The slider has 401 positions from corner to corner of
+  the data; a typed t may be anything between. The image axes u and v are
+  orthonormal in the grid coordinates, with v up along the projection of l
+  (else k) and u = v × n, and the pixels are square there, about a voxel
+  each, so an (h h l) plane is √2 wider than high and a (1 1 1) cut through
+  a cube is a regular hexagon. The axis coordinates are the components of
+  the point along u and v; a normal along an axis keeps that axis plane's
+  layout.
 - **Cartesian (UB)** redraws any plane on a square grid in Cartesian space,
   Q = 2π UB hkl, so angles and lengths are true (a hexagonal (h k 0) plane
   shows its 120°). Without a UB the cell sets the frame, with a along x; a
@@ -322,7 +344,7 @@ chunked in-memory download is used. The log reports the expected output
 size first, and reading, processing and writing show progress and can be
 cancelled. The log can be copied or downloaded.
 
-**Series…** (next to Convert) converts several files, one after another,
+**Series…** (in the bottom bar) converts several files, one after another,
 with the page's current cell source, recipe (and its extra volumes), crop
 and output settings — a temperature or composition series. In Chromium the
 outputs go into one folder you pick; elsewhere each is downloaded. A file

@@ -305,6 +305,80 @@ const scenarios = [
         if (!/Using the processed data from the preview/.test(await logText())) throw new Error('the preview result was not reused');
         if ((await H.Converter.readUnifiedData(f)).axesType !== 'uvw') throw new Error('not a 3D-ΔPDF');
     }],
+    ['Process shows the result in the preview; Download writes it without running the recipe again', async () => {
+        await setFile('#dataFile', path.join(ROOT, 'Examples/example_unified.h5'));
+        await waitLog(/Unified data format \| grid 5 x 5 x 5/);
+        if (!(await evaluate('document.getElementById("processBtn").disabled'))) throw new Error('Process with no recipe');
+        await setValue('stepOp', 'scale');
+        await evaluate('document.getElementById("addStep").click()');
+        for (let i = 0; i < 50 && await evaluate('document.getElementById("processBtn").disabled'); i++) await sleep(100);
+        await evaluate('document.getElementById("processBtn").click()');
+        await waitLog(/Preview of the processed data: grid 5 x 5 x 5/);
+        const stage = () => evaluate('document.querySelector("#stageSeg [aria-pressed=true]").dataset.stage + "|" + document.getElementById("previewSub").textContent');
+        for (let i = 0; i < 50 && await stage() !== 'processed|after the recipe'; i++) await sleep(100);
+        if (await stage() !== 'processed|after the recipe') throw new Error('stage ' + await stage());
+        await convert('example_unified_processed_unified.h5');
+        if (!/Using the processed data from the preview/.test(await logText())) throw new Error('Process was not reused');
+        // a recipe change while the input is shown: the processed view runs the recipe again
+        await evaluate('document.querySelector("#stageSeg [data-stage=input]").click()');
+        await evaluate('document.getElementById("addStep").click()');
+        await evaluate('document.querySelector("#stageSeg [data-stage=processed]").click()');
+        await waitLog(/Preview of the processed data: grid 5 x 5 x 5/);
+    }],
+    ['layout: panels move, the columns and the log resize, the columns swap; kept after a reload', async () => {
+        await send('Emulation.setDeviceMetricsOverride', { width: 1400, height: 900, deviceScaleFactor: 1, mobile: false });
+        try {
+            const cols = () => evaluate('[".flow", ".side"].map(s => Array.from(document.querySelector(s).children, n => n.id).filter(Boolean).join(",")).join("|")');
+            if (await cols() !== 'dataCard,cellCard,procCard,outCard|previewCard,logCard') throw new Error('default ' + await cols());
+            await evaluate(`(() => { const key = (id, key) => document.querySelector('#' + id + ' .grip').dispatchEvent(new KeyboardEvent('keydown', { key, bubbles: true }));
+                key('logCard', 'ArrowLeft'); key('outCard', 'ArrowUp'); })()`);
+            const moved = 'dataCard,cellCard,outCard,procCard,logCard|previewCard';
+            if (await cols() !== moved) throw new Error('moved ' + await cols());
+            const flowWidth = () => evaluate('document.querySelector(".flow").getBoundingClientRect().width');
+            const w0 = await flowWidth();
+            await evaluate(`(() => { const b = document.getElementById('colSplit'), r = b.getBoundingClientRect(), y = r.top + 200;
+                const at = (type, x) => b.dispatchEvent(new PointerEvent(type, { pointerId: 1, button: 0, bubbles: true, clientX: x, clientY: y }));
+                at('pointerdown', r.left + 10); at('pointermove', r.left + 50); at('pointerup', r.left + 50); })()`);
+            const w1 = await flowWidth();
+            if (Math.abs(w1 - w0 - 40) > 2) throw new Error(`column width ${w0} -> ${w1}`);
+            await evaluate('document.getElementById("layoutReset").click()');
+            if (await cols() !== 'dataCard,cellCard,procCard,outCard|previewCard,logCard') throw new Error('reset ' + await cols());
+            // drag the Processing panel by its grip onto the upper half of the log
+            await evaluate(`(() => {
+                const dt = new DataTransfer(), grip = document.querySelector('#procCard .grip'), side = document.querySelector('.side');
+                const r = document.getElementById('logCard').getBoundingClientRect(), x = r.left + 40, y = r.top + 10;
+                grip.dispatchEvent(new DragEvent('dragstart', { dataTransfer: dt, bubbles: true }));
+                side.dispatchEvent(new DragEvent('dragover', { dataTransfer: dt, bubbles: true, cancelable: true, clientX: x, clientY: y }));
+                side.dispatchEvent(new DragEvent('drop', { dataTransfer: dt, bubbles: true, cancelable: true, clientX: x, clientY: y }));
+                grip.dispatchEvent(new DragEvent('dragend', { dataTransfer: dt, bubbles: true }));
+            })()`);
+            if (await cols() !== 'dataCard,cellCard,outCard|previewCard,procCard,logCard') throw new Error('dragged ' + await cols());
+            await evaluate('document.getElementById("layoutReset").click()');
+            // the bar above the log: up makes the log taller and the preview shorter
+            const heights = () => evaluate('["previewCard", "logCard"].map(id => Math.round(document.getElementById(id).getBoundingClientRect().height))');
+            const [p0, l0] = await heights();
+            await evaluate(`(() => { const b = document.getElementById('logSplit'), r = b.getBoundingClientRect(), x = r.left + r.width / 2;
+                const at = (type, y) => b.dispatchEvent(new PointerEvent(type, { pointerId: 1, button: 0, bubbles: true, clientX: x, clientY: y }));
+                at('pointerdown', r.top + 6); at('pointermove', r.top - 54); at('pointerup', r.top - 54); })()`);
+            const [p1, l1] = await heights();
+            if (Math.abs(l1 - l0 - 60) > 2 || Math.abs(p0 - p1 - 60) > 2) throw new Error(`preview ${p0} -> ${p1}, log ${l0} -> ${l1}`);
+            // keyboard moves and a swap, then a reload
+            await evaluate(`(() => { const key = (id, key) => document.querySelector('#' + id + ' .grip').dispatchEvent(new KeyboardEvent('keydown', { key, bubbles: true }));
+                key('logCard', 'ArrowLeft'); key('outCard', 'ArrowUp'); document.getElementById('layoutSwap').click(); })()`);
+            await fresh();
+            if (await cols() !== moved) throw new Error('not kept: ' + await cols());
+            if (!(await evaluate('document.querySelector(".workspace").classList.contains("swapped")'))) throw new Error('the swap was not kept');
+            if (!(await evaluate('document.querySelector(".side").getBoundingClientRect().left < document.querySelector(".flow").getBoundingClientRect().left'))) {
+                throw new Error('the preview column is not on the left');
+            }
+            if (Math.abs((await heights())[1] - l1) > 2) throw new Error('the log height was not kept');
+            await evaluate('document.getElementById("layoutReset").click()');
+            if (await cols() !== 'dataCard,cellCard,procCard,outCard|previewCard,logCard') throw new Error('reset ' + await cols());
+        } finally {
+            await evaluate('document.getElementById("layoutReset").click()');
+            await send('Emulation.clearDeviceMetricsOverride');
+        }
+    }],
     ['preview: levels kept from plane to plane, typed levels, a typed plane position', async () => {
         await setFile('#dataFile', path.join(ROOT, 'Examples/example_unified.h5'));
         await waitLog(/Unified data format \| grid 5 x 5 x 5/);
@@ -376,14 +450,25 @@ const scenarios = [
         };
         await evaluate('document.querySelector("#planeSeg [data-normal=custom]").click()');
         if (await evaluate('document.getElementById("customRow").hidden')) throw new Error('no normal inputs');
-        await until('sliceStats', /h − k = 0 ·/);                              // the default normal [1 -1 0]
-        await until('normalNote', /x ∥ \[1 1 0\], y ∥ \[0 0 1\]/);
+        await until('sliceStats', /t = 0 · 201 of 401/);                        // the default normal [1 -1 0], through the middle
+        await until('normalNote', /u ∥ \[1 1 0\], v ∥ \[0 0 1\] · centre 0 0 0/);
+        // square pixels in h k l: the (h h l) plane is √2 wider than high
+        const aspect = await evaluate('document.getElementById("sliceCanvas").width / document.getElementById("sliceCanvas").height');
+        if (!(aspect > 1.3)) throw new Error('aspect ' + aspect);
         await evaluate(`(() => { const e = document.getElementById('normal0'); e.value = '0'; e.dispatchEvent(new Event('input'));
             const f = document.getElementById('normal1'); f.value = '0'; f.dispatchEvent(new Event('input'));
             const g = document.getElementById('normal2'); g.value = '1'; g.dispatchEvent(new Event('input')); })()`);
-        await until('sliceStats', /l = 0 · 3 of 5/);
+        await until('sliceStats', /t = 0 · 201 of 401/);
+        await until('normalNote', /u ∥ \[1 0 0\], v ∥ \[0 1 0\]/);
         await evaluate(`(() => { const e = document.getElementById('sliceAt'); e.value = '0.25'; e.dispatchEvent(new Event('change')); })()`);
-        await until('sliceStats', /l = 0\.25 ·/);                              // a level between the grid planes
+        await until('sliceStats', /t = 0\.25 · 251 of 401/);                   // between the grid planes
+        await until('normalNote', /centre 0 0 0\.25/);
+        // a typed point to go through: t counts from it
+        await evaluate(`(() => { const e = document.getElementById('origin2'); e.value = '0.5'; e.dispatchEvent(new Event('input')); })()`);
+        await until('sliceStats', /t = 0 · 301 of 401/);                        // l from -1 to 1: t from -1.5 to 0.5
+        await until('normalNote', /centre 0 0 0\.5/);
+        await evaluate('document.getElementById("originMiddle").click()');
+        await until('normalNote', /centre 0 0 0 /);
         await evaluate('document.getElementById("cartesian").click()');
         await until('axisX', /Å⁻¹$/);
         // a typed UB: the Cartesian frame follows it

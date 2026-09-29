@@ -361,14 +361,14 @@ function converterWorker(self, h5wasm, Converter, Processing, wgpuFftWeb) {
 
 
     // ---- planes of any orientation -------------------------------------------
-    // A plane is a layer n . x = t of the grid coordinates x (hkl, uvw or Q).
-    // For hkl data n = [u v w] gives the reciprocal-lattice layers
-    // u h + v k + w l = t: [0 0 1] the (h k 0) planes, [1 -1 0] the (h h l)
-    // ones. The plane is sampled by interpolation, about a voxel per pixel,
-    // either along two in-plane grid-coordinate directions (frame 'grid',
-    // drawn the way the grid is indexed) or on a square grid in Cartesian
-    // space, x -> M x (frame 'cartesian': Q = 2 pi UB hkl, or 2 pi B hkl with
-    // a along x, or A uvw), where angles and lengths are true.
+    // As 3DSCalculator and 3DSView cut them: a unit normal n in the grid
+    // coordinates x (hkl, uvw or Q), the plane through a centre c, moved by t
+    // along n. [0 0 1] gives the (h k 0) planes, [1 -1 0] the (h h l) ones.
+    // The plane is sampled by interpolation on square pixels of about a
+    // voxel, along orthonormal in-plane directions u and v of the grid
+    // coordinates (frame 'grid') or of Cartesian space, x -> M x (frame
+    // 'cartesian': Q = 2 pi UB hkl, or 2 pi B hkl with a along x, or A uvw),
+    // where angles and lengths are true.
 
     const dot3 = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
     const cross3 = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
@@ -383,47 +383,43 @@ function converterWorker(self, h5wasm, Converter, Processing, wgpuFftWeb) {
             [C / det, (b * g - a * h) / det, (a * e - b * d) / det]];
     }
 
-    // A direction as small whole numbers when it has such a form (else with
-    // its largest component 1), positive at its largest component.
-    function tidy(v) {
+    const unit3 = v => {
+        const s = Math.hypot(v[0], v[1], v[2]);
+        return s > 1e-10 ? v.map(x => x / s) : null;
+    };
+
+    // A direction as text: small whole numbers when it has such a form, else
+    // its components to 4 digits: "[1 −1 0]", "[0.5774 0.5774 0.5774]".
+    function directionName(v) {
         const big = Math.max(...v.map(Math.abs));
-        if (!(big > 0)) return v.slice();
-        let u = v.map(x => x / big);
+        let w = v.map(x => x / big);
         for (let d = 1; d <= 12; d++) {
-            const w = u.map(x => x * d);
-            if (w.every(x => Math.abs(x - Math.round(x)) < 1e-6)) {
-                u = w.map(Math.round);
-                break;
+            const m = w.map(x => x * d);
+            if (m.every(x => Math.abs(x - Math.round(x)) < 1e-6)) {
+                w = m.map(Math.round);
+                return `[${w.map(x => String(x + 0).replace(/^-/, '−')).join(' ')}]`;
             }
         }
-        const k = u.reduce((m, x, i) => (Math.abs(x) > Math.abs(u[m]) + 1e-9 ? i : m), 0);
-        return u.map(x => (u[k] < 0 ? -x : x) + 0);
+        return `[${v.map(x => String(+x.toPrecision(4) + 0).replace(/^-/, '−')).join(' ')}]`;
     }
 
-    // Two directions in the plane n . x = 0: e2 from the last axis (else the
-    // second), e1 = e2 x n; for [0 0 1] they are [1 0 0] and [0 1 0].
-    function planeBasis(n) {
-        const nn = dot3(n, n);
-        const proj = a => {
-            const k = dot3(a, n) / nn;
-            return a.map((x, i) => x - k * n[i]);
-        };
-        let e2 = proj([0, 0, 1]);
-        if (Math.hypot(...e2) < 0.3) e2 = proj([0, 1, 0]);
-        return { e1: tidy(cross3(e2, n)), e2: tidy(e2) };
+    // In-plane unit directions for the unit normal n, as 3DSCalculator lays
+    // them out: v up along the last axis projected on the plane (else the
+    // second, else the first), u = v x n across, so u, v, n are right-handed.
+    // A normal along an axis keeps that axis plane's layout: the first other
+    // axis across, the second up.
+    function planeAxes(n) {
+        const a = n.map(Math.abs), c = a.indexOf(Math.max(...a));
+        const e = i => [0, 1, 2].map(x => (x === i ? 1 : 0));
+        if ([0, 1, 2].every(i => i === c || a[i] < 1e-6)) {
+            const [p, q] = [0, 1, 2].filter(i => i !== c);
+            return { u: e(p), v: e(q) };
+        }
+        const proj = w => unit3(w.map((x, i) => x - dot3(w, n) * n[i]));
+        const v = proj(e(2)) || proj(e(1)) || proj(e(0));
+        const u = unit3(cross3(v, n));
+        return { u, v: unit3(cross3(n, u)) };
     }
-
-    // "h - k", "2h + l": the layer n . x as text.
-    function combination(n, names) {
-        let s = '';
-        n.forEach((c, i) => {
-            if (Math.abs(c) < 1e-12) return;
-            const m = Math.abs(c), term = (Math.abs(m - 1) < 1e-9 ? '' : String(+m.toPrecision(6))) + names[i];
-            s += s ? ` ${c < 0 ? '−' : '+'} ${term}` : (c < 0 ? '−' : '') + term;
-        });
-        return s || '0';
-    }
-    const vectorName = v => `[${v.map(x => String(+x.toPrecision(4)).replace(/^-/, '−')).join(' ')}]`;
 
     // Trilinear interpolation at a fractional grid index. A point whose nearest
     // voxel holds no data has none (masks stay sharp); NaN neighbours are left
@@ -479,91 +475,68 @@ function converterWorker(self, h5wasm, Converter, Processing, wgpuFftWeb) {
         return { M: [[1, 0, 0], [0, 1, 0], [0, 0, 1]], unit: 'r.l.u.', source: 'none' };
     }
 
-    // spec: { n, level, index, point, frame, cell, ub }. The plane at `level`,
-    // else layer `index`, else through `point`, else through 0, else the
-    // middle. Returns the slicePlane fields, plus pixel: the grid coordinates
-    // of pixel (0, bottom row) and their steps per pixel along x and y.
-    function generalPlane(geo, spec) {
+    // The plane through `centre` with unit normal n and unit in-plane
+    // directions u, v (grid coordinates), on square pixels of about a voxel:
+    // along u and v themselves (frame 'grid', u and v orthonormal), or along
+    // M u and the part of M v square to it (frame 'cartesian'). A pixel's
+    // coordinates are those of its point x along the two directions (x . u,
+    // x . v; in Q the components of M x), so they do not depend on where the
+    // plane was put; pixels are aligned with the grid point nearest the
+    // centre. The extent covers the grid's box seen along n, the same for
+    // every parallel plane. Returns the slicePlane fields but the names and
+    // the normal, with pixel: the grid coordinates of pixel (0, bottom row)
+    // and their steps along x and y.
+    function planeImage(geo, { n, centre, u, v, frame, cell, ub }) {
         const dims = geo.dims, corner = geo.corner;
-        const n = spec.n.map(Number);
-        if (n.length !== 3 || !n.every(Number.isFinite) || !(dot3(n, n) > 0)) throw new Error('the plane normal must be three numbers, not all 0');
-        const cols = geo.vectors.map(v => v.slice());
+        const cols = geo.vectors.map(w => w.slice());
         const flat = [0, 1, 2].filter(a => dims[a] <= 1 || !cols[a].some(Boolean));
         if (flat.length > 1) throw new Error('planes of any orientation need a grid with at least two axes');
         if (flat.length === 1) {
             const [b, c] = [0, 1, 2].filter(a => a !== flat[0]);
             cols[flat[0]] = cross3(cols[b], cols[c]);
         }
-        const G = [0, 1, 2].map(r => [0, 1, 2].map(a => cols[a][r]));
-        const Gi = inv3(G);
+        const Gi = inv3([0, 1, 2].map(r => [0, 1, 2].map(a => cols[a][r])));
         const toIndex = x => mul3(Gi, [x[0] - corner[0], x[1] - corner[1], x[2] - corner[2]]);
-        const box = [];
-        for (const i of [0, dims[0] - 1]) for (const j of [0, dims[1] - 1]) for (const k of [0, dims[2] - 1]) {
-            box.push([0, 1, 2].map(c => corner[c] + i * cols[0][c] + j * cols[1][c] + k * cols[2][c]));
-        }
-        // the layers: one voxel apart along the axis most across the plane
-        const ts = box.map(x => dot3(n, x)), tmin = Math.min(...ts), tmax = Math.max(...ts);
-        const across = [0, 1, 2].filter(a => dims[a] > 1).map(a => Math.abs(dot3(n, cols[a])))
-            .filter(x => x > 1e-9 * Math.sqrt(dot3(n, n)) * Math.max(...cols.map(c => Math.hypot(...c))));
-        const dt = across.length ? Math.min(...across) : 1;
-        const layers = Math.max(1, Math.floor((tmax - tmin) / dt + 1e-6) + 1);
-        let level = Number(spec.level);
-        if (!Number.isFinite(level)) {
-            if (Number.isFinite(spec.index)) level = tmin + Math.min(layers - 1, Math.max(0, Math.round(spec.index))) * dt;
-            else if (spec.point && spec.point.every(Number.isFinite)) level = dot3(n, spec.point);
-            else level = tmin <= 0 && tmax >= 0 ? 0 : (tmin + tmax) / 2;
-        }
-        level = Math.min(tmax, Math.max(tmin, level));
-        const index = Math.min(layers - 1, Math.max(0, Math.round((level - tmin) / dt)));
-
-        // pixel axes: in-plane grid-coordinate directions, or Cartesian ones
-        const { e1, e2 } = planeBasis(n);
-        const centre = [0, 1, 2].map(c => corner[c] + [0, 1, 2].reduce((s, a) => s + (dims[a] - 1) / 2 * cols[a][c], 0));
-        const p0 = centre.map((x, i) => x + (level - dot3(n, centre)) / dot3(n, n) * n[i]);
-        let A = e1, B = e2, P = p0, unit = '', names, cart = null;
-        if (spec.frame === 'cartesian') {
-            cart = cartesianMap(geo, spec.cell, spec.ub);
-            const M = cart.M, Mi = inv3(M);
-            const unitv = v => v.map(x => x / Math.hypot(...v));
-            const E1 = unitv(mul3(M, e1)), m2 = mul3(M, e2);
-            const E2 = unitv(m2.map((x, i) => x - dot3(m2, E1) * E1[i]));
+        const gridPoint = f => [0, 1, 2].map(c => corner[c] + f[0] * cols[0][c] + f[1] * cols[1][c] + f[2] * cols[2][c]);
+        let A = u, B = v, M = null, cart = null, skew = false;
+        if (frame === 'cartesian') {
+            cart = cartesianMap(geo, cell, ub);
+            M = cart.M;
+            const Mi = inv3(M), E1 = unit3(mul3(M, u)), m2 = mul3(M, v);
+            const E2 = unit3(m2.map((x, i) => x - dot3(m2, E1) * E1[i]));
+            skew = dot3(unit3(m2), E2) < 1 - 1e-9;              // v is not square to u in Q
             A = mul3(Mi, E1);
             B = mul3(Mi, E2);
-            const q0 = mul3(M, p0);
-            P = p0.map((x, i) => x - dot3(E1, q0) * A[i] - dot3(E2, q0) * B[i]);
-            unit = cart.unit;
-            names = [`${vectorName(e1)}`, `${vectorName(e2)}⊥`];
-        } else {
-            names = [vectorName(e1), vectorName(e2)];
         }
-        // the plane's extent over the grid, in (x, y) coordinates
+        // P: the plane's point with coordinates (0, 0)
+        const mc = M ? mul3(M, centre) : centre, ma = M ? mul3(M, A) : A, mb = M ? mul3(M, B) : B;
+        const ca = dot3(mc, ma), cb = dot3(mc, mb);
+        const P = centre.map((x, i) => x - ca * A[i] - cb * B[i]);
         const S = inv3([0, 1, 2].map(r => [A[r], B[r], n[r]]));
+        const inPlane = x => mul3(S, x.map((c, i) => c - P[i]));
         let xmin = Infinity, xmax = -Infinity, ymin = Infinity, ymax = -Infinity;
-        for (const x of box) {
-            const [a, b] = mul3(S, x.map((c, i) => c - P[i]));
+        for (const i of [0, dims[0] - 1]) for (const j of [0, dims[1] - 1]) for (const k of [0, dims[2] - 1]) {
+            const [a, b] = inPlane(gridPoint([i, j, k]));
             xmin = Math.min(xmin, a);
             xmax = Math.max(xmax, a);
             ymin = Math.min(ymin, b);
             ymax = Math.max(ymax, b);
         }
         const fA = mul3(Gi, A), fB = mul3(Gi, B);
-        let dx = 1 / Math.max(1e-12, Math.hypot(...fA)), dy = 1 / Math.max(1e-12, Math.hypot(...fB));
-        if (spec.frame === 'cartesian') dx = dy = Math.min(dx, dy);          // square pixels
         const MAX = 900;
-        dx = Math.max(dx, (xmax - xmin) / (MAX - 1));
-        dy = Math.max(dy, (ymax - ymin) / (MAX - 1));
-        if (spec.frame === 'cartesian') dx = dy = Math.max(dx, dy);
-        // whole steps from the plane's origin, so pixels fall on the grid points the plane meets
-        xmin = Math.floor(xmin / dx + 1e-6) * dx;
-        ymin = Math.floor(ymin / dy + 1e-6) * dy;
-        const w = Math.max(1, Math.ceil((xmax - xmin) / dx - 1e-6) + 1), h = Math.max(1, Math.ceil((ymax - ymin) / dy - 1e-6) + 1);
+        const d = Math.max(Math.min(1 / Math.max(1e-12, Math.hypot(...fA)), 1 / Math.max(1e-12, Math.hypot(...fB))),
+            (xmax - xmin) / (MAX - 1), (ymax - ymin) / (MAX - 1));
+        const [ga, gb] = inPlane(gridPoint(toIndex(centre).map((f, a) => Math.min(dims[a] - 1, Math.max(0, Math.round(f))))));
+        xmin = ga + Math.floor((xmin - ga) / d + 1e-6) * d;
+        ymin = gb + Math.floor((ymin - gb) / d + 1e-6) * d;
+        const w = Math.max(1, Math.ceil((xmax - xmin) / d - 1e-6) + 1), h = Math.max(1, Math.ceil((ymax - ymin) / d - 1e-6) + 1);
         const values = new Float32Array(w * h), outside = new Uint8Array(w * h);
         const at = sampler(geo), f0 = toIndex(P);
         let anyOutside = false;
         for (let r = 0; r < h; r++) {
-            const b = ymin + (h - 1 - r) * dy;
+            const b = ymin + (h - 1 - r) * d;
             for (let c = 0; c < w; c++) {
-                const a = xmin + c * dx;
+                const a = xmin + c * d;
                 const val = at(f0[0] + a * fA[0] + b * fB[0], f0[1] + a * fA[1] + b * fB[1], f0[2] + a * fA[2] + b * fB[2]);
                 if (val === undefined) {
                     values[r * w + c] = NaN;
@@ -574,16 +547,55 @@ function converterWorker(self, h5wasm, Converter, Processing, wgpuFftWeb) {
                 }
             }
         }
-        const origin = [0, 1, 2].map(i => P[i] + xmin * A[i] + ymin * B[i]);
         return {
-            width: w, height: h, values, outside: anyOutside ? outside : null, frame: spec.frame === 'cartesian' ? 'cartesian' : 'grid',
-            general: true, unit, cartesian: cart ? { M: cart.M, unit: cart.unit, source: cart.source } : null,
-            x: { name: names[0], n: w, from: xmin, to: xmin + (w - 1) * dx },
-            y: { name: names[1], n: h, from: ymin, to: ymin + (h - 1) * dy },
-            normal: { name: combination(n, geo.names), n: layers, from: tmin, to: tmin + (layers - 1) * dt, index, level, vector: n },
-            pixel: { origin, dx: A.map(v => v * dx), dy: B.map(v => v * dy) },
+            width: w, height: h, values, outside: anyOutside ? outside : null, frame: frame === 'cartesian' ? 'cartesian' : 'grid',
+            general: true, unit: cart ? cart.unit : '', skew,
+            cartesian: cart ? { M: cart.M, unit: cart.unit, source: cart.source } : null,
+            x: { n: w, from: xmin, to: xmin + (w - 1) * d },
+            y: { n: h, from: ymin, to: ymin + (h - 1) * d },
+            pixel: { origin: [0, 1, 2].map(i => P[i] + xmin * A[i] + ymin * B[i]), dx: A.map(x => x * d), dy: B.map(x => x * d) },
             names: geo.names.slice(),
         };
+    }
+
+    // spec: { n, origin, offset, index, frame, cell, ub }. The plane with
+    // normal n through `origin` (else the middle of the grid's box), moved
+    // along the unit normal by `offset`, else to slider position `index`,
+    // else not at all. The slider has PLANE_POSITIONS offsets over the
+    // range that reaches the box corners. The normal field gives them (name
+    // 't', n, from, to, index, level = the offset) with the unit normal, the
+    // origin, the centre and the in-plane directions.
+    const PLANE_POSITIONS = 401;
+    function customPlane(geo, spec) {
+        const n0 = (spec.n || []).map(Number);
+        const n = n0.length === 3 && n0.every(Number.isFinite) ? unit3(n0) : null;
+        if (!n) throw new Error('the plane normal must be three numbers, not all 0');
+        const given = x => x !== null && x !== undefined && x !== '' && Number.isFinite(Number(x));
+        const dims = geo.dims, corner = geo.corner, V = geo.vectors;
+        const point = f => [0, 1, 2].map(c => corner[c] + f[0] * V[0][c] + f[1] * V[1][c] + f[2] * V[2][c]);
+        const origin = spec.origin && spec.origin.length === 3 && spec.origin.every(given) ? spec.origin.map(Number)
+            : point(dims.map(m => (m - 1) / 2));
+        const ts = [];
+        for (const i of [0, dims[0] - 1]) for (const j of [0, dims[1] - 1]) for (const k of [0, dims[2] - 1]) {
+            ts.push(dot3(n, point([i, j, k])) - dot3(n, origin));
+        }
+        const tmin = Math.min(...ts), tmax = Math.max(...ts), span = tmax - tmin, last = PLANE_POSITIONS - 1;
+        let t = given(spec.offset) ? Number(spec.offset)
+            : given(spec.index) ? tmin + Math.min(last, Math.max(0, Math.round(spec.index))) * span / last : 0;
+        t = Math.min(tmax, Math.max(tmin, t));
+        const centre = origin.map((x, i) => x + t * n[i]);
+        const { u, v } = planeAxes(n);
+        const plane = planeImage(geo, { n, centre, u, v, frame: spec.frame, cell: spec.cell, ub: spec.ub });
+        const [xn, yn] = geo.names[0] === 'u' ? ['x', 'y'] : ['u', 'v'];
+        plane.x.name = xn;
+        plane.y.name = plane.skew ? `${yn}⊥` : yn;
+        plane.normal = {
+            name: 't', n: span > 1e-12 ? PLANE_POSITIONS : 1, from: tmin, to: span > 1e-12 ? tmax : tmin,
+            index: span > 1e-12 ? Math.round((t - tmin) / span * last) : 0, level: t,
+            vector: n0, unit: n, origin, centre, u, v,
+            text: { n: directionName(n0), u: directionName(u), v: directionName(v) },
+        };
+        return plane;
     }
 
     // The plane of the grid with grid axis `normal` fixed at `index` (or at
@@ -789,9 +801,9 @@ function converterWorker(self, h5wasm, Converter, Processing, wgpuFftWeb) {
         // A plane of the loaded data ('input') or of the last previewRecipe
         // result ('processed'); see slicePlane.
         // normal: a grid axis (0, 1, 2) or 'custom' with `vector`; frame
-        // 'grid' or 'cartesian' (with cell and ub); level / point place a
-        // custom plane. See slicePlane and generalPlane.
-        async slice({ stage, normal, index, at, vector, level, point, frame, cell, ub }) {
+        // 'grid' or 'cartesian' (with cell and ub); origin, offset and index
+        // place a custom plane (see customPlane), point a grid plane.
+        async slice({ stage, normal, index, at, vector, origin, offset, point, frame, cell, ub }) {
             const source = stage === 'processed' ? state.processed && { model: state.processed.plan.model } : state.data;
             if (!source) throw new Error(stage === 'processed' ? 'no processed preview yet' : 'no data file loaded');
             const geo = geometryOf(source);
@@ -802,16 +814,21 @@ function converterWorker(self, h5wasm, Converter, Processing, wgpuFftWeb) {
             }
             let plane;
             if (normal === 'custom') {
-                plane = generalPlane(geo, { n: vector, level, index, point, frame, cell, ub });
+                plane = customPlane(geo, { n: vector, origin, offset, index, frame, cell, ub });
             } else if (frame === 'cartesian') {
-                // the grid plane, as a layer of the axes' own normal, true to scale
-                const [a, b] = [0, 1, 2].filter(x => x !== normal);
-                let n = cross3(geo.vectors[a], geo.vectors[b]);
-                if (!n.some(Boolean)) n = [0, 1, 2].map(c => (c === normal ? 1 : 0));
-                if (dot3(n, geo.vectors[normal]) < 0) n = n.map(x => -x);
+                // the grid plane, its layers kept, true to scale
                 const base = slicePlane(geo, normal, index, at);
-                plane = generalPlane(geo, { n: tidy(n), index: base.normal.index, frame, cell, ub });
-                plane.normal.name = base.normal.name;
+                const [a, b] = [0, 1, 2].filter(x => x !== normal);
+                const e = i => [0, 1, 2].map(c => (c === i ? 1 : 0));
+                const axis = i => (geo.vectors[i].some(Boolean) ? geo.vectors[i] : e(i));
+                let n = unit3(cross3(axis(a), axis(b)));
+                if (dot3(n, axis(normal)) < 0) n = n.map(x => -x);
+                const centre = [0, 1, 2].map(c => geo.corner[c] + base.normal.index * geo.vectors[normal][c] +
+                    (geo.dims[a] - 1) / 2 * geo.vectors[a][c] + (geo.dims[b] - 1) / 2 * geo.vectors[b][c]);
+                plane = planeImage(geo, { n, centre, u: unit3(axis(a)), v: unit3(axis(b)), frame, cell, ub });
+                plane.x.name = base.x.name;
+                plane.y.name = plane.skew ? `${base.y.name}⊥` : base.y.name;
+                plane.normal = base.normal;
             } else {
                 plane = slicePlane(geo, normal, index, at);
             }
