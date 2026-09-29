@@ -13,6 +13,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 const require = createRequire(import.meta.url);
 const H = require('../helpers.js');
 const NX = require('../nexus-fixtures.js');
+const Processing = require('../../js/processing.js');
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 
 // CHROME, else the usual install folders (from the environment) and PATH.
@@ -132,9 +133,14 @@ async function setFile(selector, file) {
 }
 const setValue = (id, v) => evaluate(`(() => { const e = document.getElementById(${JSON.stringify(id)});
     e.value = ${JSON.stringify(String(v))}; e.dispatchEvent(new Event('change')); })()`);
-async function convert(outName) {
+// Click Convert once it is enabled (inputs still loading keep it disabled).
+async function clickConvert() {
     await evaluate('window.showSaveFilePicker = undefined');   // no save dialog when headless
+    for (let i = 0; i < 300 && await evaluate('document.getElementById("convertBtn").disabled'); i++) await sleep(100);
     await evaluate('document.getElementById("convertBtn").click()');
+}
+async function convert(outName) {
+    await clickConvert();
     const text = await waitLog(new RegExp(`Wrote ${outName.replace(/\./g, '\\.')}|Error`));
     if (/Error/.test(text)) throw new Error(text);
     const file = path.join(downloads, outName);
@@ -195,6 +201,82 @@ const scenarios = [
             throw new Error('wrong grid vectors ' + JSON.stringify(model.vectors));
         }
         if (NX.at(model, 3, 2, 1) !== NX.code(3, 2, 1)) throw new Error('values out of place');
+    }],
+    ['recipe file: symmetrize + 3D-ΔPDF -> unified u, v, w data with the recipe recorded', async () => {
+        const recipe = { version: 1, steps: [{ op: 'symmetrize', laue: 'm-3m' }, { op: 'deltaPdf', taper: 0.5 }] };
+        fs.writeFileSync(path.join(work, 'recipe.json'), JSON.stringify(recipe));
+        await setFile('#dataFile', path.join(ROOT, 'Examples/example_unified.h5'));
+        await waitLog(/Unified data format \| grid 5 x 5 x 5/);
+        await setFile('#recipeFile', path.join(work, 'recipe.json'));
+        await waitLog(/Recipe "recipe\.json": 2 step\(s\)/);
+        await setValue('outFormat', 'unified');
+        const f = await H.openH5Bytes(fs.readFileSync(await convert('example_unified_dpdf_unified.h5')));
+        if (!/FFT of 5 x 5 x 5 on the CPU \(float64\)/.test(await logText())) throw new Error('no FFT line in the log');
+        const got = await H.Converter.readUnifiedData(f);
+        const input = await H.Converter.readUnifiedData(await H.openH5('Examples/example_unified.h5'));
+        const want = await Processing.applyRecipe(input, recipe,
+            { cell: { lengths: input.cellLengths, angles: input.cellAngles }, fft: H.cpuFft });
+        if (got.axesType !== 'uvw' || got.content !== '3d-delta-pdf' || got.symmetrized !== 'laue') {
+            throw new Error(`labels ${got.axesType} ${got.content} ${got.symmetrized}`);
+        }
+        if (H.maxAbsDiff(got.values, want.values) > 1e-9 * Math.max(...want.values.map(Math.abs)) ||
+            H.maxAbsDiff(got.vectors.flat(), want.vectors.flat()) > 1e-12) {
+            throw new Error('the 3D-ΔPDF differs from the one computed in Node');
+        }
+        const saved = JSON.parse(String(f.get('entry/process/recipe/data').value));
+        if (JSON.stringify(saved) !== JSON.stringify(Processing.normalizeRecipe(recipe))) {
+            throw new Error('recorded recipe ' + JSON.stringify(saved));
+        }
+    }],
+    // WebGPU in a headless browser depends on the machine: without it the
+    // step must fail with a clear message instead.
+    ['3D-ΔPDF on the GPU where WebGPU exists (else a clear refusal)', async () => {
+        const recipe = { version: 1, steps: [{ op: 'deltaPdf', engine: 'gpu' }] };
+        fs.writeFileSync(path.join(work, 'gpu.json'), JSON.stringify(recipe));
+        await setFile('#dataFile', path.join(ROOT, 'Examples/example_unified.h5'));
+        await waitLog(/Unified data format \| grid 5 x 5 x 5/);
+        await setFile('#recipeFile', path.join(work, 'gpu.json'));
+        await waitLog(/Recipe "gpu\.json": 1 step/);
+        await setValue('outFormat', 'yell');
+        await clickConvert();
+        const text = await waitLog(/Wrote example_unified_dpdf_yell\.h5|Error/, 120000);
+        if (/Error/.test(text)) {
+            if (!/no usable WebGPU/.test(text)) throw new Error(text);
+            console.log('  (no WebGPU in this browser: ' + text.split('\n').filter(l => /Error/.test(l))[0] + ')');
+            return;
+        }
+        const out = path.join(downloads, 'example_unified_dpdf_yell.h5');
+        for (let i = 0; i < 100 && !(fs.existsSync(out) && fs.statSync(out).size); i++) await sleep(100);
+        await sleep(200);
+        const got = await H.Converter.readYell(await H.openH5Bytes(fs.readFileSync(out)));
+        const input = await H.Converter.readUnifiedData(await H.openH5('Examples/example_unified.h5'));
+        const want = await Processing.applyRecipe(input, { steps: [{ op: 'deltaPdf' }] }, { fft: H.cpuFft });
+        const line = text.split('\n').find(l => /^\s*FFT of/.test(l)) || '';
+        const tol = 1e-5 * Math.max(...want.values.map(Math.abs));        // float32 on the GPU
+        if (got.axesType !== 'uvw' || H.maxAbsDiff(got.values, want.values) > tol) {
+            throw new Error(`GPU result differs from the CPU one by ${H.maxAbsDiff(got.values, want.values)} (${line.trim()})`);
+        }
+        console.log('  (' + line.trim() + ')');
+    }],
+    ['step editor: combine with another volume, then a |Q| profile', async () => {
+        await setFile('#dataFile', path.join(ROOT, 'Examples/example_yell.h5'));
+        await waitLog(/Yell 1\.0/);
+        await setFile('#extraFiles', path.join(ROOT, 'Examples/example_unified.h5'));
+        await waitLog(/Volume "example_unified\.h5": grid 5 x 5 x 5/);
+        await setValue('stepOp', 'combine');
+        await evaluate('document.getElementById("addStep").click()');
+        const status = await evaluate('document.querySelector("#steps .step .hint").textContent');
+        if (status !== 'subtract "example_unified.h5"') throw new Error('step reads ' + status);
+        await setValue('outFormat', 'yell');
+        const diff = await H.Converter.readYell(await H.openH5Bytes(fs.readFileSync(await convert('example_yell_processed_yell.h5'))));
+        if (diff.values.some(x => x !== 0)) throw new Error('the same volume did not subtract to zero');
+        await evaluate('document.querySelector("#steps .step button[title=remove]").click()');
+        await setValue('outFormat', 'profile');
+        await setValue('profileWidth', 0.5);
+        const rows = fs.readFileSync(await convert('example_yell_profile.txt'), 'utf8').trim().split('\n')
+            .filter(r => !r.startsWith('#')).map(r => r.split(' ').map(Number));
+        const n = rows.reduce((s, r) => s + r[3], 0);
+        if (n !== 125 || rows.some(r => !(r[1] >= 111 && r[1] <= 555))) throw new Error('bad profile ' + JSON.stringify(rows));
     }],
     ['NeXus entry + externally linked data file -> unified', async () => {
         await setFile('#dataFile', [path.join(work, 'wrapper.nxs'), path.join(work, 't.nxs')]);
