@@ -5,7 +5,9 @@
 A browser-based converter for 3-D single-crystal diffuse-scattering data.
 It translates the same intensity grid between the file formats used by
 RMCProfile, DISCUS, Yell, Meerkat, and Scatty, and reads reduced NeXus
-volumes from Mantid and NXrefine — entirely client-side.
+volumes from Mantid and NXrefine — entirely client-side. On the way it can
+process the data (crop, rebin, mask, subtract backgrounds, symmetrize) and
+compute the 3D-ΔPDF, and it records the steps in the output.
 No installation, no server, and no upload: files never leave your computer.
 
 ## Supported formats
@@ -18,9 +20,12 @@ No installation, no server, and no upload: files never leave your computer.
 | VTK `STRUCTURED_POINTS` (`.vtk`) | yes | yes | Scatty, Spinteract, 3DSCalculator; also loads in ParaView |
 | NeXus: Mantid MDHistoWorkspace (`.nxs`) | yes | no | Mantid `SaveMD` (CORELLI, TOPAZ, WAND², DEMAND, SXD, ...) |
 | NeXus: NXdata (`.nxs`) | yes | no | NXrefine (APS 6-ID-D, CHESS QM2), other NeXus writers |
+| \|Q\| profile (`.txt`) | no | yes | shell averages of the (processed) volume |
 
 Any readable format can be converted to any writable one. The input format
-is detected automatically from the file content.
+is detected automatically from the file content. The unified and Yell
+formats also hold direct-space 3D-ΔPDF maps (u, v, w axes); these are read
+and written in those two formats only.
 
 ### Format notes
 
@@ -29,12 +34,17 @@ is detected automatically from the file content.
   contain both. New output follows the current common contract: the mandatory
   crystal-metadata audit datasets are written under `/entry/data`, with
   `audit_conform_dict_name = Disorder unified data`,
-  `data_type_axes = hkl`, and `data_type_number = real`. Readers accept
+  `data_type_axes = hkl` (`uvw` for a 3D-ΔPDF), and `data_type_number = real`. Readers accept
   the older `Disorder scattering` name and infer missing axes metadata as
   RMCProfile does for legacy files, but reject a structure dictionary or an
   unsupported axes/number type instead of silently treating it as HKL data.
   Three-dimensional `Q` axes are converted to HKL using the real parent
-  cell; scalar or direct-space axis types are outside this diffuse converter.
+  cell. Direct-space 3D-ΔPDF data are read and written with the labels
+  DiffuseCode uses (`data_type_axes = uvw`, `data_type_reciprocal =
+  patterson`, `data_type_style = single_pdf`, `data_type_content =
+  3d-delta-pdf`, axes `u`/`v`/`w`); scalar axis types (`2theta`, `r`, ...)
+  are refused. `data_type_symmetrized` is passed on, and processed output
+  records its recipe in `/entry/process` (see Processing).
   Dataset shapes are checked against `data_dimension` and the `h`/`k`/`l`
   coordinate arrays. Files in the transposed `/scattering/data` layout of the
   `write_diffuse_scattering.py` reference writer (C order `[nh,nk,nl]`, one
@@ -52,8 +62,9 @@ is detected automatically from the file content.
   reciprocal lattice units of the parent cell; written files always store the
   real cell when one is known. 1-D and 2-D `data` are read as grids with one
   point along the missing axes, and `step_size` is accepted in place of
-  `step_sizes`. Direct-space files (`is_direct = 1`, e.g. 3D-ΔPDF maps) are
-  refused. An `is_direct` value that is neither 0 nor 1 is reported as a
+  `step_sizes`. Direct-space files (`is_direct = 1`, Yell's 3D-ΔPDF maps)
+  are read as u, v, w grids and written back with `is_direct = 1`. An
+  `is_direct` value that is neither 0 nor 1 is reported as a
   corrupted flag; set *Yell data space* to *reciprocal space* to read such a
   file anyway.
 - **RMCProfile old text format**: an `npoints nsec` header followed by
@@ -154,7 +165,9 @@ then browse to `http://localhost:8000/`.
    When the data file already stores a real cell (for example RMCProfile
    `_calc.h5` output), it is used automatically and this section can be left
    empty.
-3. **Output**: pick the target format, optionally set the radiation metadata
+3. **Processing** (optional): add steps, or load a saved recipe; they run
+   in order when you convert (see Processing below).
+4. **Output**: pick the target format, optionally set the radiation metadata
    for HDF5 output, and press "Convert & download". For HDF5 output you can
    also choose
    - the precision of the data array: the same as the input (float32 data
@@ -163,10 +176,15 @@ then browse to `http://localhost:8000/`.
      default), or `/entry/data` only, which halves the file;
    - gzip compression, which is slower to write.
 
-   Text output (`.dat`, `.vtk`) is streamed directly to disk in browsers
-   that support the File System Access API (Chromium); elsewhere a chunked
-   in-memory download is used. The log reports the expected output size
-   first, and reading and writing show progress and can be cancelled.
+   The *|Q| profile* output writes the mean of the finite voxels in |Q|
+   shells of the chosen width, with the standard error of the mean and the
+   voxel count (`Q mean_I sigma_of_mean n_voxels`).
+
+   Text output (`.dat`, `.vtk`, profiles) is streamed directly to disk in
+   browsers that support the File System Access API (Chromium); elsewhere a
+   chunked in-memory download is used. The log reports the expected output
+   size first, and reading, processing and writing show progress and can be
+   cancelled.
 
 ### Large files
 
@@ -178,6 +196,8 @@ re-read. The limits are the browser's: the volume itself must fit in
 memory, and an HDF5 output file is assembled in memory, which Chrome and
 Edge cap at about 2 GB; float32, the `/entry/data`-only layout or
 compression reduce it. Text output streamed to disk has no such limit.
+Processing holds a few copies of the volume, and the 3D-ΔPDF about 64
+bytes per voxel more.
 
 ### When is the unit cell required?
 
@@ -192,6 +212,67 @@ compression reduce it. Text output streamed to disk has no such limit.
 | Mantid `.nxs` with an oriented lattice | no |
 | NeXus NXdata, hkl axes | no if the file stores a cell; otherwise as for unit metric |
 | NeXus NXdata, Cartesian Q axes | yes, unless the file stores a cell |
+
+## Processing
+
+The *Processing* panel applies a list of steps to the data before they are
+written; the input file is never changed. The steps run in the order listed.
+NaN marks masked or missing voxels throughout, and |Q| is Cartesian in
+1/Angstrom with the 2*pi convention, computed with the parent cell.
+
+| Step | What it does |
+| --- | --- |
+| Crop | keeps the points inside hkl ranges (grids along h, k, l; use Resample otherwise) |
+| Resample | NaN-aware trilinear interpolation onto a new axis-aligned hkl grid |
+| Rebin | averages blocks of voxels, skipping NaN |
+| Mask Bragg positions | boxes (half-width in r.l.u.) or spheres (radius in 1/Angstrom) around integer hkl, for P, I, F, C, A, B or R lattices |
+| Mask powder rings | voxels within ±w of given \|Q\| values |
+| Mask values | values outside a range |
+| Scale and offset | I × factor + offset |
+| Background B(\|Q\|) | subtracts a constant, linear, a − b·c^\|Q\| or tabulated function of \|Q\| |
+| Background from \|Q\| shells | subtracts the minimum or a percentile of each \|Q\| shell, optionally smoothed over neighbouring shells |
+| Combine | subtracts, adds, multiplies or divides by another volume (times a factor), interpolated onto this grid if the grids differ |
+| Replace low values | sets values below a threshold to a number or NaN |
+| Symmetrize | averages over Laue-equivalent points (-1 to m-3m; hexagonal axes for the trigonal groups), or only fills empty voxels; can extend a partial grid to its symmetric images |
+| 3D-ΔPDF | Fourier transform to direct space (below) |
+
+The other volumes that *Combine* steps use (an empty-can measurement, a
+calculated pattern, ...) are loaded under *Other volumes*, in any readable
+format; a step names its volume by file name.
+
+**Recipes.** The steps are plain JSON, for example
+
+```json
+{ "version": 1, "steps": [
+    { "op": "combine", "operation": "subtract", "file": "background.nxs" },
+    { "op": "symmetrize", "laue": "m-3m" },
+    { "op": "maskBragg", "shape": "box", "size": 0.2 },
+    { "op": "deltaPdf" } ] }
+```
+
+Recipes can be saved and loaded. Unified output of processed data records
+the recipe in `/entry/process` (an `NXprocess` group; the JSON and a
+readable list of the steps sit in its `recipe` `NXnote`), and reading such
+a file lists the steps in the log.
+
+**3D-ΔPDF.** The step computes P(r) = |det V| Σ I(q) exp(2πi q·r) over all
+grid points q, where the columns of V are the grid steps, so P approximates
+the Fourier integral whatever the sampling. P is evaluated on the direct
+grid conjugate to the data: u, v, w in lattice units of the parent cell,
+centred on the origin, with steps 1/(N·Δh) etc. for an hkl-aligned grid.
+NaN voxels, such as masked Bragg positions, count as zero, and an optional
+Tukey taper (0–1) softens truncation ripples. The largest imaginary part is
+logged and dropped; it vanishes for centrosymmetric data, e.g. after
+symmetrization. The FFT is [wgpuFFT](https://github.com/MaximEremenko/wgpuFFT)'s:
+on the CPU in float64, or with WebGPU in float32 (errors about 1e-8 of the
+peak on real data). Grids of up to 2^25 voxels (e.g. 321³) are accepted. The
+result can be written as unified or Yell data only, since the text formats
+hold reciprocal-space grids.
+
+As an example, background subtraction, m-3m symmetrization, Bragg masking
+and the 3D-ΔPDF of a 321 x 321 x 321 CORELLI volume take about 22 s in
+Chrome, most of it symmetrization; the FFT itself takes 3.4 s on the CPU
+and about 1 s on a GPU, including transfers.
 
 ## Examples
 
@@ -219,6 +300,10 @@ in all files, so results are easy to compare.
 - `js/converter.js` — format readers/writers and the cell/reciprocal-space
   math. Plain JavaScript with a UMD wrapper, also loadable from Node.js for
   testing.
+- `js/processing.js` — the processing steps and recipes (UMD like the
+  converter).
+- `js/wgpu_fft_web.js` — vendored wgpuFFT browser build (see Third-party
+  code); `tools/vendor-wgpu-fft-web.mjs` replaces it with a new build.
 - `js/unified_hdf5.js` — shared helpers for the unified HDF5
   structure/data contract. Not loaded by the converter page itself; this is
   the canonical copy of a library shared with the companion browser tools
@@ -242,6 +327,11 @@ The conversion core was verified against real files from each producer:
   string types as RMCProfile's Fortran implementation
   (`unified_config/unified_hdf5_io.f90`), and round-trip conversions through
   every format are exact at double precision.
+- 3D-ΔPDF: the transform is checked against analytic cases (a constant
+  gives an origin peak of N·|det V| and zero at the other grid points; a
+  plane wave gives peaks at ±r0), and in the browser against the same recipe
+  run in Node. On a real 321³ CORELLI volume the browser output matches
+  Node to 1e-16 of the peak with the CPU engine and to 2e-8 with the GPU.
 
 RMCProfile (built with `RMC_ENABLE_HDF5=ON`) provides Fortran command-line
 equivalents for the unified/old-text conversions: `unified_to_diffuse3d`
@@ -275,6 +365,12 @@ distributed under the NIST and HDF5 license terms reproduced in
 [`js/h5wasm-LICENSE.txt`](js/h5wasm-LICENSE.txt). The only change is a
 wrapper: the bundle's code sits inside a function, `h5wasmModule()`, whose
 source text the page uses to start the HDF5 engine in its Web Worker.
+
+`js/wgpu_fft_web.js` is a build of the browser bindings of
+[wgpuFFT](https://github.com/MaximEremenko/wgpuFFT) (Apache-2.0), with the
+WebAssembly module embedded, wrapped the same way in `wgpuFftWebModule()`.
+It includes Rust crates under the Apache-2.0, MIT and zlib licenses; see
+[`js/wgpu_fft_web-LICENSES.txt`](js/wgpu_fft_web-LICENSES.txt).
 
 ## Provenance
 
