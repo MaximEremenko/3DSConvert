@@ -413,4 +413,4 @@ if (require.main === module) {
         });
 }
 
-module.exports = { main, parseArgs, parseCrop, parseCell, DiskFile };
+module.exports = { main, parseArgs, parseCrop, parseCell, DiskFile, startEngine };

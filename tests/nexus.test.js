@@ -54,7 +54,9 @@ test('Mantid: 2-D workspaces pad to a single layer; Q frames and 4-D data are re
     assert.deepEqual(flat.dims, [4, 3, 1]);
     assert.equal(at(flat, 3, 2, 0), code(3, 2, 0));
     await assert.rejects(Converter.readMantidMD(await mantidFile({ system: 2, frame: 'QSample' })),
-        /Q \(sample frame\) frame; only HKL workspaces/);
+        /Q \(sample frame\) frame and stores no UB matrix/);
+    await assert.rejects(Converter.readMantidMD(await mantidFile({ system: 1, frame: 'QLab' })),
+        /Q \(lab frame\) frame; HKL and Q \(sample frame\) workspaces are supported/);
     await assert.rejects(Converter.readMantidMD(await mantidFile({
         n: [2, 2, 2, 2], edges: [[0, 1], [0, 1], [0, 1], [0, 1]], names: ['a', 'b', 'c', 'd'], values: new Float64Array(16),
     })), /4 dimensions, and d \(2 bins\) is not integrated/);
@@ -288,4 +290,26 @@ test('Mantid: a fourth dimension integrated into one bin (DeltaE) leaves a volum
     assert.equal(at(m, 3, 2, 1), code(3, 2, 1));
     const cut = await mantidFile({ n: [4, 3, 2, 5], names, edges: [[-1, 1], [-3, 3], [0, 2], [-2, 2]], values: new Float64Array(120) });
     await assert.rejects(Converter.readMantidMD(cut, {}), /DeltaE \(5 bins\) is not integrated/);
+});
+
+test('Mantid: a Q (sample frame) workspace goes onto hkl axes through its UB', async () => {
+    const c = Math.cos(Math.PI / 6), s = Math.sin(Math.PI / 6);
+    const U = [[c, -s, 0], [s, c, 0], [0, 0, 1]];
+    const UB = U.map(r => r.map(x => x / 4.05));                         // cubic a = 4.05: B = I / a
+    const f = await mantidFile({
+        system: 2, frame: 'QSample', names: ['Q_sample_x', 'Q_sample_y', 'Q_sample_z'], edges: [[-1, 1], [-3, 3], [0, 2]], W: null,
+        extra: file => file.get('MDHistoWorkspace/experiment0/sample/oriented_lattice')
+            .create_dataset({ name: 'orientation_matrix', data: UB.flat(), shape: [3, 3], dtype: '<d' }),
+    });
+    const m = await Converter.readMantidMD(f, {});
+    // bin centres in Q, and hkl = -(2 pi UB)^-1 Q (Inelastic) = -(a / 2 pi) U^T Q
+    const qOf = (i, j, k) => [-1 + (i + 0.5) * 0.5, -3 + (j + 0.5) * 2, (k + 0.5) * 1];
+    const hklOf = q => [0, 1, 2].map(r => -4.05 / (2 * Math.PI) * (U[0][r] * q[0] + U[1][r] * q[1] + U[2][r] * q[2]));
+    for (const [i, j, k] of [[0, 0, 0], [3, 2, 1], [1, 2, 0]]) {
+        const x = [0, 1, 2].map(cc => m.corner[cc] + i * m.vectors[0][cc] + j * m.vectors[1][cc] + k * m.vectors[2][cc]);
+        assert.ok(maxAbsDiff(x, hklOf(qOf(i, j, k))) < 1e-12, `point ${i} ${j} ${k}`);
+    }
+    assert.equal(at(m, 3, 2, 1), code(3, 2, 1));
+    assert.match(m.notes.join('\n'), /hkl = −\(2π UB\)⁻¹ Q \(QConvention Inelastic\)/);
+    assert.equal(maxAbsDiff(m.ub.flat(), UB.flat()), 0);
 });

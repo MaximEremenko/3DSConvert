@@ -110,6 +110,11 @@
         return attr ? textValue(attr.value) : '';
     }
 
+    // A 3 x 3 matrix (rows) from 9 numbers in row order, or null.
+    function rows3(flat) {
+        return flat && flat.length === 9 && flat.every(Number.isFinite) ? [flat.slice(0, 3), flat.slice(3, 6), flat.slice(6, 9)] : null;
+    }
+
     // A numeric attribute (scalar or first element), or null.
     function attributeNumber(obj, name) {
         const attr = obj && obj.attrs && obj.attrs[name];
@@ -470,15 +475,24 @@
                angles.every(x => Math.abs(x - 90) <= UNIT_METRIC_TOL);
     }
 
-    function modelAxesToHkl(model, cell) {
+    // Cartesian Q axes to hkl: with a UB (Q = 2 pi UB hkl, the sample frame)
+    // when one is given, else with the cell in the frame with a along x.
+    function modelAxesToHkl(model, cell, ub) {
         if (!model || model.axesType === 'hkl' || !model.axesType) return model;
         if (model.axesType !== 'Q') {
             throw new Error(`cannot convert ${model.axesType} axes to hkl`);
         }
-        const A = cellToLattice(cell.lengths, cell.angles);
+        let toHkl;
+        if (ub) {
+            const K = invert3x3(ub.map(r => r.map(x => 2 * Math.PI * x)));
+            toHkl = q => [0, 1, 2].map(r => K[r][0] * q[0] + K[r][1] * q[1] + K[r][2] * q[2]);
+        } else {
+            const A = cellToLattice(cell.lengths, cell.angles);
+            toHkl = q => qToHkl(A, q);
+        }
         return Object.assign({}, model, {
-            corner: qToHkl(A, model.corner),
-            vectors: model.vectors.map(v => qToHkl(A, v)),
+            corner: toHkl(model.corner),
+            vectors: model.vectors.map(toHkl),
             axesType: 'hkl',
         });
     }
@@ -548,8 +562,12 @@
             return v;
         };
         const sg = datasetText(f, 'sample/space_group');
+        // B is the upper Cholesky factor of the reciprocal metric (Busing-Levy,
+        // no 2 pi), so U B is a UB in Mantid's sense.
+        const U = rows3(numbersAt(f, 'sample/U')), B = rows3(numbersAt(f, 'sample/B'));
+        const ub = U && B ? U.map(r => [0, 1, 2].map(c => r[0] * B[0][c] + r[1] * B[1][c] + r[2] * B[2][c])) : null;
         return Object.assign({ lengths: ['a', 'b', 'c'].map(need), angles: ['alpha', 'beta', 'gamma'].map(need), source: 'subhkl' },
-            sg ? { spaceGroup: sg } : {});
+            sg ? { spaceGroup: sg } : {}, ub ? { ub } : {});
     }
 
     // ----------------------------------------------------------------- readers
@@ -955,11 +973,13 @@
         if (symmetrized) notes.push(`symmetrized by rspace3d over Laue group ${laue} (${applied} operations)`);
         const measured = attributeNumber(f, 'measured_pct');
         if (measured !== null) notes.push(`${+measured.toFixed(1)}% of the voxels measured`);
+        // CrysAlisPro's UB is in units of 1/wavelength
+        const ubBL = ub && ub.length === 9 && wavelength > 0 ? rows3(ub.map(x => x / wavelength)) : null;
         return Object.assign({
             dims: grid.dims, corner: grid.corner, vectors: grid.vectors, values,
             cellLengths: lengths, cellAngles: angles, radiation: 'xray', axes: pickAxes(grid.vectors, grid.dims),
             axesType: 'hkl', notes,
-        }, symmetrized ? { symmetrized: 'laue', laueGroup: laue } : {});
+        }, symmetrized ? { symmetrized: 'laue', laueGroup: laue } : {}, ubBL ? { ub: ubBL } : {});
     }
 
     // ------------------------------------------------------------------ NeXus
@@ -1071,13 +1091,20 @@
         }
         const frames = [...new Set(info.map(a => a.frame).filter(Boolean))];
         const hkl = system === 3 || (system === null && frames.length === 1 && frames[0] === 'HKL');
-        if (!hkl || frames.some(fr => fr !== 'HKL')) {
+        // The UB of the oriented lattice: Q_sample = 2 pi UB hkl (Busing-Levy).
+        const ub = rows3(numbersAt(f, 'MDHistoWorkspace/experiment0/sample/oriented_lattice/orientation_matrix'));
+        const qsample = !hkl && (system === 2 || (frames.length === 1 && frames[0] === 'QSample'));
+        if (qsample && !ub) {
+            throw new Error('the MDHistoWorkspace is in the Q (sample frame) frame and stores no UB matrix ' +
+                '(oriented_lattice/orientation_matrix), so it cannot be put on hkl axes; set the UB (SetUB) or bin it in HKL');
+        }
+        if (!qsample && (!hkl || frames.some(fr => fr !== 'HKL'))) {
             const name = { 0: 'general', 1: 'Q (lab frame)', 2: 'Q (sample frame)' }[system] || frames.join('/') || 'unknown';
-            throw new Error(`the MDHistoWorkspace is in the ${name} frame; only HKL workspaces are ` +
-                'supported - bin it in HKL (e.g. with MDNorm) before saving');
+            throw new Error(`the MDHistoWorkspace is in the ${name} frame; HKL and Q (sample frame) workspaces are ` +
+                'supported - bin it in HKL (e.g. with MDNorm), or in Q_sample, before saving');
         }
 
-        const W = numbersAt(f, 'MDHistoWorkspace/experiment0/logs/W_MATRIX/value');
+        const W = qsample ? null : numbersAt(f, 'MDHistoWorkspace/experiment0/logs/W_MATRIX/value');
         const basis = [];
         for (let j = 0; j < 3; j++) {
             const named = j < nd ? projectionVector(info[j].longName) : null;
@@ -1101,13 +1128,26 @@
                 'not applied; the grid follows the dimension names and W_MATRIX');
         }
         if (nd < 3) notes.push(`${nd}-D workspace read as a ${dims.join(' x ')} grid`);
-        const corner = [0, 0, 0];
-        const vectors = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+        let corner = [0, 0, 0];
+        let vectors = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
         for (let j = 0; j < nd; j++) {
             for (let c = 0; c < 3; c++) {
                 corner[c] += basis[j][c] * info[j].first;
                 vectors[j][c] = dims[j] > 1 ? basis[j][c] * info[j].step : 0;
             }
+        }
+        if (qsample) {
+            // hkl = s (2 pi UB)^-1 Q, s = -1 in Mantid's default Inelastic
+            // convention (Q = k_i - k_f), +1 in the Crystallography one: an
+            // exact, generally sheared, hkl grid.
+            const convention = attributeText(f.get('MDHistoWorkspace'), 'QConvention') || 'Inelastic';
+            const sign = /crystal/i.test(convention) ? 1 : -1;
+            const K = invert3x3(ub.map(r => r.map(x => 2 * Math.PI * x))).map(r => r.map(x => sign * x));
+            const apply = v => [0, 1, 2].map(r => K[r][0] * v[0] + K[r][1] * v[1] + K[r][2] * v[2]);
+            corner = apply(corner);
+            vectors = vectors.map(v => (v.some(Boolean) ? apply(v) : v));
+            notes.push(`Q (sample frame) put on hkl axes with the workspace's UB: hkl = ${sign < 0 ? '−' : ''}(2π UB)⁻¹ Q ` +
+                `(QConvention ${convention})`);
         }
 
         const progress = opts.progress;
@@ -1160,6 +1200,7 @@
         } else {
             notes.push('no oriented lattice stored; supply the parent cell');
         }
+        if (ub) notes.push('UB matrix read from the oriented lattice');
         if (f.get('MDHistoWorkspace/experiment1')) {
             notes.push('the workspace holds several experiments; the lattice of experiment0 is used');
         }
@@ -1167,6 +1208,7 @@
         return {
             dims: grid.dims, corner: grid.corner, vectors: grid.vectors, values, sigma, cellLengths: lengths, cellAngles: angles,
             radiation: 'neutron', axes: pickAxes(grid.vectors, grid.dims), axesType: 'hkl', notes,
+            ub: ub || undefined,
         };
     }
 
@@ -1316,6 +1358,8 @@
                 if (t !== null) meta.temperature = t;
             }
             if (!meta.laueGroup && text(s + 'laue_group')) meta.laueGroup = text(s + 'laue_group');
+            // NXsample ub_matrix: Busing-Levy, Q = 2 pi UB hkl
+            if (!meta.ub) meta.ub = rows3(numbersAt(f, s + 'ub_matrix')) || undefined;
             if (!meta.spaceGroup && text(s + 'space_group')) meta.spaceGroup = text(s + 'space_group');
             if (meta.wavelength === undefined) {
                 const w = firstNumber(f, e + '/instrument/monochromator/wavelength');
@@ -1435,7 +1479,7 @@
         return {
             dims, corner, vectors, values, sigma, cellLengths: lengths, cellAngles: angles,
             radiation: meta.radiation || 'unknown', axes: pickAxes(vectors, dims),
-            axesType: frame === 'Q' ? 'Q' : 'hkl', notes, nexusPath: pick.path,
+            axesType: frame === 'Q' ? 'Q' : 'hkl', notes, nexusPath: pick.path, ub: meta.ub,
         };
     }
 
@@ -3018,11 +3062,13 @@
         model = Object.assign({}, model);
         if (params.radiation) model.radiation = params.radiation;
         if (model.axesType === 'Q') {
-            if (isUnitMetric(resolved.cell.lengths, resolved.cell.angles)) {
-                throw new Error('Q-axis unified data needs a real parent cell to convert Q to hkl');
+            const ub = params.ub || model.ub || null;
+            if (!ub && isUnitMetric(resolved.cell.lengths, resolved.cell.angles)) {
+                throw new Error('Q-axis data need a real parent cell (or a UB matrix) to convert Q to hkl');
             }
-            model = modelAxesToHkl(model, resolved.cell);
-            logs.push('Converted unified Cartesian Q axes to hkl using the selected parent cell.');
+            model = modelAxesToHkl(model, resolved.cell, ub);
+            logs.push(ub ? `Converted Cartesian Q axes to hkl with the ${params.ub ? 'typed' : "file's"} UB matrix (hkl = (2π UB)⁻¹ Q).`
+                : 'Converted Cartesian Q axes to hkl using the selected parent cell (a along x).');
         }
         checkWritable(model, params.format);
         if (text && isUnitMetric(resolved.cell.lengths, resolved.cell.angles)) {

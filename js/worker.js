@@ -224,7 +224,7 @@ function converterWorker(self, h5wasm, Converter, Processing, wgpuFftWeb) {
         const recipe = params.recipe && params.recipe.steps && params.recipe.steps.length
             ? Processing.normalizeRecipe(params.recipe) : null;
         const key = JSON.stringify([state.dataVersion, state.extrasVersion, state.structVersion, params.manual || null,
-            params.cellPrefer || null, params.grid || null, params.customFrame || null, params.radiation || null, recipe]);
+            params.cellPrefer || null, params.grid || null, params.customFrame || null, params.radiation || null, params.ub || null, recipe]);
         if (state.processed && state.processed.key === key) {
             ctx.log('Using the processed data from the preview.');
             return state.processed;
@@ -290,6 +290,7 @@ function converterWorker(self, h5wasm, Converter, Processing, wgpuFftWeb) {
             return Object.assign(common, {
                 kind: data.kind, dims: m.dims, cellLengths: m.cellLengths, cellAngles: m.cellAngles,
                 axesType: m.axesType, content: m.content || null, legacyContract: !!m.legacyContract, hasSigma: !!m.sigma,
+                ub: m.ub || null,
                 notes: m.notes || [], precision: m.values instanceof Float32Array ? 'float32' : 'float64',
             });
         }
@@ -315,9 +316,6 @@ function converterWorker(self, h5wasm, Converter, Processing, wgpuFftWeb) {
         return { dims: g.dims, values: g.values, corner: g.origin, vectors, names };
     }
 
-    // The plane of the grid with grid axis `normal` fixed at `index` (or at
-    // the plane nearest the coordinate `coord` along it), as float32 rows from
-    // the top (the second in-plane axis increases upwards).
     // Colour levels over the whole volume (from a sample of it), so the page
     // keeps one scale while it moves through the planes: robust linear and
     // log ranges, and the largest |value| for the diverging scale.
@@ -342,6 +340,236 @@ function converterWorker(self, h5wasm, Converter, Processing, wgpuFftWeb) {
         return out;
     }
 
+
+    // ---- planes of any orientation -------------------------------------------
+    // A plane is a layer n . x = t of the grid coordinates x (hkl, uvw or Q).
+    // For hkl data n = [u v w] gives the reciprocal-lattice layers
+    // u h + v k + w l = t: [0 0 1] the (h k 0) planes, [1 -1 0] the (h h l)
+    // ones. The plane is sampled by interpolation, about a voxel per pixel,
+    // either along two in-plane grid-coordinate directions (frame 'grid',
+    // drawn the way the grid is indexed) or on a square grid in Cartesian
+    // space, x -> M x (frame 'cartesian': Q = 2 pi UB hkl, or 2 pi B hkl with
+    // a along x, or A uvw), where angles and lengths are true.
+
+    const dot3 = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+    const cross3 = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+    const mul3 = (M, v) => [0, 1, 2].map(r => M[r][0] * v[0] + M[r][1] * v[1] + M[r][2] * v[2]);
+    function inv3(M) {
+        const [[a, b, c], [d, e, f], [g, h, i]] = M;
+        const A = e * i - f * h, B = f * g - d * i, C = d * h - e * g;
+        const det = a * A + b * B + c * C;
+        if (!det || !Number.isFinite(det)) throw new Error('singular matrix');
+        return [[A / det, (c * h - b * i) / det, (b * f - c * e) / det],
+            [B / det, (a * i - c * g) / det, (c * d - a * f) / det],
+            [C / det, (b * g - a * h) / det, (a * e - b * d) / det]];
+    }
+
+    // A direction as small whole numbers when it has such a form (else with
+    // its largest component 1), positive at its largest component.
+    function tidy(v) {
+        const big = Math.max(...v.map(Math.abs));
+        if (!(big > 0)) return v.slice();
+        let u = v.map(x => x / big);
+        for (let d = 1; d <= 12; d++) {
+            const w = u.map(x => x * d);
+            if (w.every(x => Math.abs(x - Math.round(x)) < 1e-6)) {
+                u = w.map(Math.round);
+                break;
+            }
+        }
+        const k = u.reduce((m, x, i) => (Math.abs(x) > Math.abs(u[m]) + 1e-9 ? i : m), 0);
+        return u.map(x => (u[k] < 0 ? -x : x) + 0);
+    }
+
+    // Two directions in the plane n . x = 0: e2 from the last axis (else the
+    // second), e1 = e2 x n; for [0 0 1] they are [1 0 0] and [0 1 0].
+    function planeBasis(n) {
+        const nn = dot3(n, n);
+        const proj = a => {
+            const k = dot3(a, n) / nn;
+            return a.map((x, i) => x - k * n[i]);
+        };
+        let e2 = proj([0, 0, 1]);
+        if (Math.hypot(...e2) < 0.3) e2 = proj([0, 1, 0]);
+        return { e1: tidy(cross3(e2, n)), e2: tidy(e2) };
+    }
+
+    // "h - k", "2h + l": the layer n . x as text.
+    function combination(n, names) {
+        let s = '';
+        n.forEach((c, i) => {
+            if (Math.abs(c) < 1e-12) return;
+            const m = Math.abs(c), term = (Math.abs(m - 1) < 1e-9 ? '' : String(+m.toPrecision(6))) + names[i];
+            s += s ? ` ${c < 0 ? '−' : '+'} ${term}` : (c < 0 ? '−' : '') + term;
+        });
+        return s || '0';
+    }
+    const vectorName = v => `[${v.map(x => String(+x.toPrecision(4)).replace(/^-/, '−')).join(' ')}]`;
+
+    // Trilinear interpolation at a fractional grid index. A point whose nearest
+    // voxel holds no data has none (masks stay sharp); NaN neighbours are left
+    // out of the weights. undefined outside the grid.
+    function sampler(geo) {
+        const [nx, ny, nz] = geo.dims, v = geo.values, nxy = nx * ny;
+        return (fx, fy, fz) => {
+            if (!(fx > -0.5 && fy > -0.5 && fz > -0.5 && fx < nx - 0.5 && fy < ny - 0.5 && fz < nz - 0.5)) return undefined;
+            const near = v[(Math.round(fz) * ny + Math.round(fy)) * nx + Math.round(fx)];
+            if (near !== near) return NaN;
+            const cx = Math.min(nx - 1, Math.max(0, fx)), cy = Math.min(ny - 1, Math.max(0, fy)), cz = Math.min(nz - 1, Math.max(0, fz));
+            const x0 = Math.floor(cx), y0 = Math.floor(cy), z0 = Math.floor(cz);
+            const x1 = Math.min(nx - 1, x0 + 1), y1 = Math.min(ny - 1, y0 + 1), z1 = Math.min(nz - 1, z0 + 1);
+            const wx = cx - x0, wy = cy - y0, wz = cz - z0;
+            let sum = 0, ws = 0;
+            const add = (x, y, z, w) => {
+                if (!w) return;
+                const val = v[(z * ny + y) * nx + x];
+                if (val === val) {
+                    sum += w * val;
+                    ws += w;
+                }
+            };
+            add(x0, y0, z0, (1 - wx) * (1 - wy) * (1 - wz));
+            add(x1, y0, z0, wx * (1 - wy) * (1 - wz));
+            add(x0, y1, z0, (1 - wx) * wy * (1 - wz));
+            add(x1, y1, z0, wx * wy * (1 - wz));
+            add(x0, y0, z1, (1 - wx) * (1 - wy) * wz);
+            add(x1, y0, z1, wx * (1 - wy) * wz);
+            add(x0, y1, z1, (1 - wx) * wy * wz);
+            add(x1, y1, z1, wx * wy * wz);
+            return ws > 0 ? sum / ws : NaN;
+        };
+    }
+
+    // The Cartesian map x -> M x of the grid coordinates, and its unit:
+    // Q = 2 pi UB hkl (UB in the Busing-Levy sense, without 2 pi), else
+    // 2 pi B hkl for the cell with a along x; A uvw; Q grids are Cartesian.
+    function cartesianMap(geo, cell, ub) {
+        const direct = geo.names[0] === 'u', q = geo.names[0] === 'Qx';
+        if (q) return { M: [[1, 0, 0], [0, 1, 0], [0, 0, 1]], unit: 'Å⁻¹', source: 'Q' };
+        const real = cell && cell.lengths && !Converter.isUnitMetric(cell.lengths, cell.angles);
+        if (direct) {
+            return real ? { M: Converter.cellToLattice(cell.lengths, cell.angles), unit: 'Å', source: 'cell' }
+                : { M: [[1, 0, 0], [0, 1, 0], [0, 0, 1]], unit: 'lattice units', source: 'none' };
+        }
+        const t = 2 * Math.PI;
+        if (ub && ub.length === 3) return { M: ub.map(r => r.map(x => t * x)), unit: 'Å⁻¹', source: 'UB' };
+        if (real) {
+            const B = Converter.reciprocalBasis(Converter.cellToLattice(cell.lengths, cell.angles));
+            return { M: B.map(r => r.map(x => t * x)), unit: 'Å⁻¹', source: 'cell' };
+        }
+        return { M: [[1, 0, 0], [0, 1, 0], [0, 0, 1]], unit: 'r.l.u.', source: 'none' };
+    }
+
+    // spec: { n, level, index, point, frame, cell, ub }. The plane at `level`,
+    // else layer `index`, else through `point`, else through 0, else the
+    // middle. Returns the slicePlane fields, plus pixel: the grid coordinates
+    // of pixel (0, bottom row) and their steps per pixel along x and y.
+    function generalPlane(geo, spec) {
+        const dims = geo.dims, corner = geo.corner;
+        const n = spec.n.map(Number);
+        if (n.length !== 3 || !n.every(Number.isFinite) || !(dot3(n, n) > 0)) throw new Error('the plane normal must be three numbers, not all 0');
+        const cols = geo.vectors.map(v => v.slice());
+        const flat = [0, 1, 2].filter(a => dims[a] <= 1 || !cols[a].some(Boolean));
+        if (flat.length > 1) throw new Error('planes of any orientation need a grid with at least two axes');
+        if (flat.length === 1) {
+            const [b, c] = [0, 1, 2].filter(a => a !== flat[0]);
+            cols[flat[0]] = cross3(cols[b], cols[c]);
+        }
+        const G = [0, 1, 2].map(r => [0, 1, 2].map(a => cols[a][r]));
+        const Gi = inv3(G);
+        const toIndex = x => mul3(Gi, [x[0] - corner[0], x[1] - corner[1], x[2] - corner[2]]);
+        const box = [];
+        for (const i of [0, dims[0] - 1]) for (const j of [0, dims[1] - 1]) for (const k of [0, dims[2] - 1]) {
+            box.push([0, 1, 2].map(c => corner[c] + i * cols[0][c] + j * cols[1][c] + k * cols[2][c]));
+        }
+        // the layers: one voxel apart along the axis most across the plane
+        const ts = box.map(x => dot3(n, x)), tmin = Math.min(...ts), tmax = Math.max(...ts);
+        const across = [0, 1, 2].filter(a => dims[a] > 1).map(a => Math.abs(dot3(n, cols[a])))
+            .filter(x => x > 1e-9 * Math.sqrt(dot3(n, n)) * Math.max(...cols.map(c => Math.hypot(...c))));
+        const dt = across.length ? Math.min(...across) : 1;
+        const layers = Math.max(1, Math.floor((tmax - tmin) / dt + 1e-6) + 1);
+        let level = Number(spec.level);
+        if (!Number.isFinite(level)) {
+            if (Number.isFinite(spec.index)) level = tmin + Math.min(layers - 1, Math.max(0, Math.round(spec.index))) * dt;
+            else if (spec.point && spec.point.every(Number.isFinite)) level = dot3(n, spec.point);
+            else level = tmin <= 0 && tmax >= 0 ? 0 : (tmin + tmax) / 2;
+        }
+        level = Math.min(tmax, Math.max(tmin, level));
+        const index = Math.min(layers - 1, Math.max(0, Math.round((level - tmin) / dt)));
+
+        // pixel axes: in-plane grid-coordinate directions, or Cartesian ones
+        const { e1, e2 } = planeBasis(n);
+        const centre = [0, 1, 2].map(c => corner[c] + [0, 1, 2].reduce((s, a) => s + (dims[a] - 1) / 2 * cols[a][c], 0));
+        const p0 = centre.map((x, i) => x + (level - dot3(n, centre)) / dot3(n, n) * n[i]);
+        let A = e1, B = e2, P = p0, unit = '', names, cart = null;
+        if (spec.frame === 'cartesian') {
+            cart = cartesianMap(geo, spec.cell, spec.ub);
+            const M = cart.M, Mi = inv3(M);
+            const unitv = v => v.map(x => x / Math.hypot(...v));
+            const E1 = unitv(mul3(M, e1)), m2 = mul3(M, e2);
+            const E2 = unitv(m2.map((x, i) => x - dot3(m2, E1) * E1[i]));
+            A = mul3(Mi, E1);
+            B = mul3(Mi, E2);
+            const q0 = mul3(M, p0);
+            P = p0.map((x, i) => x - dot3(E1, q0) * A[i] - dot3(E2, q0) * B[i]);
+            unit = cart.unit;
+            names = [`${vectorName(e1)}`, `${vectorName(e2)}⊥`];
+        } else {
+            names = [vectorName(e1), vectorName(e2)];
+        }
+        // the plane's extent over the grid, in (x, y) coordinates
+        const S = inv3([0, 1, 2].map(r => [A[r], B[r], n[r]]));
+        let xmin = Infinity, xmax = -Infinity, ymin = Infinity, ymax = -Infinity;
+        for (const x of box) {
+            const [a, b] = mul3(S, x.map((c, i) => c - P[i]));
+            xmin = Math.min(xmin, a);
+            xmax = Math.max(xmax, a);
+            ymin = Math.min(ymin, b);
+            ymax = Math.max(ymax, b);
+        }
+        const fA = mul3(Gi, A), fB = mul3(Gi, B);
+        let dx = 1 / Math.max(1e-12, Math.hypot(...fA)), dy = 1 / Math.max(1e-12, Math.hypot(...fB));
+        if (spec.frame === 'cartesian') dx = dy = Math.min(dx, dy);          // square pixels
+        const MAX = 900;
+        dx = Math.max(dx, (xmax - xmin) / (MAX - 1));
+        dy = Math.max(dy, (ymax - ymin) / (MAX - 1));
+        if (spec.frame === 'cartesian') dx = dy = Math.max(dx, dy);
+        // whole steps from the plane's origin, so pixels fall on the grid points the plane meets
+        xmin = Math.floor(xmin / dx + 1e-6) * dx;
+        ymin = Math.floor(ymin / dy + 1e-6) * dy;
+        const w = Math.max(1, Math.ceil((xmax - xmin) / dx - 1e-6) + 1), h = Math.max(1, Math.ceil((ymax - ymin) / dy - 1e-6) + 1);
+        const values = new Float32Array(w * h), outside = new Uint8Array(w * h);
+        const at = sampler(geo), f0 = toIndex(P);
+        let anyOutside = false;
+        for (let r = 0; r < h; r++) {
+            const b = ymin + (h - 1 - r) * dy;
+            for (let c = 0; c < w; c++) {
+                const a = xmin + c * dx;
+                const val = at(f0[0] + a * fA[0] + b * fB[0], f0[1] + a * fA[1] + b * fB[1], f0[2] + a * fA[2] + b * fB[2]);
+                if (val === undefined) {
+                    values[r * w + c] = NaN;
+                    outside[r * w + c] = 1;
+                    anyOutside = true;
+                } else {
+                    values[r * w + c] = val;
+                }
+            }
+        }
+        const origin = [0, 1, 2].map(i => P[i] + xmin * A[i] + ymin * B[i]);
+        return {
+            width: w, height: h, values, outside: anyOutside ? outside : null, frame: spec.frame === 'cartesian' ? 'cartesian' : 'grid',
+            general: true, unit, cartesian: cart ? { M: cart.M, unit: cart.unit, source: cart.source } : null,
+            x: { name: names[0], n: w, from: xmin, to: xmin + (w - 1) * dx },
+            y: { name: names[1], n: h, from: ymin, to: ymin + (h - 1) * dy },
+            normal: { name: combination(n, geo.names), n: layers, from: tmin, to: tmin + (layers - 1) * dt, index, level, vector: n },
+            pixel: { origin, dx: A.map(v => v * dx), dy: B.map(v => v * dy) },
+            names: geo.names.slice(),
+        };
+    }
+
+    // The plane of the grid with grid axis `normal` fixed at `index` (or at
+    // the plane nearest the coordinate `coord` along it), as float32 rows from
+    // the top (the second in-plane axis increases upwards).
     function slicePlane(geo, normal, index, coord) {
         const [nh, nk, nl] = geo.dims;
         const [ax, ay] = [0, 1, 2].filter(a => a !== normal);
@@ -378,11 +606,23 @@ function converterWorker(self, h5wasm, Converter, Processing, wgpuFftWeb) {
             };
         };
         const at0 = [0, 1, 2].map(c => geo.corner[c] + i0 * geo.vectors[normal][c]);
-        return { width: w, height: h, values: out, x: axis(ax), y: axis(ay), normal: Object.assign(axis(normal), { index: i0, at: at0 }) };
+        const nrm = axis(normal);
+        return {
+            width: w, height: h, values: out, x: axis(ax), y: axis(ay), frame: 'grid',
+            normal: Object.assign(nrm, { index: i0, at: at0, level: nrm.n > 1 ? nrm.from + i0 * (nrm.to - nrm.from) / (nrm.n - 1) : nrm.from }),
+            pixel: { origin: at0, dx: geo.vectors[ax].slice(), dy: geo.vectors[ay].slice() }, names: geo.names.slice(),
+        };
     }
 
     const methods = {
         async ping() {
+            return {};
+        },
+
+        // Release the yield channel, so a Node process running this core can end.
+        async close() {
+            channel.port1.close();
+            channel.port2.close();
             return {};
         },
 
@@ -526,11 +766,33 @@ function converterWorker(self, h5wasm, Converter, Processing, wgpuFftWeb) {
 
         // A plane of the loaded data ('input') or of the last previewRecipe
         // result ('processed'); see slicePlane.
-        async slice({ stage, normal, index, at }) {
+        // normal: a grid axis (0, 1, 2) or 'custom' with `vector`; frame
+        // 'grid' or 'cartesian' (with cell and ub); level / point place a
+        // custom plane. See slicePlane and generalPlane.
+        async slice({ stage, normal, index, at, vector, level, point, frame, cell, ub }) {
             const source = stage === 'processed' ? state.processed && { model: state.processed.plan.model } : state.data;
             if (!source) throw new Error(stage === 'processed' ? 'no processed preview yet' : 'no data file loaded');
             const geo = geometryOf(source);
-            const plane = slicePlane(geo, normal, index, at);
+            // a grid plane through a pinned point: its coordinate along the plane's axis
+            if (at === undefined && point && (index === null || index === undefined) && normal !== 'custom') {
+                const v = geo.vectors[normal].map(Math.abs);
+                at = point[v.indexOf(Math.max(...v))];
+            }
+            let plane;
+            if (normal === 'custom') {
+                plane = generalPlane(geo, { n: vector, level, index, point, frame, cell, ub });
+            } else if (frame === 'cartesian') {
+                // the grid plane, as a layer of the axes' own normal, true to scale
+                const [a, b] = [0, 1, 2].filter(x => x !== normal);
+                let n = cross3(geo.vectors[a], geo.vectors[b]);
+                if (!n.some(Boolean)) n = [0, 1, 2].map(c => (c === normal ? 1 : 0));
+                if (dot3(n, geo.vectors[normal]) < 0) n = n.map(x => -x);
+                const base = slicePlane(geo, normal, index, at);
+                plane = generalPlane(geo, { n: tidy(n), index: base.normal.index, frame, cell, ub });
+                plane.normal.name = base.normal.name;
+            } else {
+                plane = slicePlane(geo, normal, index, at);
+            }
             plane.levels = volumeLevels(geo.values);
             return { result: plane, transfer: [plane.values.buffer] };
         },

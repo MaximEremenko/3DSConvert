@@ -575,6 +575,7 @@
     const differs = d && s && [0, 1, 2].some(i => Math.abs(d.lengths[i] - s.lengths[i]) > 0.005 * d.lengths[i] ||
       Math.abs(d.angles[i] - s.angles[i]) > 0.5);
     $('cellWarn').hidden = !differs;
+    renderUB();
     if (differs) {
       $('cellWarn').textContent = `The structure file's cell (${fmtCell(s)}) differs from the data file's (${fmtCell(d)}); ` +
         `the conversion uses ${SOURCE_NAME[src]}.`;
@@ -592,6 +593,53 @@
   for (const id of CELL_IDS) $(id).addEventListener('input', () => {
     renderCell();
     stepsChanged();
+    if (preview.frame === 'cartesian') {
+      clearTimeout(preview.timer);
+      preview.timer = setTimeout(loadSlice, 300);
+    }
+  });
+
+  // ------------------------------------------------------------ UB matrix
+  // Typed, else from the data file (Mantid, rspace3d, NeXus) or the
+  // structure file (subhkl): Q = 2 pi UB hkl.
+  const UB_IDS = [0, 1, 2].flatMap(r => [0, 1, 2].map(c => `ub${r}${c}`));
+  const fileUB = () => (state.data && state.data.ub) || (state.struct && state.struct.ub) || null;
+  const currentUB = () => state.ubManual || fileUB();
+  function renderUB() {
+    const ub = currentUB();
+    UB_IDS.forEach((id, i) => {
+      if (document.activeElement !== $(id)) $(id).value = ub ? String(+ub[Math.floor(i / 3)][i % 3].toPrecision(8)) : '';
+    });
+    $('ubNote').textContent = state.ubManual ? 'typed (used for Cartesian Q data and the preview)'
+      : ub ? `from the ${state.data && state.data.ub ? 'data' : 'structure'} file` : 'none: the cell, with a along x, sets the Cartesian frame';
+    $('ubClear').hidden = !state.ubManual;
+  }
+  function readUB() {
+    const v = UB_IDS.map(id => parseNum($(id).value));
+    if (v.every(x => !Number.isFinite(x))) {
+      state.ubManual = null;
+    } else if (v.every(Number.isFinite)) {
+      const m = [v.slice(0, 3), v.slice(3, 6), v.slice(6, 9)];
+      const det = m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0]) +
+        m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+      if (!det) {
+        $('ubNote').textContent = 'that UB is singular';
+        return;
+      }
+      state.ubManual = m;
+    } else {
+      return;                                   // still typing
+    }
+    renderUB();
+    stepsChanged();
+    if (preview.frame === 'cartesian') loadSlice();
+  }
+  for (const id of UB_IDS) $(id).addEventListener('change', readUB);
+  $('ubClear').addEventListener('click', () => {
+    state.ubManual = null;
+    renderUB();
+    stepsChanged();
+    if (preview.frame === 'cartesian') loadSlice();
   });
 
   async function loadStructureFile(file) {
@@ -1160,6 +1208,11 @@
     // colour levels: 'volume' (the whole volume's range, kept for every plane),
     // 'slice' (each plane's own range) or 'set' (typed, in data units)
     levelMode: 'volume', levelSet: null,
+    // slice zoom (scale and offset in CSS pixels of the plot) and its plane;
+    // the |Q| range shown in the profile (null: all)
+    zoom: { z: 1, x: 0, y: 0, key: '' }, qRange: null,
+    // a custom plane: its normal and level; the frame ('grid' or 'cartesian')
+    vector: [1, -1, 0], level: null, frame: 'grid',
     ready: false, stale: false, seq: 0, timer: 0, ptimer: 0,
   };
 
@@ -1176,19 +1229,22 @@
     preview.ready = false;
     preview.stale = false;
     preview.index = null;
+    preview.level = null;
     preview.normal = s ? (s.dims.indexOf(1) >= 0 ? s.dims.indexOf(1) : 2) : 2;
+    $('customRow').hidden = true;
     preview.profile = null;
     preview.point = null;
     preview.names = null;
     preview.cursor = null;
     preview.levelMode = 'volume';
     preview.levelSet = null;
+    preview.qRange = null;
     $('levelSlice').checked = false;
     $('sliceMark').hidden = true;
     $('previewEmpty').hidden = !!s;
     showView();
     $('previewSub').textContent = '';
-    $('readout').textContent = 'Point at the slice to read values';
+    $('readout').textContent = 'Point at the slice to read values · the wheel zooms, dragging pans';
     setPreviewButtons();
   }
 
@@ -1200,6 +1256,11 @@
     }
     const n = names || (state.data ? state.data.names && axisRanges(state.data).map(r => r.name) : null) || ['h', 'k', 'l'];
     for (const b of $('planeSeg').children) {
+      if (b.dataset.normal === 'custom') {
+        b.setAttribute('aria-pressed', String(preview.normal === 'custom'));
+        b.disabled = !state.data || !!current || state.data.dims.filter(d => d > 1).length < 2;
+        continue;
+      }
       const normal = Number(b.dataset.normal);
       b.textContent = [0, 1, 2].filter(a => a !== normal).map(a => n[a]).join(' ');
       b.setAttribute('aria-pressed', String(normal === preview.normal));
@@ -1218,23 +1279,45 @@
     if (!state.data || current) return;
     const token = ++preview.seq;
     try {
-      const at = preview.index === null && preview.point && preview.names ? preview.point[preview.names[preview.normal]] : undefined;
-      const plane = await client.call('slice', { stage: preview.stage, normal: preview.normal, index: preview.index, at }).promise;
+      // the pinned point, in the order of the grid coordinates, places new planes
+      const names = (preview.plane && preview.plane.names) || state.data.names || null;
+      const point = preview.point && names && names.every(k => k in preview.point) ? names.map(k => preview.point[k]) : null;
+      const args = {
+        stage: preview.stage, normal: preview.normal, index: preview.index, frame: preview.frame,
+        cell: previewCell(), ub: currentUB(), point: preview.index === null ? point : null,
+      };
+      if (preview.normal === 'custom') {
+        args.vector = preview.vector;
+        args.level = preview.level;
+      }
+      const plane = await client.call('slice', args).promise;
       if (token !== preview.seq) return;
       preview.plane = plane;
       preview.index = plane.normal.index;
-      preview.names = [0, 1, 2].map(a => (a === preview.normal ? plane.normal.name
-        : a === [0, 1, 2].filter(b => b !== preview.normal)[0] ? plane.x.name : plane.y.name));
+      if (preview.normal === 'custom') {
+        preview.level = plane.normal.level;
+        $('normalNote').textContent = `layers ${plane.normal.name} = const · x ∥ ${plane.x.name}, y ∥ ${plane.y.name}`;
+      }
+      const zoomKey = `${plane.width}x${plane.height} ${plane.x.name} ${plane.y.name}`;
+      if (zoomKey !== preview.zoom.key) {
+        preview.zoom.key = zoomKey;
+        resetZoom();
+      }
       preview.cursor = null;
       const slider = $('sliceIndex');
       slider.max = String(plane.normal.n - 1);
       slider.value = String(plane.normal.index);
       slider.disabled = plane.normal.n < 2;
       $('sliceName').textContent = plane.normal.name;
-      $('axisX').textContent = `${plane.x.name}  ${fmtNum(plane.x.from)} … ${fmtNum(plane.x.to)}`;
+      const unit = plane.unit ? ` ${plane.unit}` : '';
+      $('axisX').textContent = `${plane.x.name}  ${fmtNum(plane.x.from)} … ${fmtNum(plane.x.to)}${unit}`;
       $('axisY').textContent = plane.y.name;
-      setPreviewButtons([0, 1, 2].map(a => (a === preview.normal ? plane.normal.name
-        : a === [0, 1, 2].filter(b => b !== preview.normal)[0] ? plane.x.name : plane.y.name)));
+      if (!plane.general) {
+        setPreviewButtons([0, 1, 2].map(a => (a === preview.normal ? plane.normal.name
+          : a === [0, 1, 2].filter(b => b !== preview.normal)[0] ? plane.x.name : plane.y.name)));
+      } else {
+        setPreviewButtons();
+      }
       if (!preview.stale) {
         $('previewSub').textContent = preview.stage === 'processed' ? 'after the recipe' : 'as read';
       }
@@ -1250,13 +1333,39 @@
   const indexOf = (axis, x) => (axis.n > 1 && axis.to !== axis.from ? Math.round((x - axis.from) / (axis.to - axis.from) * (axis.n - 1)) : 0);
 
   // The value under plane pixel (ix, iy from the top), as readout text.
+  // Grid coordinates (hkl, uvw or Q) of plane pixel (ix, iy from the top).
+  function pixelPoint(p, ix, iy) {
+    const r = p.height - 1 - iy, px = p.pixel;
+    return [0, 1, 2].map(c => px.origin[c] + ix * px.dx[c] + r * px.dy[c]);
+  }
+  // Plane pixel of grid coordinates x (its projection onto the plane).
+  function pointPixel(p, x) {
+    const px = p.pixel, n = [px.dx[1] * px.dy[2] - px.dx[2] * px.dy[1], px.dx[2] * px.dy[0] - px.dx[0] * px.dy[2],
+      px.dx[0] * px.dy[1] - px.dx[1] * px.dy[0]];
+    const M = [0, 1, 2].map(r => [px.dx[r], px.dy[r], n[r]]);
+    const det = M[0][0] * (M[1][1] * M[2][2] - M[1][2] * M[2][1]) - M[0][1] * (M[1][0] * M[2][2] - M[1][2] * M[2][0]) +
+      M[0][2] * (M[1][0] * M[2][1] - M[1][1] * M[2][0]);
+    if (!det) return null;
+    const d = x.map((v, i) => v - px.origin[i]);
+    const col = (k, v) => M.map((row, r) => row.map((m, c) => (c === k ? v[r] : m)));
+    const det3 = A => A[0][0] * (A[1][1] * A[2][2] - A[1][2] * A[2][1]) - A[0][1] * (A[1][0] * A[2][2] - A[1][2] * A[2][0]) +
+      A[0][2] * (A[1][0] * A[2][1] - A[1][1] * A[2][0]);
+    return [Math.round(det3(col(0, d)) / det), p.height - 1 - Math.round(det3(col(1, d)) / det)];
+  }
+
+  // The value under plane pixel (ix, iy from the top), as readout text.
   function readoutAt(ix, iy) {
-    const p = preview.plane;
-    const x = coordOf(p.x, ix), y = coordOf(p.y, p.height - 1 - iy), z = coordOf(p.normal, p.normal.index);
-    const val = p.values[iy * p.width + ix];
-    const what = [p.x.name, p.y.name].includes('u') ? 'P' : 'I';
-    return `${p.x.name} ${fmtNum(x)}   ${p.y.name} ${fmtNum(y)}   ${p.normal.name} ${fmtNum(z)}   ` +
-      (val === val ? `${what} = ${fmtNum(val, 4)}` : 'no data');
+    const p = preview.plane, x = pixelPoint(p, ix, iy);
+    const val = p.values[iy * p.width + ix], names = p.names || ['h', 'k', 'l'];
+    const what = names[0] === 'u' ? 'P' : 'I';
+    let q = '';
+    if (p.cartesian && p.cartesian.source !== 'none') {
+      const M = p.cartesian.M, v = [0, 1, 2].map(r => M[r][0] * x[0] + M[r][1] * x[1] + M[r][2] * x[2]);
+      q = `   |${names[0] === 'u' ? 'r' : 'Q'}| ${fmtNum(Math.hypot(...v))} ${p.cartesian.unit}`;
+    }
+    const outside = p.outside && p.outside[iy * p.width + ix];
+    return names.map((n, i) => `${n} ${fmtNum(x[i])}`).join('   ') + q + '   ' +
+      (outside ? 'outside the grid' : val === val ? `${what} = ${fmtNum(val, 4)}` : 'no data');
   }
 
   // The marker at the pinned point (or the keyboard cursor) in this plane.
@@ -1265,9 +1374,9 @@
     let ix, iy;
     if (p && preview.cursor) {
       [ix, iy] = preview.cursor;
-    } else if (p && preview.point && [p.x.name, p.y.name].every(n => n in preview.point)) {
-      ix = indexOf(p.x, preview.point[p.x.name]);
-      iy = p.height - 1 - indexOf(p.y, preview.point[p.y.name]);
+    } else if (p && preview.point && p.names && p.names.every(n => n in preview.point)) {
+      const at = pointPixel(p, p.names.map(n => preview.point[n]));
+      if (at) [ix, iy] = at;
     }
     mark.hidden = !(ix >= 0 && ix < p.width && iy >= 0 && iy < p.height);
     if (mark.hidden) return;
@@ -1277,10 +1386,8 @@
 
   // Pin the point under plane pixel (ix, iy); other planes then go through it.
   function pinPoint(ix, iy) {
-    const p = preview.plane;
-    preview.point = {
-      [p.x.name]: coordOf(p.x, ix), [p.y.name]: coordOf(p.y, p.height - 1 - iy), [p.normal.name]: coordOf(p.normal, p.normal.index),
-    };
+    const p = preview.plane, x = pixelPoint(p, ix, iy);
+    preview.point = Object.fromEntries((p.names || ['h', 'k', 'l']).map((n, i) => [n, x[i]]));
     preview.cursor = null;
     placeMark();
     $('readout').textContent = readoutAt(ix, iy) + '   · pinned; the other planes go through it';
@@ -1298,8 +1405,7 @@
     canvas.height = h;
     const spanX = Math.abs(p.x.to - p.x.from) || 1, spanY = Math.abs(p.y.to - p.y.from) || 1;
     canvas.style.aspectRatio = String(Math.min(4, Math.max(0.25, spanX / spanY)));
-    // Coarse grids show their voxels; fine ones are smoothed when scaled.
-    canvas.style.imageRendering = Math.max(w, h) < 256 ? 'pixelated' : 'auto';
+    applyZoom();                                // also picks the rendering: voxels when coarse or zoomed
     const direct = [p.x.name, p.y.name, p.normal.name].includes('u');
     const logScale = $('logScale').checked && !direct;
     $('logScale').disabled = direct;
@@ -1366,7 +1472,7 @@
       d[4 * i] = rgb[0];
       d[4 * i + 1] = rgb[1];
       d[4 * i + 2] = rgb[2];
-      d[4 * i + 3] = 255;
+      d[4 * i + 3] = p.outside && p.outside[i] ? 0 : 255;         // beyond the grid: the background
     }
     ctx.putImageData(img, 0, 0);
     $('colorbar').style.background = gradient(stops);
@@ -1380,12 +1486,12 @@
     }
     $('levelNote').textContent = mode === 'volume' ? 'whole volume, kept for every plane'
       : mode === 'set' ? 'as typed, kept for every plane' : 'this plane only';
-    const n = p.normal, at = n.n > 1 ? n.from + n.index * (n.to - n.from) / (n.n - 1) : n.from;
+    const n = p.normal, at = Number.isFinite(n.level) ? n.level : n.n > 1 ? n.from + n.index * (n.to - n.from) / (n.n - 1) : n.from;
     if (document.activeElement !== $('sliceAt')) $('sliceAt').value = fmtNum(at);
     $('sliceStats').replaceChildren(
       stat('Slice', `${n.name} = ${fmtNum(at)} · ${n.index + 1} of ${n.n}`),
       stat('Values', Number.isFinite(min) ? `${fmtNum(min)} … ${fmtNum(max)}` : 'none'),
-      stat('No data', `${(100 * nan / v.length).toFixed(1)} % of the slice`),
+      stat('No data', `${(100 * (nan - (p.outside ? p.outside.reduce((s, x) => s + x, 0) : 0)) / v.length).toFixed(1)} % of the slice`),
       stat('Scale', (direct ? 'linear, centred on 0' : logScale ? 'log₁₀' : 'linear') +
         (mode === 'volume' ? ', volume levels' : mode === 'set' ? ', set levels' : ', slice levels')));
   }
@@ -1423,7 +1529,7 @@
   });
   $('sliceCanvas').addEventListener('click', ev => {
     const p = preview.plane;
-    if (!p) return;
+    if (!p || drag.moved) return;
     const r = ev.currentTarget.getBoundingClientRect();
     pinPoint(Math.min(p.width - 1, Math.max(0, Math.floor((ev.clientX - r.left) / r.width * p.width))),
       Math.min(p.height - 1, Math.max(0, Math.floor((ev.clientY - r.top) / r.height * p.height))));
@@ -1448,14 +1554,92 @@
     } else if (ev.key === 'PageUp' || ev.key === 'PageDown') {
       ev.preventDefault();
       preview.index = Math.min(p.normal.n - 1, Math.max(0, p.normal.index + (ev.key === 'PageUp' ? 1 : -1)));
+      preview.level = null;
       loadSlice();
+    } else if (ev.key === '+' || ev.key === '=' || ev.key === '-' || ev.key === '_') {
+      ev.preventDefault();
+      const wrap = $('canvasWrap');
+      zoomAt(ev.key === '+' || ev.key === '=' ? 1.5 : 1 / 1.5, wrap.clientWidth / 2, wrap.clientHeight / 2);
+    } else if (ev.key === '0') {
+      ev.preventDefault();
+      resetZoom();
     }
   });
   $('sliceCanvas').addEventListener('mouseleave', () => {
-    $('readout').textContent = 'Point at the slice to read values';
+    $('readout').textContent = 'Point at the slice to read values · the wheel zooms, dragging pans';
   });
+
+  // Zoom and pan: the wheel or + and − zoom about the pointer (or the
+  // middle), dragging pans, 0 or a double-click shows the whole plane. The
+  // canvas keeps its voxels; the layer holding it and the pin is scaled.
+  const drag = { at: null, moved: false };
+  function applyZoom() {
+    const wrap = $('canvasWrap'), zm = preview.zoom, W = wrap.clientWidth, H = wrap.clientHeight;
+    zm.z = Math.min(64, Math.max(1, zm.z));
+    zm.x = Math.min(0, Math.max(W - W * zm.z, zm.x));
+    zm.y = Math.min(0, Math.max(H - H * zm.z, zm.y));
+    $('zoomLayer').style.transform = zm.z > 1 ? `translate(${zm.x}px, ${zm.y}px) scale(${zm.z})` : '';
+    wrap.style.setProperty('--zoom', String(zm.z));
+    wrap.classList.toggle('zoomed', zm.z > 1);
+    $('zoomOut').disabled = $('zoomReset').disabled = zm.z <= 1;
+    const p = preview.plane;
+    // Coarse grids, or a zoom that makes voxels big, show their voxels.
+    if (p) $('sliceCanvas').style.imageRendering = Math.max(p.width, p.height) < 256 || zm.z * W > 3 * p.width ? 'pixelated' : 'auto';
+  }
+  function zoomAt(factor, cx, cy) {
+    const zm = preview.zoom, z = Math.min(64, Math.max(1, zm.z * factor));
+    zm.x = cx - (cx - zm.x) * z / zm.z;
+    zm.y = cy - (cy - zm.y) * z / zm.z;
+    zm.z = z;
+    applyZoom();
+  }
+  function resetZoom() {
+    Object.assign(preview.zoom, { z: 1, x: 0, y: 0 });
+    applyZoom();
+  }
+  $('canvasWrap').addEventListener('wheel', ev => {
+    if (!preview.plane) return;
+    ev.preventDefault();
+    const r = $('canvasWrap').getBoundingClientRect();
+    zoomAt(Math.exp(-ev.deltaY * (ev.deltaMode === 1 ? 0.05 : 0.0015)), ev.clientX - r.left, ev.clientY - r.top);
+  }, { passive: false });
+  $('sliceCanvas').addEventListener('pointerdown', ev => {
+    if (ev.button !== 0) return;
+    drag.at = { x: ev.clientX, y: ev.clientY, x0: preview.zoom.x, y0: preview.zoom.y };
+    drag.moved = false;
+    try {
+      $('sliceCanvas').setPointerCapture(ev.pointerId);
+    } catch (_) {
+      // not a live pointer (synthetic events)
+    }
+  });
+  $('sliceCanvas').addEventListener('pointermove', ev => {
+    if (!drag.at) return;
+    const dx = ev.clientX - drag.at.x, dy = ev.clientY - drag.at.y;
+    if (Math.abs(dx) + Math.abs(dy) > 4) drag.moved = true;
+    if (drag.moved && preview.zoom.z > 1) {
+      preview.zoom.x = drag.at.x0 + dx;
+      preview.zoom.y = drag.at.y0 + dy;
+      $('canvasWrap').classList.add('panning');
+      applyZoom();
+    }
+  });
+  const endDrag = () => {
+    drag.at = null;
+    $('canvasWrap').classList.remove('panning');
+    // the click that follows a drag is not a pin; later clicks are
+    setTimeout(() => { drag.moved = false; }, 0);
+  };
+  $('sliceCanvas').addEventListener('pointerup', endDrag);
+  $('sliceCanvas').addEventListener('pointercancel', endDrag);
+  $('sliceCanvas').addEventListener('dblclick', resetZoom);
+  $('zoomIn').addEventListener('click', () => zoomAt(1.5, $('canvasWrap').clientWidth / 2, $('canvasWrap').clientHeight / 2));
+  $('zoomOut').addEventListener('click', () => zoomAt(1 / 1.5, $('canvasWrap').clientWidth / 2, $('canvasWrap').clientHeight / 2));
+  $('zoomReset').addEventListener('click', resetZoom);
+  window.addEventListener('resize', applyZoom);
   $('sliceIndex').addEventListener('input', () => {
     preview.index = Number($('sliceIndex').value);
+    preview.level = null;
     clearTimeout(preview.timer);
     preview.timer = setTimeout(loadSlice, 40);
   });
@@ -1467,7 +1651,12 @@
       drawSlice();
       return;
     }
-    preview.index = Math.min(p.normal.n - 1, Math.max(0, indexOf(p.normal, x)));
+    if (preview.normal === 'custom') {
+      preview.level = x;
+      preview.index = null;
+    } else {
+      preview.index = Math.min(p.normal.n - 1, Math.max(0, indexOf(p.normal, x)));
+    }
     $('sliceAt').blur();
     loadSlice();
   });
@@ -1497,12 +1686,38 @@
   });
   for (const b of $('planeSeg').children) {
     b.addEventListener('click', () => {
-      preview.normal = Number(b.dataset.normal);
+      preview.normal = b.dataset.normal === 'custom' ? 'custom' : Number(b.dataset.normal);
       preview.index = null;
+      preview.level = null;
+      $('customRow').hidden = preview.normal !== 'custom';
       setPreviewButtons();
       loadSlice();
     });
   }
+  // A typed normal: its layers through the pinned point, else through 0.
+  const readNormal = () => {
+    const v = ['normal0', 'normal1', 'normal2'].map(id => parseNum($(id).value));
+    if (!v.every(Number.isFinite) || v.every(x => x === 0)) return;
+    preview.vector = v;
+    preview.index = null;
+    preview.level = null;
+    clearTimeout(preview.timer);
+    preview.timer = setTimeout(loadSlice, 200);
+  };
+  for (const id of ['normal0', 'normal1', 'normal2']) $(id).addEventListener('input', readNormal);
+  $('cartesian').addEventListener('change', () => {
+    preview.frame = $('cartesian').checked ? 'cartesian' : 'grid';
+    loadSlice();
+  });
+
+  // The cell and UB the preview draws a Cartesian plane with.
+  function previewCell() {
+    const src = cellSource();
+    const c = src === 'data' ? dataCell() : src === 'structure' ? state.struct : manualCell();
+    return c ? { lengths: c.lengths.slice(), angles: c.angles.slice() } : null;
+  }
+
+
   for (const b of $('stageSeg').children) {
     b.addEventListener('click', async () => {
       if (b.dataset.stage === 'input') {
@@ -1608,24 +1823,25 @@
     const css = getComputedStyle(document.documentElement), col = name => css.getPropertyValue(name).trim();
     ctx.clearRect(0, 0, W, H);
     if (!p || !p.q.length) return;
+    const [qa, qb] = profileRange(p);
+    const shown = i => p.q[i] >= qa && p.q[i] <= qb;
     const logY = $('profileLog').checked && p.mean.some(v => v > 0);
     const ty = v => (logY ? (v > 0 ? Math.log10(v) : NaN) : v);
     const lo = p.mean.map((v, i) => ty(v - p.sigma[i])), hi = p.mean.map((v, i) => ty(v + p.sigma[i])), mid = p.mean.map(ty);
     let ylo = Infinity, yhi = -Infinity;
-    for (const y of mid.concat(hi, lo)) {
-      if (Number.isFinite(y)) {
+    [mid, hi, lo].forEach(list => list.forEach((y, i) => {
+      if (Number.isFinite(y) && shown(i)) {
         ylo = Math.min(ylo, y);
         yhi = Math.max(yhi, y);
       }
-    }
+    }));
     if (!logY) ylo = Math.min(ylo, 0);
     if (!(yhi > ylo)) yhi = ylo + 1;
     const pad = 0.05 * (yhi - ylo);
     ylo -= pad;
     yhi += pad;
-    const half = p.q.length > 1 ? (p.q[1] - p.q[0]) / 2 : 0.05, qmax = p.q[p.q.length - 1] + half;
     const m = { l: 62 * dpr, r: 14 * dpr, t: 12 * dpr, b: 32 * dpr };
-    const X = q => m.l + (W - m.l - m.r) * q / qmax;
+    const X = q => m.l + (W - m.l - m.r) * (q - qa) / (qb - qa);
     const Y = y => H - m.b - (H - m.t - m.b) * (y - ylo) / (yhi - ylo);
     ctx.font = `${11 * dpr}px ${col('--mono')}`;
     ctx.lineWidth = dpr;
@@ -1633,8 +1849,8 @@
     ctx.fillStyle = col('--muted');
     ctx.textAlign = 'center';
     ctx.textBaseline = 'top';
-    const xs = niceStep(qmax / 6);
-    for (let q = 0; q <= qmax + 1e-9; q += xs) {
+    const xs = niceStep((qb - qa) / 6);
+    for (let q = Math.ceil(qa / xs - 1e-9) * xs; q <= qb + 1e-9; q += xs) {
       ctx.beginPath();
       ctx.moveTo(X(q), m.t);
       ctx.lineTo(X(q), H - m.b);
@@ -1670,7 +1886,11 @@
     ctx.textAlign = 'left';
     ctx.textBaseline = 'top';
     ctx.fillText(logY ? 'mean I (log scale)' : 'mean I', m.l + 6 * dpr, m.t + 2 * dpr);
-    // ±sigma band, then the mean
+    // ±sigma band, then the mean, inside the plot area
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(m.l, m.t, W - m.l - m.r, H - m.t - m.b);
+    ctx.clip();
     ctx.fillStyle = col('--accent-soft');
     ctx.beginPath();
     let open = false;
@@ -1693,7 +1913,8 @@
       open = true;
     }
     ctx.stroke();
-    if (preview.hover >= 0 && preview.hover < p.q.length && Number.isFinite(mid[preview.hover])) {
+    ctx.restore();
+    if (preview.hover >= 0 && preview.hover < p.q.length && Number.isFinite(mid[preview.hover]) && shown(preview.hover)) {
       const x = X(p.q[preview.hover]), y = Y(mid[preview.hover]);
       ctx.strokeStyle = col('--muted');
       ctx.lineWidth = dpr;
@@ -1710,13 +1931,57 @@
     }
   }
 
+  // The |Q| range shown: all of it, or the zoomed part.
+  function profileRange(p) {
+    const half = p.q.length > 1 ? (p.q[1] - p.q[0]) / 2 : 0.05, full = [0, p.q[p.q.length - 1] + half];
+    return preview.qRange ? preview.qRange : full;
+  }
+  // |Q| under a pointer x position on the profile canvas.
+  function profileQ(ev) {
+    const p = preview.profile, r = $('profileCanvas').getBoundingClientRect(), dpr = window.devicePixelRatio || 1;
+    const W = r.width * dpr, left = 62 * dpr, right = 14 * dpr, [qa, qb] = profileRange(p);
+    return qa + ((ev.clientX - r.left) * dpr - left) / (W - left - right) * (qb - qa);
+  }
+  function setQRange(qa, qb) {
+    const p = preview.profile, half = p.q.length > 1 ? (p.q[1] - p.q[0]) / 2 : 0.05, full = p.q[p.q.length - 1] + half;
+    const span = Math.min(full, Math.max(4 * half, qb - qa));
+    qa = Math.min(full - span, Math.max(0, qa));
+    preview.qRange = span >= full - 1e-12 ? null : [qa, qa + span];
+    drawProfile();
+  }
+  const qdrag = { at: null };
+  $('profileCanvas').addEventListener('wheel', ev => {
+    const p = preview.profile;
+    if (!p || !p.q.length) return;
+    ev.preventDefault();
+    const q = profileQ(ev), [qa, qb] = profileRange(p), f = Math.exp(ev.deltaY * (ev.deltaMode === 1 ? 0.05 : 0.0015));
+    setQRange(q - (q - qa) * f, q + (qb - q) * f);
+  }, { passive: false });
+  $('profileCanvas').addEventListener('pointerdown', ev => {
+    if (ev.button !== 0 || !preview.profile || !preview.qRange) return;
+    qdrag.at = { x: ev.clientX, range: preview.qRange.slice() };
+    try {
+      $('profileCanvas').setPointerCapture(ev.pointerId);
+    } catch (_) {
+      // not a live pointer (synthetic events)
+    }
+  });
+  $('profileCanvas').addEventListener('pointerup', () => { qdrag.at = null; });
+  $('profileCanvas').addEventListener('dblclick', () => {
+    preview.qRange = null;
+    drawProfile();
+  });
   $('profileCanvas').addEventListener('mousemove', ev => {
     const p = preview.profile;
     if (!p || !p.q.length) return;
-    const r = ev.currentTarget.getBoundingClientRect(), dpr = window.devicePixelRatio || 1;
-    const W = r.width * dpr, left = 62 * dpr, right = 14 * dpr;
-    const half = p.q.length > 1 ? (p.q[1] - p.q[0]) / 2 : 0.05, qmax = p.q[p.q.length - 1] + half;
-    const q = ((ev.clientX - r.left) * dpr - left) / (W - left - right) * qmax;
+    if (qdrag.at) {
+      // the plot spans the canvas less 62 + 14 CSS pixels of margins
+      const [qa, qb] = qdrag.at.range, width = $('profileCanvas').getBoundingClientRect().width - 76;
+      const dq = (ev.clientX - qdrag.at.x) / Math.max(1, width) * (qb - qa);
+      setQRange(qa - dq, qb - dq);
+      return;
+    }
+    const q = profileQ(ev);
     let best = 0;
     for (let i = 1; i < p.q.length; i++) if (Math.abs(p.q[i] - q) < Math.abs(p.q[best] - q)) best = i;
     preview.hover = best;
@@ -1726,7 +1991,7 @@
   });
   $('profileCanvas').addEventListener('mouseleave', () => {
     preview.hover = -1;
-    $('profileReadout').textContent = 'Point at the curve to read values';
+    $('profileReadout').textContent = 'Point at the curve to read values · the wheel zooms |Q|, dragging pans';
     drawProfile();
   });
   $('profileLog').addEventListener('change', drawProfile);
@@ -1904,6 +2169,7 @@
       recipe: steps.length ? { version: 1, steps } : null,
       profileWidth: Number($('profileWidth').value), hklTarget: $('hklTarget').value,
       datFrame: $('datFrame').value, datSections: $('datSections').value, vtkEncoding: $('vtkEncoding').value,
+      ub: state.ubManual || undefined,
     };
     const bad = state.recipe.map((s, n) => [n + 1, s.enabled === false ? null : checkStep(s, n).error]).filter(x => x[1]);
     for (const [n, error] of bad) log(`Error: processing step ${n}: ${error}`, 'err');

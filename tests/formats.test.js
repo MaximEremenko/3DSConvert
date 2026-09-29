@@ -377,6 +377,8 @@ test('subhkl indexer file: a cell source; as data it points to the structure slo
     const { subhklFile } = require('./nexus-fixtures');
     const f = await subhklFile();
     assert.equal(Converter.detectH5Kind(f), 'subhkl');
-    assert.deepEqual(Converter.readSubhklCell(f), { lengths: [8.1, 8.1, 8.1], angles: [90, 90, 90], source: 'subhkl', spaceGroup: 'F d -3 m' });
+    const cell = Converter.readSubhklCell(f);
+    assert.deepEqual(Object.assign({}, cell, { ub: undefined }), { lengths: [8.1, 8.1, 8.1], angles: [90, 90, 90], source: 'subhkl', spaceGroup: 'F d -3 m', ub: undefined });
+    assert.deepEqual(cell.ub.flat().map(x => +x.toFixed(12)), [1, 0, 0, 0, 1, 0, 0, 0, 1].map(x => +(x / 8.1).toFixed(12)));   // U B
     assert.match(Converter.unsupportedKindMessage('subhkl'), /structure file in section 2/);
 });

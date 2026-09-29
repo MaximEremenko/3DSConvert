@@ -145,6 +145,24 @@
       <label class="field"><span>γ (°)</span><input id="cga" inputmode="decimal" autocomplete="off"></label>
     </div>
     <div class="cell-warn" id="cellWarn" hidden></div>
+    <details class="more" id="ubBox">
+      <summary>Orientation (UB matrix)</summary>
+      <div class="ubgrid">
+        <input id="ub00" class="text" inputmode="decimal" autocomplete="off" aria-label="UB row 1, column 1">
+        <input id="ub01" class="text" inputmode="decimal" autocomplete="off" aria-label="UB row 1, column 2">
+        <input id="ub02" class="text" inputmode="decimal" autocomplete="off" aria-label="UB row 1, column 3">
+        <input id="ub10" class="text" inputmode="decimal" autocomplete="off" aria-label="UB row 2, column 1">
+        <input id="ub11" class="text" inputmode="decimal" autocomplete="off" aria-label="UB row 2, column 2">
+        <input id="ub12" class="text" inputmode="decimal" autocomplete="off" aria-label="UB row 2, column 3">
+        <input id="ub20" class="text" inputmode="decimal" autocomplete="off" aria-label="UB row 3, column 1">
+        <input id="ub21" class="text" inputmode="decimal" autocomplete="off" aria-label="UB row 3, column 2">
+        <input id="ub22" class="text" inputmode="decimal" autocomplete="off" aria-label="UB row 3, column 3">
+      </div>
+      <div class="ubfoot"><span class="sub" id="ubNote"></span>
+        <button type="button" class="btn ghost small" id="ubClear" hidden>use the file's</button></div>
+      <p class="sub">Q = 2π UB hkl, with UB as Mantid, NeXus and subhkl store it (CrysAlisPro's divided by the
+        wavelength). It sets the Cartesian frame of the preview and puts Cartesian Q data on hkl axes.</p>
+    </details>
   </section>
 
   <section class="card" id="procCard">
@@ -251,6 +269,7 @@
         <button type="button" data-normal="2" aria-pressed="true">(h k 0)</button>
         <button type="button" data-normal="1" aria-pressed="false">(h 0 l)</button>
         <button type="button" data-normal="0" aria-pressed="false">(0 k l)</button>
+        <button type="button" data-normal="custom" aria-pressed="false" title="A plane of any orientation: the layers of a normal you type">custom</button>
       </div>
     </div>
     <div class="empty-preview" id="previewEmpty">
@@ -262,8 +281,9 @@
       <div class="previewbody">
         <div class="plot">
           <span class="ax y" id="axisY"></span>
-          <div class="canvaswrap"><canvas id="sliceCanvas" width="1" height="1" tabindex="0" role="img"
-            aria-label="Slice of the data; click or press Enter to pin a point, arrow keys move it, Page Up and Page Down change the plane"></canvas><div class="mark" id="sliceMark" hidden></div></div>
+          <div class="canvaswrap" id="canvasWrap"><div class="zoomlayer" id="zoomLayer"><canvas id="sliceCanvas" width="1" height="1" tabindex="0" role="img"
+            aria-label="Slice of the data; click or press Enter to pin a point, arrow keys move it, Page Up and Page Down change the plane, plus and minus zoom, 0 shows the whole plane"></canvas><div class="mark" id="sliceMark" hidden></div></div>
+            <div class="zoombar"><button type="button" id="zoomIn" title="Zoom in (+, or the mouse wheel)" aria-label="Zoom in">+</button><button type="button" id="zoomOut" title="Zoom out (−)" aria-label="Zoom out">−</button><button type="button" id="zoomReset" title="The whole plane (0, or double-click)" aria-label="Show the whole plane">1:1</button></div></div>
           <span class="ax x" id="axisX"></span>
         </div>
         <div class="colorbar"><i id="colorbar"></i><div id="colorTicks"></div></div>
@@ -274,6 +294,14 @@
         <input type="range" id="sliceIndex" min="0" max="0" value="0" aria-label="Slice position">
         <input id="sliceAt" class="text slice-at" inputmode="decimal" aria-label="Plane position" title="Type a position and press Enter">
         <label class="check"><input type="checkbox" id="logScale" checked>log scale</label>
+        <label class="check" title="Draw the plane in Cartesian space - Q = 2π UB hkl, or the cell with a along x - so angles and lengths are true"><input type="checkbox" id="cartesian">Cartesian (UB)</label>
+      </div>
+      <div class="slicer customrow" id="customRow" hidden>
+        <span>Normal</span>
+        <input id="normal0" class="text nrm" inputmode="decimal" value="1" aria-label="Normal, first component">
+        <input id="normal1" class="text nrm" inputmode="decimal" value="-1" aria-label="Normal, second component">
+        <input id="normal2" class="text nrm" inputmode="decimal" value="0" aria-label="Normal, third component">
+        <span class="lvlnote" id="normalNote"></span>
       </div>
       <div class="slicer levels">
         <span>Levels</span>
@@ -284,7 +312,7 @@
         <label class="check"><input type="checkbox" id="levelSlice">per slice</label>
         <span class="lvlnote" id="levelNote"></span>
       </div>
-      <div class="readout" id="readout">Point at the slice to read values</div>
+      <div class="readout" id="readout">Point at the slice to read values · the wheel zooms, dragging pans</div>
       <div class="histo">
         <canvas id="histogram" width="600" height="56" role="img" aria-label="Histogram of the slice values"></canvas>
         <div class="histo-axis"><span id="histoLo"></span><span>histogram of the slice, on the colour scale</span><span id="histoHi"></span></div>

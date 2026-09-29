@@ -329,6 +329,74 @@ const scenarios = [
         await evaluate('document.getElementById("levelAuto").click()');
         if (await levels() !== first) throw new Error('auto did not restore the volume levels: ' + await levels());
     }],
+    ['preview: zoom with the buttons and the wheel, drag to pan without pinning, reset', async () => {
+        await setFile('#dataFile', path.join(ROOT, 'Examples/example_unified.h5'));
+        await waitLog(/Unified data format \| grid 5 x 5 x 5/);
+        for (let i = 0; i < 50 && !(await evaluate('document.getElementById("sliceCanvas").width === 5')); i++) await sleep(100);
+        const transform = () => evaluate('document.getElementById("zoomLayer").style.transform');
+        await evaluate('document.getElementById("zoomIn").click()');
+        if (!/scale\(1\.5\)/.test(await transform())) throw new Error('zoom in: ' + await transform());
+        await evaluate(`(() => {
+            const w = document.getElementById('canvasWrap'), r = w.getBoundingClientRect();
+            w.dispatchEvent(new WheelEvent('wheel', { deltaY: -400, clientX: r.left + 20, clientY: r.top + 20, bubbles: true, cancelable: true }));
+        })()`);
+        const zoomed = await transform();
+        const z = Number(/scale\(([\d.]+)\)/.exec(zoomed)[1]);
+        if (!(z > 1.5)) throw new Error('wheel zoom: ' + zoomed);
+        await evaluate(`(() => {
+            const c = document.getElementById('sliceCanvas'), r = c.getBoundingClientRect();
+            const at = (type, dx) => c.dispatchEvent(new PointerEvent(type, { pointerId: 1, button: 0, bubbles: true,
+                clientX: r.left + r.width / 2 + dx, clientY: r.top + r.height / 2 }));
+            at('pointerdown', 0);
+            at('pointermove', -60);
+            at('pointerup', -60);
+            c.dispatchEvent(new MouseEvent('click', { bubbles: true, clientX: r.left + r.width / 2 - 60, clientY: r.top + r.height / 2 }));
+        })()`);
+        if (await transform() === zoomed) throw new Error('dragging did not pan');
+        if (/pinned/.test(await evaluate('document.getElementById("readout").textContent'))) throw new Error('a drag pinned a point');
+        await evaluate('document.getElementById("sliceCanvas").dispatchEvent(new MouseEvent("dblclick", { bubbles: true }))');
+        if (await transform() !== '') throw new Error('double-click did not reset: ' + await transform());
+        // the |Q| profile zooms too
+        await evaluate('document.querySelector("#viewSeg [data-view=profile]").click()');
+        for (let i = 0; i < 50 && !(await evaluate('document.getElementById("profileCanvas").width > 200')); i++) await sleep(100);
+        await evaluate(`(() => {
+            const c = document.getElementById('profileCanvas'), r = c.getBoundingClientRect();
+            c.dispatchEvent(new WheelEvent('wheel', { deltaY: -600, clientX: r.left + r.width / 2, clientY: r.top + 100, bubbles: true, cancelable: true }));
+            c.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }));
+        })()`);
+    }],
+    ['preview: a custom plane, the Cartesian frame and a typed UB', async () => {
+        await setFile('#dataFile', path.join(ROOT, 'Examples/example_unified.h5'));
+        await waitLog(/Unified data format \| grid 5 x 5 x 5/);
+        for (let i = 0; i < 50 && !(await evaluate('document.getElementById("sliceCanvas").width === 5')); i++) await sleep(100);
+        const text = id => evaluate(`document.getElementById(${JSON.stringify(id)}).textContent`);
+        const until = async (id, re) => {
+            for (let i = 0; i < 50 && !re.test(await text(id)); i++) await sleep(100);
+            if (!re.test(await text(id))) throw new Error(`${id}: ${await text(id)}`);
+        };
+        await evaluate('document.querySelector("#planeSeg [data-normal=custom]").click()');
+        if (await evaluate('document.getElementById("customRow").hidden')) throw new Error('no normal inputs');
+        await until('sliceStats', /h − k = 0 ·/);                              // the default normal [1 -1 0]
+        await until('normalNote', /x ∥ \[1 1 0\], y ∥ \[0 0 1\]/);
+        await evaluate(`(() => { const e = document.getElementById('normal0'); e.value = '0'; e.dispatchEvent(new Event('input'));
+            const f = document.getElementById('normal1'); f.value = '0'; f.dispatchEvent(new Event('input'));
+            const g = document.getElementById('normal2'); g.value = '1'; g.dispatchEvent(new Event('input')); })()`);
+        await until('sliceStats', /l = 0 · 3 of 5/);
+        await evaluate(`(() => { const e = document.getElementById('sliceAt'); e.value = '0.25'; e.dispatchEvent(new Event('change')); })()`);
+        await until('sliceStats', /l = 0\.25 ·/);                              // a level between the grid planes
+        await evaluate('document.getElementById("cartesian").click()');
+        await until('axisX', /Å⁻¹$/);
+        // a typed UB: the Cartesian frame follows it
+        await evaluate('document.getElementById("ubBox").open = true');
+        await evaluate(`(() => { const v = [0, -0.2, 0, 0.2, 0, 0, 0, 0, 0.2];
+            ['ub00', 'ub01', 'ub02', 'ub10', 'ub11', 'ub12', 'ub20', 'ub21', 'ub22'].forEach((id, i) => { document.getElementById(id).value = String(v[i]); });
+            document.getElementById('ub22').dispatchEvent(new Event('change')); })()`);
+        await until('ubNote', /typed/);
+        const c = await evaluate(`(() => { const c = document.getElementById('sliceCanvas'), r = c.getBoundingClientRect();
+            c.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: r.left + r.width / 2, clientY: r.top + r.height / 2 }));
+            return document.getElementById('readout').textContent; })()`);
+        if (!/\|Q\| [\d.]+ Å⁻¹/.test(c)) throw new Error('readout ' + c);
+    }],
     ['recipe editor: drag to reorder, undo, and the JSON view', async () => {
         await setFile('#dataFile', path.join(ROOT, 'Examples/example_unified.h5'));
         await waitLog(/Unified data format \| grid 5 x 5 x 5/);

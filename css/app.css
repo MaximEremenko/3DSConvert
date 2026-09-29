@@ -254,12 +254,20 @@ details.more .field { margin-top: 10px; }
 .previewbody { display: flex; gap: 16px; align-items: flex-start; flex-wrap: wrap; }
 .plot { display: grid; grid-template-columns: auto 1fr; grid-template-rows: 1fr auto; gap: 6px 8px; align-items: center;
   flex: 0 1 460px; min-width: 240px; }
-.plot canvas { width: 100%; aspect-ratio: 1; display: block; border-radius: 10px; border: 1px solid var(--border);
-  cursor: crosshair; background: var(--raised); }
+.plot canvas { width: 100%; aspect-ratio: 1; display: block; cursor: crosshair; }
 .plot .ax { font-family: var(--mono); font-size: 12px; color: var(--muted); }
-.canvaswrap { position: relative; width: 100%; }
+.canvaswrap { position: relative; width: 100%; overflow: hidden; border-radius: 10px; border: 1px solid var(--border);
+  background: var(--raised); touch-action: none; }
+.zoomlayer { position: relative; transform-origin: 0 0; }
+.canvaswrap.zoomed canvas { cursor: grab; }
+.canvaswrap.panning canvas { cursor: grabbing; }
 .mark { position: absolute; width: 14px; height: 14px; margin: -7px 0 0 -7px; border-radius: 50%; pointer-events: none;
-  border: 2px solid #fff; box-shadow: 0 0 0 1.5px rgba(0, 0, 0, .65); }
+  border: 2px solid #fff; box-shadow: 0 0 0 1.5px rgba(0, 0, 0, .65); transform: scale(calc(1 / var(--zoom, 1))); }
+.zoombar { position: absolute; top: 6px; right: 6px; display: flex; gap: 4px; }
+.zoombar button { min-width: 28px; height: 26px; padding: 0 6px; border-radius: 6px; border: 1px solid var(--border);
+  background: var(--panel); color: var(--text); font: 600 13px/1 var(--font); cursor: pointer; opacity: .88; }
+.zoombar button:hover { opacity: 1; background: var(--raised); }
+.zoombar button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 .plot .ax.x { grid-column: 2; text-align: center; }
 .colorbar { display: flex; gap: 8px; align-self: stretch; padding: 8px 0 28px; }
 .colorbar i { width: 14px; border-radius: 7px; }
@@ -274,13 +282,18 @@ details.more .field { margin-top: 10px; }
 .slicer.levels { margin-top: 6px; }
 .slicer .lvl { width: 12ch; height: 28px; font-family: var(--mono); font-size: 12.5px; }
 .slicer .lvlnote { font-size: 12px; }
+.slicer .nrm { width: 7ch; height: 28px; font-family: var(--mono); font-size: 12.5px; }
+.slicer.customrow { margin-top: 6px; }
+.ubgrid { display: grid; grid-template-columns: repeat(3, minmax(0, 9rem)); gap: 6px; }
+.ubgrid input { font-family: var(--mono); font-size: 12.5px; height: 30px; }
+.ubfoot { display: flex; align-items: center; gap: 10px; margin-top: 6px; }
 .empty-preview { height: 420px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px;
   border-radius: 12px; border: 1px dashed var(--border-strong); color: var(--muted); text-align: center; padding: 0 20px; }
 .empty-preview svg.i { width: 44px; height: 44px; stroke-width: 1.4; }
 .empty-preview b { font-size: 15px; color: var(--text); }
 
 #profileView { display: flex; flex-direction: column; gap: 10px; }
-#profileCanvas { width: 100%; height: 380px; display: block; cursor: crosshair; }
+#profileCanvas { width: 100%; height: 380px; display: block; cursor: crosshair; touch-action: none; }
 .histo { display: flex; flex-direction: column; gap: 4px; margin-top: 10px; }
 .histo canvas { width: 100%; height: 56px; display: block; }
 .histo-axis { display: flex; justify-content: space-between; gap: 10px; font-family: var(--mono); font-size: 11.5px; color: var(--muted); }
