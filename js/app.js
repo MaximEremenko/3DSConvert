@@ -50,6 +50,21 @@
     line.append(el('time', null, new Date().toTimeString().slice(0, 8) + ' '), lv, el('span', 'msg', msg));
     logEl.appendChild(line);
     logEl.scrollTop = logEl.scrollHeight;
+    if (level === 'err' || (level === 'ok' && /^Wrote /.test(msg))) toast(msg.replace(/^Error: /, ''), level);
+  }
+
+  // Errors and finished files also pop up, bottom right, for a while.
+  function toast(msg, level) {
+    const box = $('toasts');
+    const t = el('div', 'toast ' + level);
+    const mark = el('span', 'ti');
+    mark.appendChild(icon(level === 'err' ? 'alert' : 'check', 16));
+    const close = button('btn ghost icon small', '', 'x', 'Dismiss');
+    close.addEventListener('click', () => t.remove());
+    t.append(mark, el('p', null, msg), close);
+    box.appendChild(t);
+    while (box.children.length > 3) box.firstElementChild.remove();
+    setTimeout(() => t.remove(), level === 'err' ? 12000 : 6000);
   }
   function clearLog() { logEl.textContent = ''; }
   function logNotes(notes) {
@@ -1092,6 +1107,9 @@
     $('colorbar').style.background = gradient(stops);
     const label = t => fmtNum(logScale ? 10 ** t : t, 3);
     $('colorTicks').replaceChildren(el('span', null, label(hi)), el('span', null, label((lo + hi) / 2)), el('span', null, label(lo)));
+    drawHistogram(v, step, t => (tf(t) - lo) / (hi - lo), stops);
+    $('histoLo').textContent = label(lo);
+    $('histoHi').textContent = label(hi);
     const n = p.normal, at = n.n > 1 ? n.from + n.index * (n.to - n.from) / (n.n - 1) : n.from;
     $('sliceValue').textContent = `= ${fmtNum(at)}`;
     $('sliceStats').replaceChildren(
@@ -1099,6 +1117,29 @@
       stat('Values', Number.isFinite(min) ? `${fmtNum(min)} … ${fmtNum(max)}` : 'none'),
       stat('No data', `${(100 * nan / v.length).toFixed(1)} % of the slice`),
       stat('Scale', direct ? 'linear, centred on 0' : logScale ? 'log₁₀, robust range' : 'linear, robust range'));
+  }
+
+  // Counts of the (sampled) finite values across the colour scale; the
+  // end bins also hold what the scale clips. Heights go as the square root.
+  function drawHistogram(v, step, frac, stops) {
+    const canvas = $('histogram'), dpr = window.devicePixelRatio || 1;
+    const w = Math.max(100, Math.round(canvas.clientWidth * dpr)), h = Math.round(56 * dpr);
+    canvas.width = w;
+    canvas.height = h;
+    const bins = new Float64Array(64);
+    for (let i = 0; i < v.length; i += step) {
+      const x = v[i];
+      if (x === x) bins[Math.min(63, Math.max(0, Math.floor(frac(x) * 64)))]++;
+    }
+    const top = Math.sqrt(Math.max(...bins)) || 1, ctx = canvas.getContext('2d');
+    ctx.clearRect(0, 0, w, h);
+    const bw = w / 64;
+    for (let b = 0; b < 64; b++) {
+      if (!bins[b]) continue;
+      const bh = Math.max(1, Math.round((h - 2) * Math.sqrt(bins[b]) / top));
+      ctx.fillStyle = `rgb(${colorAt(stops, (b + 0.5) / 64).join(',')})`;
+      ctx.fillRect(Math.round(b * bw), h - bh, Math.max(1, Math.round(bw) - 1), bh);
+    }
   }
 
   $('sliceCanvas').addEventListener('mousemove', ev => {

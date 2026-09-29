@@ -234,6 +234,10 @@
         <label class="check"><input type="checkbox" id="logScale" checked>log scale</label>
       </div>
       <div class="readout" id="readout">Point at the slice to read values</div>
+      <div class="histo">
+        <canvas id="histogram" width="600" height="56" role="img" aria-label="Histogram of the slice values"></canvas>
+        <div class="histo-axis"><span id="histoLo"></span><span>histogram of the slice, on the colour scale</span><span id="histoHi"></span></div>
+      </div>
     </div>
   </section>
   <section class="card logcard">
@@ -255,6 +259,7 @@
   <button type="button" class="btn big" id="cancelBtn" hidden>Cancel</button>
   <button type="button" class="btn primary big" id="convertBtn" disabled><svg class="i"><use href="#i-download"/></svg>Convert &amp; download</button>
 </footer>
+<div class="toasts" id="toasts" aria-live="assertive"></div>
 <div class="dropveil" id="dropVeil" hidden><div><svg class="i"><use href="#i-upload"/></svg>Drop to load</div></div>
 </div>
 

@@ -255,6 +255,24 @@ details.more[open] > summary { margin-bottom: 10px; }
 .empty-preview svg.i { width: 44px; height: 44px; stroke-width: 1.4; }
 .empty-preview b { font-size: 15px; color: var(--text); }
 
+.histo { display: flex; flex-direction: column; gap: 4px; margin-top: 10px; }
+.histo canvas { width: 100%; height: 56px; display: block; }
+.histo-axis { display: flex; justify-content: space-between; gap: 10px; font-family: var(--mono); font-size: 11.5px; color: var(--muted); }
+.histo-axis span:nth-child(2) { font-family: var(--font); }
+
+/* ---- toasts ---- */
+.toasts { position: fixed; right: 24px; bottom: 96px; z-index: 40; display: flex; flex-direction: column; gap: 8px;
+  width: min(420px, calc(100vw - 32px)); pointer-events: none; }
+.toast { pointer-events: auto; display: flex; align-items: flex-start; gap: 10px; padding: 12px 12px 12px 14px; border-radius: 12px;
+  border: 1px solid var(--border); background: var(--panel); box-shadow: 0 12px 32px rgba(0, 0, 0, .2); font-size: 13.5px;
+  animation: toast-in .18s ease-out; }
+.toast .ti { display: flex; padding-top: 1px; }
+.toast.err .ti { color: var(--err); }
+.toast.ok .ti { color: var(--ok); }
+.toast p { margin: 0; flex: 1 1 auto; overflow-wrap: anywhere; }
+@keyframes toast-in { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+@media (prefers-reduced-motion: reduce) { .toast { animation: none; } }
+
 /* ---- log ---- */
 .logcard { flex: 1 1 auto; min-height: 180px; padding: 14px 18px; gap: 10px; }
 #log { flex: 1 1 auto; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: 6px; font-size: 13px; }
