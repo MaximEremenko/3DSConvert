@@ -293,6 +293,36 @@ const scenarios = [
         if (!/Using the processed data from the preview/.test(await logText())) throw new Error('the preview result was not reused');
         if ((await H.Converter.readUnifiedData(f)).axesType !== 'uvw') throw new Error('not a 3D-ΔPDF');
     }],
+    ['recipe editor: drag to reorder, undo, and the JSON view', async () => {
+        await setFile('#dataFile', path.join(ROOT, 'Examples/example_unified.h5'));
+        await waitLog(/Unified data format \| grid 5 x 5 x 5/);
+        const titles = () => evaluate('Array.from(document.querySelectorAll("#steps .step .toggle b"), b => b.textContent).join(",")');
+        for (const op of ['rebin', 'scale']) {
+            await setValue('stepOp', op);
+            await evaluate('document.getElementById("addStep").click()');
+        }
+        if (await titles() !== 'Rebin,Scale and offset') throw new Error('steps: ' + await titles());
+        await evaluate(`(() => {
+            const items = document.querySelectorAll('#steps .step'), dt = new DataTransfer();
+            const y = items[1].getBoundingClientRect().bottom - 2;
+            items[0].querySelector('.rail').dispatchEvent(new DragEvent('dragstart', { dataTransfer: dt, bubbles: true }));
+            items[1].dispatchEvent(new DragEvent('dragover', { dataTransfer: dt, bubbles: true, cancelable: true, clientY: y }));
+            items[1].dispatchEvent(new DragEvent('drop', { dataTransfer: dt, bubbles: true, cancelable: true, clientY: y }));
+        })()`);
+        if (await titles() !== 'Scale and offset,Rebin') throw new Error('after the drag: ' + await titles());
+        await evaluate('document.getElementById("undoBtn").click()');
+        if (await titles() !== 'Rebin,Scale and offset') throw new Error('after undo: ' + await titles());
+        await evaluate('document.getElementById("jsonBtn").click()');
+        await evaluate(`(() => {
+            document.getElementById('recipeJson').value =
+                JSON.stringify({ steps: [{ op: 'symmetrize', laue: 'm-3m' }, { op: 'deltaPdf', enabled: false }] });
+            document.getElementById('jsonApply').click();
+        })()`);
+        if (await titles() !== 'Symmetrize,3D-ΔPDF') throw new Error('after the JSON edit: ' + await titles());
+        const off = await evaluate('Array.from(document.querySelectorAll("#steps .step"), li => li.classList.contains("off")).join(",")');
+        if (off !== 'false,true') throw new Error('switched off: ' + off);
+        if (await evaluate('document.querySelector("[data-format=dat]").disabled')) throw new Error('.dat disabled by a switched-off ΔPDF');
+    }],
     ['NeXus entry + externally linked data file -> unified', async () => {
         await setFile('#dataFile', [path.join(work, 'wrapper.nxs'), path.join(work, 't.nxs')]);
         await waitLog(/linked files: t\.nxs as scan\/t\.nxs/);
