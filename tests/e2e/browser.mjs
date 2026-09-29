@@ -251,7 +251,7 @@ const scenarios = [
         const got = await H.Converter.readYell(await H.openH5Bytes(fs.readFileSync(out)));
         const input = await H.Converter.readUnifiedData(await H.openH5('Examples/example_unified.h5'));
         const want = await Processing.applyRecipe(input, { steps: [{ op: 'deltaPdf' }] }, { fft: H.cpuFft });
-        const line = text.split('\n').find(l => /^\s*FFT of/.test(l)) || '';
+        const line = (text.split('\n').find(l => /FFT of/.test(l)) || '').replace(/^[\d:]+ /, '');
         const tol = 1e-5 * Math.max(...want.values.map(Math.abs));        // float32 on the GPU
         if (got.axesType !== 'uvw' || H.maxAbsDiff(got.values, want.values) > tol) {
             throw new Error(`GPU result differs from the CPU one by ${H.maxAbsDiff(got.values, want.values)} (${line.trim()})`);
@@ -277,6 +277,21 @@ const scenarios = [
             .filter(r => !r.startsWith('#')).map(r => r.split(' ').map(Number));
         const n = rows.reduce((s, r) => s + r[3], 0);
         if (n !== 125 || rows.some(r => !(r[1] >= 111 && r[1] <= 555))) throw new Error('bad profile ' + JSON.stringify(rows));
+    }],
+    ['preview: slices as read and after a preset recipe, reused by Convert', async () => {
+        await setFile('#dataFile', path.join(ROOT, 'Examples/example_unified.h5'));
+        await waitLog(/Unified data format \| grid 5 x 5 x 5/);
+        for (let i = 0; i < 50 && !(await evaluate('document.getElementById("sliceCanvas").width === 5')); i++) await sleep(100);
+        const stats = await evaluate('document.getElementById("sliceStats").textContent');
+        if (!/l = 0 · 3 of 5/.test(stats)) throw new Error('slice stats: ' + stats);
+        await evaluate('document.getElementById("presetBtn").click()');
+        await evaluate('document.querySelector("#presetMenu button").click()');
+        await evaluate('document.querySelector("#stageSeg [data-stage=processed]").click()');
+        await waitLog(/Preview of the processed data: grid 5 x 5 x 5 in direct space/);
+        for (let i = 0; i < 50 && !/u v/.test(await evaluate('document.getElementById("planeSeg").textContent')); i++) await sleep(100);
+        const f = await H.openH5Bytes(fs.readFileSync(await convert('example_unified_dpdf_unified.h5')));
+        if (!/Using the processed data from the preview/.test(await logText())) throw new Error('the preview result was not reused');
+        if ((await H.Converter.readUnifiedData(f)).axesType !== 'uvw') throw new Error('not a 3D-ΔPDF');
     }],
     ['NeXus entry + externally linked data file -> unified', async () => {
         await setFile('#dataFile', [path.join(work, 'wrapper.nxs'), path.join(work, 't.nxs')]);
