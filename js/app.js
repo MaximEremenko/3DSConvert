@@ -1232,6 +1232,8 @@
     canvas.height = h;
     const spanX = Math.abs(p.x.to - p.x.from) || 1, spanY = Math.abs(p.y.to - p.y.from) || 1;
     canvas.style.aspectRatio = String(Math.min(4, Math.max(0.25, spanX / spanY)));
+    // Coarse grids show their voxels; fine ones are smoothed when scaled.
+    canvas.style.imageRendering = Math.max(w, h) < 256 ? 'pixelated' : 'auto';
     const direct = [p.x.name, p.y.name, p.normal.name].includes('u');
     const logScale = $('logScale').checked && !direct;
     $('logScale').disabled = direct;
