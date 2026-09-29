@@ -901,7 +901,7 @@
   // Form fields per step op: [key, type, label]. A type is a list of
   // choices, or 'num', 'num?' (blank = none), 'nums' (a list), 'range'
   // (min max, blank = all), 'axis' (min max step), 'ints3', 'json', 'bool',
-  // 'clipTo' (a number or nan) or 'extra' (a loaded volume).
+  // 'text', 'clipTo' (a number or nan) or 'extra' (a loaded volume).
   const STEP_FORMS = {
     crop: ['Crop to hkl ranges', [['h', 'range', 'h'], ['k', 'range', 'k'], ['l', 'range', 'l']]],
     resample: ['Resample onto an hkl grid', [['h', 'axis', 'h min max step'], ['k', 'axis', 'k'], ['l', 'axis', 'l']]],
@@ -913,6 +913,25 @@
       ['a', 'num?', 'its lattice parameter (Å; blank: room temperature)'], ['q', 'nums', 'more rings at |Q| (Å⁻¹)'],
       ['width', 'num', 'half-width (Å⁻¹)']]],
     maskRange: ['Mask a value range', [['min', 'num?', 'keep from'], ['max', 'num?', 'keep up to']]],
+    maskQ: ['Mask a |Q| range', [['min', 'num?', 'keep from |Q| (Å⁻¹)'], ['max', 'num?', 'keep up to |Q| (Å⁻¹)']]],
+    removeRings: ['Remove rings (Fourier filter)', [['cutoff', 'num', 'remove what is sharper in |Q| than (Å⁻¹)'],
+      ['width', 'num', '|Q| profile bin (Å⁻¹)'], ['sectors', 'num', 'direction sectors (1 = whole shells)'],
+      ['coverage', 'num', 'judge only shells covered at least this much (0–1)'],
+      ['powder', ['none', 'aluminium', 'copper', 'vanadium'], 'only near the lines of'], ['a', 'num?', 'its lattice parameter (Å; blank: room temperature)'],
+      ['near', 'num', 'within (Å⁻¹; 0 = twice the cutoff)'], ['positive', 'bool', 'only excess intensity (rings add, never take away)']]],
+    backgroundDebyeWaller: ['Background: Laue + thermal (Debye–Waller)', [
+      ['composition', 'text', 'sites, e.g. Pb; Mg 0.333 + Nb 0.667; 3*O'], ['uiso', 'text', 'Uiso (Å²): one value, or e.g. 0.01, Pb 0.03'],
+      ['radiation', ['auto', 'xray', 'neutron', 'electron'], 'radiation (auto: the data’s)'],
+      ['fit', 'bool', 'scale it to the floor of the data'], ['percentile', 'num', 'floor: percentile of each |Q| shell'],
+      ['width', 'num', 'shell width (Å⁻¹)'], ['offset', 'bool', 'fit and subtract an offset too'], ['scale', 'num', 'scale when not fitted']]],
+    correctUB: ['Correct the UB (Bragg peaks on integers)', [['mode', ['refine', 'matrix'], 'refine from the Bragg peaks, or from a new UB'],
+      ['centring', ['P', 'I', 'F', 'C', 'A', 'B', 'R'], 'lattice centring'], ['radius', 'num', 'search around integer hkl within (r.l.u.)'],
+      ['snr', 'num', 'a peak stands out by (robust σ)'], ['peaks', 'num', 'use the strongest'], ['shift', 'bool', 'allow a shift too'],
+      ['ub', 'nums', 'matrix: the UB the grid was made with (9 numbers; blank: the data’s)'], ['ubNew', 'nums', 'matrix: the corrected UB (9 numbers)']]],
+    despike: ['Despike (median)', [['size', 'num', 'neighbourhood: 1 = 3×3×3, 2 = 5×5×5'],
+      ['k', 'num', 'replace beyond k robust σ of the neighbours (0 = median filter); single-voxel Bragg peaks count as spikes']]],
+    window: ['|Q| window (before a ΔPDF)', [['kind', ['lorch', 'hann', 'gauss', 'sphere'], 'window'],
+      ['qmax', 'num', 'to |Q| (Å⁻¹; 0 = the largest sphere in the grid)']]],
     scale: ['Scale and offset', [['factor', 'num', 'factor'], ['offset', 'num', 'offset'],
       ['positive', 'bool', 'then shift up so every value is positive (RMCProfile reads 0 as masked)']]],
     smooth: ['Smooth (Gaussian)', [['sigma', 'num', 'σ in voxels; empty voxels are left out']]],
@@ -937,14 +956,15 @@
       ['fill', 'num', 'fill holes, voxels deep (0 = count them as 0)']]],
   };
   const STEP_GROUPS = [
-    ['Grid', ['crop', 'resample', 'rebin']], ['Masks', ['maskBragg', 'maskRings', 'maskRange', 'fill']],
-    ['Background', ['normalize', 'backgroundShells', 'backgroundFunction', 'combine']], ['Values', ['scale', 'clip', 'smooth']],
-    ['Symmetry', ['symmetrize']], ['Transform', ['deltaPdf']],
+    ['Grid', ['crop', 'resample', 'rebin', 'correctUB']], ['Masks', ['maskBragg', 'maskRings', 'maskQ', 'maskRange', 'fill']],
+    ['Background', ['normalize', 'backgroundShells', 'backgroundDebyeWaller', 'backgroundFunction', 'removeRings', 'combine']],
+    ['Values', ['scale', 'clip', 'smooth', 'despike']], ['Symmetry', ['symmetrize']], ['Transform', ['window', 'deltaPdf']],
   ];
   const STEP_ICON = {
     crop: 'crop', resample: 'grid', rebin: 'grid', maskBragg: 'mask', maskRings: 'rings', maskRange: 'sliders',
     scale: 'sliders', backgroundFunction: 'curve', backgroundShells: 'curve', combine: 'layers', normalize: 'layers', clip: 'sliders',
-    symmetrize: 'sym', deltaPdf: 'wave', smooth: 'curve', fill: 'wand',
+    symmetrize: 'sym', deltaPdf: 'wave', smooth: 'curve', fill: 'wand', maskQ: 'rings', removeRings: 'rings',
+    backgroundDebyeWaller: 'curve', correctUB: 'grid', despike: 'wand', window: 'wave',
   };
   // Starting values of a new step.
   const STEP_START = {
@@ -956,11 +976,18 @@
     clip: { below: 0, to: 0 }, symmetrize: { laue: 'm-3m', mode: 'average', k: 3, expand: true },
     deltaPdf: { taper: 0, engine: 'cpu', fill: 0 },
     normalize: { background: '', backgroundNorm: '', scale: 1, fitScale: false, laue: 'none' },
+    maskQ: { min: 0.3 }, removeRings: { cutoff: 0.05, width: 0.005, sectors: 1, coverage: 0.25, powder: 'none', near: 0, positive: true },
+    backgroundDebyeWaller: { composition: '', uiso: '0.01', radiation: 'auto', fit: true, percentile: 5, width: 0.05, offset: false, scale: 1 },
+    correctUB: { mode: 'refine', centring: 'P', radius: 0.25, snr: 10, peaks: 300, shift: false, ub: [], ubNew: [] },
+    despike: { size: 1, k: 5 }, window: { kind: 'lorch', qmax: 0 },
   };
   const PRESETS = [
     { name: '3D-ΔPDF of a cubic crystal', note: 'm-3m symmetrize · Bragg mask · ΔPDF', steps: [
       { op: 'symmetrize', laue: 'm-3m', mode: 'average', k: 3, expand: true },
       { op: 'maskBragg', shape: 'box', size: 0.2, centring: 'P' }, { op: 'deltaPdf', taper: 0, engine: 'cpu' }] },
+    { name: 'Clean up a volume', note: 'despike · remove rings · symmetrize without outliers', steps: [
+      { op: 'despike', size: 1, k: 5 }, { op: 'removeRings', cutoff: 0.05, width: 0.005, sectors: 1, coverage: 0.25, powder: 'none', near: 0, positive: true },
+      { op: 'symmetrize', laue: 'm-3m', mode: 'clip', k: 3, expand: true }] },
     { name: 'Subtract a background volume', note: 'load it under Other volumes', steps: [
       { op: 'combine', operation: 'subtract', scale: 1 }] },
     { name: 'Diffuse scattering only', note: 'Bragg mask · background from |Q| shells', steps: [
@@ -1054,6 +1081,11 @@
       e.addEventListener('change', changed);
       node.appendChild(e);
       return { node, read: () => e.checked };
+    }
+    if (type === 'text') {
+      const e = input(value === undefined || value === null ? '' : String(value), true);
+      e.classList.add('text-field');
+      return { node, read: () => e.value.trim() };
     }
     if (type === 'clipTo') {
       const e = input(value === undefined ? '' : String(value));

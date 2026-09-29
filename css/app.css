@@ -231,6 +231,7 @@ details.more .field { margin-top: 10px; }
 .fields input:not([type=checkbox]), .fields select { height: 32px; width: 6.5em; padding: 0 8px; border: 1px solid var(--border-strong);
   border-radius: 8px; background: var(--panel); color: var(--text); font-family: var(--mono); font-size: 13px; }
 .fields input.wide { width: 15em; }
+.fields input.text-field { width: min(26em, 70vw); }
 .fields select { width: auto; font-family: var(--font); }
 .stepactions { display: flex; gap: 6px; }
 .step { position: relative; }

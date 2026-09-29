@@ -293,6 +293,9 @@
         removeRings: { width: 0.005, cutoff: 0.05, sectors: 1, coverage: 0.25, positive: true, powder: 'none', near: 0 },
         backgroundDebyeWaller: { radiation: 'auto', uiso: '0.01', fit: true, scale: 1, offset: false, percentile: 5, width: 0.05 },
         correctUB: { mode: 'refine', centring: 'P', radius: 0.25, snr: 10, peaks: 300, shift: false },
+        despike: { size: 1, k: 5 },
+        window: { kind: 'lorch', qmax: 0 },
+        maskQ: {},
         deltaPdf: { taper: 0, engine: 'cpu', fill: 0 },
         normalize: { background: '', backgroundNorm: '', scale: 1, fitScale: false, laue: 'none' },
     };
@@ -1238,6 +1241,144 @@ D|0.413048 0.294953 0.187491 0.080701 0.023736 15.56995 32.39847 5.711404 61.889
         return withValues(model, values, changes);
     }
 
+    // ------------------------------------------------- despike, window, |Q| mask
+
+    // The k-th smallest of a[0..n) (reorders a).
+    function select(a, n, k) {
+        let lo = 0, hi = n - 1;
+        while (lo < hi) {
+            const pivot = a[(lo + hi) >> 1];
+            let i = lo, j = hi;
+            while (i <= j) {
+                while (a[i] < pivot) i++;
+                while (a[j] > pivot) j--;
+                if (i <= j) {
+                    const t = a[i];
+                    a[i] = a[j];
+                    a[j] = t;
+                    i++;
+                    j--;
+                }
+            }
+            if (k <= j) hi = j;
+            else if (k >= i) lo = i;
+            else return a[k];
+        }
+        return a[k];
+    }
+    const quickMedian = (a, n) => (n % 2 ? select(a, n, n >> 1) : 0.5 * (select(a, n, n / 2 - 1) + select(a, n, n / 2)));
+
+    // Spikes out: a voxel more than k robust sigma (1.4826 x the median
+    // absolute deviation) from the median of its neighbourhood (3 x 3 x 3,
+    // or 5 x 5 x 5 with size 2) takes that median; with k = 0 every voxel
+    // does (a median filter). Empty voxels stay empty; a replaced voxel
+    // loses its uncertainty.
+    async function stepDespike(model, step, ctx) {
+        const [nh, nk, nl] = model.dims, v = model.values, r = step.size;
+        const values = copyValues(model), sigma = model.sigma ? model.sigma.slice() : undefined;
+        const box = new Float64Array((2 * r + 1) ** 3), dev = new Float64Array(box.length);
+        let replaced = 0, i = 0;
+        for (let il = 0; il < nl; il++) {
+            for (let ik = 0; ik < nk; ik++) {
+                for (let ih = 0; ih < nh; ih++, i++) {
+                    const x = v[i];
+                    if (x !== x) continue;
+                    let n = 0;
+                    for (let c = Math.max(0, il - r); c <= Math.min(nl - 1, il + r); c++)
+                        for (let b = Math.max(0, ik - r); b <= Math.min(nk - 1, ik + r); b++) {
+                            const row = (c * nk + b) * nh;
+                            for (let a = Math.max(0, ih - r); a <= Math.min(nh - 1, ih + r); a++) {
+                                const y = v[row + a];
+                                if (y === y) box[n++] = y;
+                            }
+                        }
+                    if (n < 3) continue;
+                    const med = quickMedian(box, n);
+                    if (step.k > 0) {
+                        for (let t = 0; t < n; t++) dev[t] = Math.abs(box[t] - med);
+                        const lim = step.k * 1.4826 * quickMedian(dev, n);
+                        if (!(Math.abs(x - med) > lim)) continue;
+                    }
+                    if (values[i] !== med) {
+                        values[i] = med;
+                        if (sigma) sigma[i] = NaN;
+                        replaced++;
+                    }
+                }
+            }
+            if (ctx.tick && il % 4 === 3) await ctx.tick();
+        }
+        ctx.log(`${replaced} voxels ${step.k > 0 ? `beyond ${step.k} robust sigma of their neighbours ` : ''}set to the median around them`);
+        return withValues(model, values, { sigma });
+    }
+
+    // The largest |Q| of a whole sphere about Q = 0 inside the grid's box
+    // (0 when the box does not hold Q = 0).
+    function inscribedQ(model, cell) {
+        const Q = qMatrix(cell), M = gridMatrix(model), QM = mulMM(Q, M);
+        const f0 = mulMV(invert3(M), model.corner.map(x => -x));       // Q = 0 in grid indices
+        let best = Infinity;
+        for (let a = 0; a < 3; a++) {
+            if (model.dims[a] <= 1) continue;
+            if (f0[a] < 0 || f0[a] > model.dims[a] - 1) return 0;
+            // distance from Q = 0 to the faces index_a = 0 and dims - 1: the
+            // plane's normal is row a of (QM)^-1
+            const row = invert3(QM)[a], len = Math.hypot(...row);
+            best = Math.min(best, f0[a] / len, (model.dims[a] - 1 - f0[a]) / len);
+        }
+        return best === Infinity ? 0 : best;
+    }
+
+    // A window in |Q| against truncation ripples in a 3D-ΔPDF: Lorch
+    // (sin x / x, x = pi |Q| / qmax), Hann ((1 + cos(pi |Q| / qmax)) / 2),
+    // Gaussian (exp(-|Q|^2 / 2 s^2), s = qmax / 3) or a sphere (1 inside);
+    // voxels beyond qmax become empty (0 for the ΔPDF). qmax 0: the largest
+    // sphere inside the grid.
+    function stepWindow(model, step, ctx) {
+        needCell(ctx.cell, 'a |Q| window');
+        const qmax = step.qmax > 0 ? step.qmax : inscribedQ(model, ctx.cell);
+        if (!(qmax > 0)) throw new Error('the grid does not hold |Q| = 0; give qmax');
+        const f = {
+            lorch: q => (q > 0 ? Math.sin(Math.PI * q / qmax) / (Math.PI * q / qmax) : 1),
+            hann: q => 0.5 * (1 + Math.cos(Math.PI * q / qmax)),
+            gauss: q => Math.exp(-0.5 * (3 * q / qmax) ** 2),
+            sphere: () => 1,
+        }[step.kind];
+        const values = copyValues(model), sigma = model.sigma ? model.sigma.slice() : undefined;
+        let outside = 0;
+        forEachQ(model, ctx.cell, (i, q) => {
+            if (q > qmax) {
+                if (values[i] === values[i]) outside++;
+                values[i] = NaN;
+                if (sigma) sigma[i] = NaN;
+                return;
+            }
+            const w = f(q);
+            values[i] *= w;
+            if (sigma) sigma[i] *= w;
+        });
+        ctx.log(`${step.kind} window to |Q| ${+qmax.toPrecision(5)} 1/A; ${outside} voxels beyond it emptied`);
+        return withValues(model, values, { sigma });
+    }
+
+    // Voxels outside min <= |Q| <= max (1/A) become empty: the beam stop,
+    // the corners of the grid.
+    function stepMaskQ(model, step, ctx) {
+        needCell(ctx.cell, 'a |Q| range mask');
+        const lo = step.min === undefined || step.min === null ? -Infinity : step.min;
+        const hi = step.max === undefined || step.max === null ? Infinity : step.max;
+        const values = copyValues(model);
+        let masked = 0;
+        forEachQ(model, ctx.cell, (i, q) => {
+            if ((q < lo || q > hi) && values[i] === values[i]) {
+                values[i] = NaN;
+                masked++;
+            }
+        });
+        ctx.log(`${masked} voxels masked`);
+        return withValues(model, values);
+    }
+
     // Combine with another volume, sampled onto this grid.
     function stepCombine(model, step, ctx) {
         const other = ctx.extras && ctx.extras[step.file];
@@ -1952,7 +2093,7 @@ D|0.413048 0.294953 0.187491 0.080701 0.023736 15.56995 32.39847 5.711404 61.889
 
     // Steps that act on hkl / |Q| and so need reciprocal-space data.
     const RECIPROCAL_ONLY = new Set(['maskBragg', 'maskRings', 'backgroundFunction', 'backgroundShells', 'deltaPdf', 'removeRings',
-        'backgroundDebyeWaller', 'correctUB']);
+        'backgroundDebyeWaller', 'correctUB', 'window', 'maskQ']);
 
     const STEPS = {
         crop: { run: stepCrop, fields: { h: 'range?', k: 'range?', l: 'range?' } },
@@ -1968,6 +2109,9 @@ D|0.413048 0.294953 0.187491 0.080701 0.023736 15.56995 32.39847 5.711404 61.889
         maskBragg: { run: stepMaskBragg, fields: { shape: 'string', size: 'positive', centring: 'string' } },
         maskRings: { run: stepMaskRings, fields: { q: 'numbers?', width: 'positive', powder: 'powder', a: 'number?' } },
         maskRange: { run: stepMaskRange, fields: { min: 'number?', max: 'number?' } },
+        maskQ: { run: stepMaskQ, fields: { min: 'number?', max: 'number?' } },
+        despike: { run: stepDespike, fields: { size: 'despikeSize', k: 'nonnegative' } },
+        window: { run: stepWindow, fields: { kind: 'windowKind', qmax: 'nonnegative' } },
         removeRings: {
             run: stepRemoveRings,
             fields: {
@@ -1983,7 +2127,7 @@ D|0.413048 0.294953 0.187491 0.080701 0.023736 15.56995 32.39847 5.711404 61.889
         backgroundDebyeWaller: {
             run: stepBackgroundDebyeWaller,
             fields: {
-                radiation: 'radiation', composition: 'string', uiso: 'any', fit: 'boolean', scale: 'number', offset: 'boolean',
+                radiation: 'radiation', composition: 'any', uiso: 'any', fit: 'boolean', scale: 'number', offset: 'boolean',
                 percentile: 'number', width: 'positive',
             },
         },
@@ -2021,6 +2165,9 @@ D|0.413048 0.294953 0.187491 0.080701 0.023736 15.56995 32.39847 5.711404 61.889
             fraction: v => finite(v) && v >= 0 && v <= 1,
             radiation: v => ['auto', 'xray', 'neutron', 'electron'].includes(v),
             ubMode: v => v === 'refine' || v === 'matrix',
+            despikeSize: v => v === 1 || v === 2,
+            nonnegative: v => finite(v) && v >= 0,
+            windowKind: v => ['lorch', 'hann', 'gauss', 'sphere'].includes(v),
             centring: v => Object.prototype.hasOwnProperty.call(CENTRING, v),
             peakCount: v => Number.isInteger(v) && v >= 5 && v <= 100000,
             'matrix?': v => v === undefined || v === null || (Array.isArray(v) && (v.length === 0 || (v.length === 9 && v.every(finite)))),
@@ -2076,6 +2223,11 @@ D|0.413048 0.294953 0.187491 0.080701 0.023736 15.56995 32.39847 5.711404 61.889
             case 'removeRings': return `remove rings sharper than ${step.cutoff} 1/A by Fourier filtering of the |Q| profile ` +
                 `(bins of ${step.width} 1/A${step.sectors > 1 ? `, ${step.sectors} direction sectors` : ''}` +
                 (step.powder && step.powder !== 'none' ? `, only near the ${step.powder} lines` : '') + ')';
+            case 'maskQ': return `mask |Q| outside ${step.min === undefined || step.min === null ? 0 : step.min}..${step.max === undefined || step.max === null ? 'inf' : step.max} 1/A`;
+            case 'despike': return step.k > 0
+                ? `despike: voxels beyond ${step.k} robust sigma of the median of their ${step.size === 2 ? '5 x 5 x 5' : '3 x 3 x 3'} neighbourhood take that median`
+                : `median filter over ${step.size === 2 ? '5 x 5 x 5' : '3 x 3 x 3'} voxels`;
+            case 'window': return `${step.kind} window in |Q| up to ${step.qmax > 0 ? step.qmax + ' 1/A' : 'the largest sphere in the grid'}, empty beyond`;
             case 'maskRange': return `mask values outside ${step.min === undefined || step.min === null ? '-inf' : step.min}..${step.max === undefined || step.max === null ? 'inf' : step.max}`;
             case 'scale': return `scale: I * ${step.factor} + ${step.offset}` + (step.positive ? ', then shift up to positive' : '');
             case 'smooth': return `Gaussian smoothing, sigma ${step.sigma} voxel${step.sigma === 1 ? '' : 's'} (empty voxels left out)`;

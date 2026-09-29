@@ -558,3 +558,24 @@ test('correctUB: Bragg peaks of a slightly wrong UB go back onto integer hkl (re
     assert.ok(maxAbsDiff(byUB.ub.flat(), ubNew.flat()) < 1e-12);
     await assert.rejects(run(m, [{ op: 'correctUB', mode: 'matrix', ubNew: ubNew.flat() }]), /made with/);
 });
+
+test('despike, |Q| window and |Q| mask', async () => {
+    const m = grid(1, 0.25, (h, k, l) => 10 + h + 2 * k + 3 * l);
+    const spiked = Object.assign({}, m, { values: Float64Array.from(m.values) });
+    spiked.values[(4 * 9 + 4) * 9 + 4] = 500;                          // (0, 0, 0)
+    spiked.values[(2 * 9 + 6) * 9 + 3] = -300;
+    const logs = [];
+    const clean = await run(spiked, [{ op: 'despike', size: 1, k: 5 }], { log: t => logs.push(t) });
+    assert.match(logs.join(' '), /2 voxels beyond 5 robust sigma/);
+    assert.equal(clean.values[(4 * 9 + 4) * 9 + 4], 10);
+    assert.equal(maxAbsDiff(clean.values.filter((_, i) => i !== (2 * 9 + 6) * 9 + 3), m.values.filter((_, i) => i !== (2 * 9 + 6) * 9 + 3)), 0);
+    // |Q| window: the largest sphere in -1..1 r.l.u. of a 4 A cube has |Q| = 2 pi / 4
+    const ones = grid(1, 0.25, () => 1);
+    const win = await run(ones, [{ op: 'window', kind: 'lorch' }], { log: t => logs.push(t) });
+    assert.match(logs.join(' '), /lorch window to \|Q\| 1\.5708/);
+    assert.equal(value(win, 4, 4, 4), 1);
+    assert.ok(Math.abs(value(win, 6, 4, 4) - Math.sin(Math.PI / 2) / (Math.PI / 2)) < 1e-12);   // h = 0.5: half of qmax
+    assert.ok(Number.isNaN(value(win, 8, 8, 8)));
+    const shell = await run(ones, [{ op: 'maskQ', min: 0.5, max: 1.2 }]);
+    assert.ok(Number.isNaN(value(shell, 4, 4, 4)) && value(shell, 6, 4, 4) === 1 && Number.isNaN(value(shell, 8, 4, 4)));
+});

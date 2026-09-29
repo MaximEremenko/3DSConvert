@@ -325,6 +325,32 @@ const scenarios = [
         await evaluate('document.querySelector("#stageSeg [data-stage=processed]").click()');
         await waitLog(/Preview of the processed data: grid 5 x 5 x 5/);
     }],
+    ['processing: a half volume comes back whole after Symmetrize; despike, |Q| window and mask run', async () => {
+        await setFile('#dataFile', path.join(ROOT, 'Examples/example_unified.h5'));
+        await waitLog(/Unified data format \| grid 5 x 5 x 5/);
+        await evaluate(`(() => {
+            const add = op => { const s = document.getElementById('stepOp'); s.value = op; document.getElementById('addStep').click(); };
+            add('crop');
+            const ins = document.querySelector('#steps .step.open .stepbody').querySelectorAll('input');
+            ins[0].value = '0'; ins[1].value = '1';
+            ins[1].dispatchEvent(new Event('input'));
+            add('symmetrize');
+        })()`);
+        await evaluate('document.getElementById("processBtn").click()');
+        await waitLog(/grid extended from 3 x 5 x 5 to 5 x 5 x 5[\s\S]*Preview of the processed data: grid 5 x 5 x 5/);
+        for (let i = 0; i < 50 && !/h\s+−1 … 1/.test(await evaluate('document.getElementById("axisX").textContent')); i++) await sleep(100);
+        const axis = await evaluate('document.getElementById("axisX").textContent');
+        if (!/h\s+−1 … 1/.test(axis)) throw new Error('the processed preview is not whole: ' + axis);
+        await evaluate(`(() => {
+            for (const op of ['despike', 'window', 'maskQ']) { const s = document.getElementById('stepOp'); s.value = op; document.getElementById('addStep').click(); }
+        })()`);
+        await evaluate('document.getElementById("processBtn").click()');
+        const text = await waitLog(/Preview of the processed data|Error/);
+        if (/Error/.test(text)) throw new Error(text);
+        for (const want of [/set to the median around them/, /lorch window to \|Q\| [\d.]+ 1\/A/, /voxels masked/]) {
+            if (!want.test(text)) throw new Error(`no ${want} in\n${text}`);
+        }
+    }],
     ['layout: panels move, the columns and the log resize, the columns swap; kept after a reload', async () => {
         await send('Emulation.setDeviceMetricsOverride', { width: 1400, height: 900, deviceScaleFactor: 1, mobile: false });
         try {

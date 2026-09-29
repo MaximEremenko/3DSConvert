@@ -392,18 +392,24 @@ NaN marks masked or missing voxels throughout, and |Q| is Cartesian in
 | Crop | keeps the points inside hkl ranges (grids along h, k, l; use Resample otherwise) |
 | Resample | NaN-aware trilinear interpolation onto a new axis-aligned hkl grid |
 | Rebin | averages blocks of voxels, skipping NaN |
+| Correct the UB | puts the Bragg peaks back on integer hkl: *refine* finds the peaks near integer positions (half-maximum centroids within a search radius, a robust signal-to-noise cut), fits the linear map (optionally with a shift) that takes them to the integers by least squares with one round of outlier rejection, and resamples the volume on its own grid; *matrix* does the same from the UB the grid was made with (else the data's) and a corrected UB. The data's UB is corrected too. Run it before any Bragg mask |
 | Mask Bragg positions | boxes (half-width in r.l.u.) or spheres (radius in 1/Angstrom) around integer hkl, for P, I, F, C, A, B or R lattices |
 | Mask powder rings | voxels within ±w of given \|Q\| values, or of the powder lines of an aluminium, copper or vanadium sample holder (from its lattice parameter, room temperature by default) |
+| Mask \|Q\| range | voxels outside min ≤ \|Q\| ≤ max (the beam stop, the corners of the grid) |
 | Mask values | values outside a range |
 | Fill empty voxels | empty voxels next to data take the mean of their measured neighbours, n layers deep |
 | Scale and offset | I × factor + offset; optionally then shifted up by 1.01 × the lowest value, so every value is positive (RMCProfile reads I = 0 as masked) |
 | Smooth | Gaussian, σ in voxels; empty voxels neither count nor get filled; uncertainties are dropped |
+| Despike | a voxel more than k robust σ (1.4826 × the median absolute deviation) from the median of its 3×3×3 (or 5×5×5) neighbourhood takes that median; k = 0 makes it a median filter. Single-voxel Bragg peaks of calculated patterns count as spikes |
 | Normalize by Mantid norms | Σdata/Σnorm − s·Σbkg/Σbkg_norm from MDNorm's component volumes, summed over Laue equivalents if asked; s given, or fitted by least squares of data/norm against bkg/bkg_norm (on real CORELLI data the fit comes out near 0, so check it) |
 | Background B(\|Q\|) | subtracts a constant, linear, a − b·c^\|Q\| or tabulated function of \|Q\| (two table rows at one \|Q\| make a step) |
 | Background from \|Q\| shells | subtracts the minimum or a percentile of each \|Q\| shell, optionally smoothed over neighbouring shells |
+| Background: Laue + thermal | the diffuse scattering of uncorrelated disorder, per formula unit Σ over sites of count × (⟨f²⟩ − ⟨f e^−W⟩²) with 2W = Uiso Q²: the Laue term of species sharing a site and the thermal diffuse scattering the Debye–Waller factors take from the Bragg peaks. The composition is written as sites, e.g. `Pb; Mg 0.333 + Nb 0.667; 3*O` (occupancies; what is missing to 1 is vacancy), with Uiso for all or per element (`0.01, Pb 0.03`); X-ray (Waasmaier–Kirfel), neutron (coherent lengths) or electron (Peng) scattering, from 3DSCalculator's tables. It is scaled by least squares to a low percentile of each \|Q\| shell (with an offset if asked), or by a given factor |
+| Remove rings (Fourier filter) | the median \|Q\| profile (per direction sector if asked) is split by a Gaussian low-pass in Fourier space, iterated so the smooth part passes under the rings; what is sharper than the cutoff and rises above four times the uncertainty of the median is a ring and is subtracted at its \|Q\| from every voxel, leaving anisotropic diffuse scattering alone. Shells covered less than a set fraction are not judged; with a sample-holder powder, only its lines are touched |
 | Combine | subtracts, adds, multiplies or divides by another volume (times a factor), interpolated onto this grid if the grids differ |
 | Replace low values | sets values below a threshold to a number or NaN |
-| Symmetrize | averages over Laue-equivalent points (-1 to m-3m; hexagonal axes for the trigonal groups), or only fills empty voxels; can extend a partial grid to its symmetric images |
+| Symmetrize | averages over Laue-equivalent points (-1 to m-3m; hexagonal axes for the trigonal groups), or only fills empty voxels; *median* takes the median of the equivalents and *clip* their mean without those more than k robust σ from it, so a spike or a spurious peak in one equivalent drops out. The grid is extended to its symmetric images (a half volume becomes whole) unless that is switched off; a grid that already holds them stays as it is |
+| \|Q\| window | multiplies by a Lorch (sin x / x), Hann or Gaussian window in \|Q\| up to qmax (by default the largest sphere inside the grid), or keeps a sphere; voxels beyond become empty. Before a 3D-ΔPDF it damps the truncation ripples of the box's edges |
 | 3D-ΔPDF | Fourier transform to direct space (below) |
 
 The other volumes that *Combine* steps use (an empty-can measurement, a
