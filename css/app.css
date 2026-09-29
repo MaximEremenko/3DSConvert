@@ -270,6 +270,10 @@ details.more .field { margin-top: 10px; }
 .slicer { display: flex; align-items: center; gap: 10px; font-size: 12.5px; color: var(--muted); flex-wrap: wrap; }
 .slicer input[type=range] { flex: 1 1 160px; }
 .slicer b { font-family: var(--mono); font-weight: 400; color: var(--text); min-width: 9ch; }
+.slicer .slice-at { width: 11ch; height: 28px; font-family: var(--mono); font-size: 12.5px; }
+.slicer.levels { margin-top: 6px; }
+.slicer .lvl { width: 12ch; height: 28px; font-family: var(--mono); font-size: 12.5px; }
+.slicer .lvlnote { font-size: 12px; }
 .empty-preview { height: 420px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px;
   border-radius: 12px; border: 1px dashed var(--border-strong); color: var(--muted); text-align: center; padding: 0 20px; }
 .empty-preview svg.i { width: 44px; height: 44px; stroke-width: 1.4; }

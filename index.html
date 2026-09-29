@@ -272,8 +272,17 @@
       <div class="slicer">
         <span id="sliceName"></span>
         <input type="range" id="sliceIndex" min="0" max="0" value="0" aria-label="Slice position">
-        <b id="sliceValue"></b>
+        <input id="sliceAt" class="text slice-at" inputmode="decimal" aria-label="Plane position" title="Type a position and press Enter">
         <label class="check"><input type="checkbox" id="logScale" checked>log scale</label>
+      </div>
+      <div class="slicer levels">
+        <span>Levels</span>
+        <input id="levelLo" class="text lvl" inputmode="decimal" aria-label="Lowest colour level" title="Type a level; it stays while you move through the planes">
+        <span>…</span>
+        <input id="levelHi" class="text lvl" inputmode="decimal" aria-label="Highest colour level" title="Type a level; it stays while you move through the planes">
+        <button type="button" class="btn ghost small" id="levelAuto" title="Levels from the whole volume, kept for every plane">auto</button>
+        <label class="check"><input type="checkbox" id="levelSlice">per slice</label>
+        <span class="lvlnote" id="levelNote"></span>
       </div>
       <div class="readout" id="readout">Point at the slice to read values</div>
       <div class="histo">

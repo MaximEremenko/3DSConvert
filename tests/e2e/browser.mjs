@@ -305,6 +305,30 @@ const scenarios = [
         if (!/Using the processed data from the preview/.test(await logText())) throw new Error('the preview result was not reused');
         if ((await H.Converter.readUnifiedData(f)).axesType !== 'uvw') throw new Error('not a 3D-ΔPDF');
     }],
+    ['preview: levels kept from plane to plane, typed levels, a typed plane position', async () => {
+        await setFile('#dataFile', path.join(ROOT, 'Examples/example_unified.h5'));
+        await waitLog(/Unified data format \| grid 5 x 5 x 5/);
+        for (let i = 0; i < 50 && !(await evaluate('document.getElementById("sliceCanvas").width === 5')); i++) await sleep(100);
+        const levels = () => evaluate('["levelLo", "levelHi", "levelNote"].map(id => { const e = document.getElementById(id); return e.value || e.textContent; }).join("|")');
+        const stats = () => evaluate('document.getElementById("sliceStats").textContent');
+        const typePlane = async (value, want) => {
+            await evaluate(`(() => { const e = document.getElementById('sliceAt'); e.value = ${JSON.stringify(value)}; e.dispatchEvent(new Event('change')); })()`);
+            for (let i = 0; i < 50 && !want.test(await stats()); i++) await sleep(100);
+            if (!want.test(await stats())) throw new Error(`typed ${value}: ${await stats()}`);
+        };
+        const first = await levels();
+        if (!/whole volume, kept for every plane/.test(first)) throw new Error('levels ' + first);
+        await typePlane('1', /l = 1 · 5 of 5/);
+        if (await levels() !== first) throw new Error(`the levels changed with the plane: ${first} -> ${await levels()}`);
+        await evaluate(`(() => { const lo = document.getElementById('levelLo'), hi = document.getElementById('levelHi');
+            lo.value = '2'; hi.value = '50'; hi.dispatchEvent(new Event('change')); })()`);
+        const set = await levels();
+        if (set !== '2|50|as typed, kept for every plane') throw new Error('typed levels ' + set);
+        await typePlane('−0.6', /l = −0\.5 · 2 of 5/);                 // the nearest plane, true minus accepted
+        if (await levels() !== set) throw new Error('typed levels lost: ' + await levels());
+        await evaluate('document.getElementById("levelAuto").click()');
+        if (await levels() !== first) throw new Error('auto did not restore the volume levels: ' + await levels());
+    }],
     ['recipe editor: drag to reorder, undo, and the JSON view', async () => {
         await setFile('#dataFile', path.join(ROOT, 'Examples/example_unified.h5'));
         await waitLog(/Unified data format \| grid 5 x 5 x 5/);

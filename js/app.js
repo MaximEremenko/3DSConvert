@@ -93,6 +93,11 @@
     return t.replace(/^-/, '−');
   }
   const fmtInt = n => String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ' ');
+  // A typed number, with either minus sign; NaN when empty or not a number.
+  const parseNum = text => {
+    const t = String(text).trim().replace(/−/g, '-');
+    return t === '' ? NaN : Number(t);
+  };
   // n significant digits, a true minus sign.
   const sig = (x, n) => (Number.isFinite(x) ? String(+x.toPrecision(n || 3)).replace(/^-/, '−') : String(x));
 
@@ -1152,6 +1157,9 @@
   const preview = {
     view: 'slice', stage: 'input', normal: 2, index: null, plane: null, profile: null, hover: -1,
     point: null, names: null, cursor: null,
+    // colour levels: 'volume' (the whole volume's range, kept for every plane),
+    // 'slice' (each plane's own range) or 'set' (typed, in data units)
+    levelMode: 'volume', levelSet: null,
     ready: false, stale: false, seq: 0, timer: 0, ptimer: 0,
   };
 
@@ -1173,6 +1181,9 @@
     preview.point = null;
     preview.names = null;
     preview.cursor = null;
+    preview.levelMode = 'volume';
+    preview.levelSet = null;
+    $('levelSlice').checked = false;
     $('sliceMark').hidden = true;
     $('previewEmpty').hidden = !!s;
     showView();
@@ -1306,23 +1317,44 @@
       if (x > max) max = x;
       if (i % step === 0) finite.push(logScale ? x : direct ? Math.abs(x) : x);
     }
+    // The levels, in data units: typed, the whole volume's (kept while
+    // moving through the planes) or this plane's own.
+    const mode = preview.levelMode === 'set' && preview.levelSet ? 'set'
+      : preview.levelMode === 'volume' && p.levels ? 'volume' : 'slice';
     let lo, hi, tf;
-    if (direct) {
-      finite.sort((a, b) => a - b);
-      hi = percentile(finite, 0.998) || 1;
+    if (mode === 'set') {
+      [lo, hi] = preview.levelSet;
+      if (logScale) {
+        const floor = p.levels && p.levels.log[0] > 0 ? p.levels.log[0] : 1e-6;
+        lo = Math.log10(lo > 0 ? lo : Math.min(floor, hi > 0 ? hi / 1000 : floor));
+        hi = Math.log10(hi > 0 ? hi : 1);
+      }
+    } else if (direct) {
+      if (mode === 'volume') {
+        hi = p.levels.abs || 1;
+      } else {
+        finite.sort((a, b) => a - b);
+        hi = percentile(finite, 0.998) || 1;
+      }
       lo = -hi;
-      tf = x => x;
     } else if (logScale) {
-      const pos = finite.filter(x => x > 0).sort((a, b) => a - b);
-      lo = Math.log10(percentile(pos, 0.01) || 1e-3);
-      hi = Math.log10(percentile(pos, 0.998) || 1);
-      tf = x => (x > 0 ? Math.log10(x) : lo);
+      let a, b;
+      if (mode === 'volume') {
+        [a, b] = p.levels.log;
+      } else {
+        const pos = finite.filter(x => x > 0).sort((x, y) => x - y);
+        [a, b] = [percentile(pos, 0.01), percentile(pos, 0.998)];
+      }
+      lo = Math.log10(a || 1e-3);
+      hi = Math.log10(b || 1);
+    } else if (mode === 'volume') {
+      [lo, hi] = p.levels.lin;
     } else {
       finite.sort((a, b) => a - b);
       lo = percentile(finite, 0.005);
       hi = percentile(finite, 0.995);
-      tf = x => x;
     }
+    tf = logScale && !direct ? (x => (x > 0 ? Math.log10(x) : lo)) : (x => x);
     if (!(hi > lo)) hi = lo + 1;
     const stops = direct ? DIVERGING : VIRIDIS;
     const nanHex = getComputedStyle(document.documentElement).getPropertyValue('--nan').trim() || '#c9ced8';
@@ -1343,13 +1375,19 @@
     drawHistogram(v, step, t => (tf(t) - lo) / (hi - lo), stops);
     $('histoLo').textContent = label(lo);
     $('histoHi').textContent = label(hi);
+    for (const [id, value] of [['levelLo', lo], ['levelHi', hi]]) {
+      if (document.activeElement !== $(id)) $(id).value = label(value);
+    }
+    $('levelNote').textContent = mode === 'volume' ? 'whole volume, kept for every plane'
+      : mode === 'set' ? 'as typed, kept for every plane' : 'this plane only';
     const n = p.normal, at = n.n > 1 ? n.from + n.index * (n.to - n.from) / (n.n - 1) : n.from;
-    $('sliceValue').textContent = `= ${fmtNum(at)}`;
+    if (document.activeElement !== $('sliceAt')) $('sliceAt').value = fmtNum(at);
     $('sliceStats').replaceChildren(
       stat('Slice', `${n.name} = ${fmtNum(at)} · ${n.index + 1} of ${n.n}`),
       stat('Values', Number.isFinite(min) ? `${fmtNum(min)} … ${fmtNum(max)}` : 'none'),
       stat('No data', `${(100 * nan / v.length).toFixed(1)} % of the slice`),
-      stat('Scale', direct ? 'linear, centred on 0' : logScale ? 'log₁₀, robust range' : 'linear, robust range'));
+      stat('Scale', (direct ? 'linear, centred on 0' : logScale ? 'log₁₀' : 'linear') +
+        (mode === 'volume' ? ', volume levels' : mode === 'set' ? ', set levels' : ', slice levels')));
   }
 
   // Counts of the (sampled) finite values across the colour scale; the
@@ -1422,6 +1460,41 @@
     preview.timer = setTimeout(loadSlice, 40);
   });
   $('logScale').addEventListener('change', drawSlice);
+  // A typed plane position: the nearest plane.
+  $('sliceAt').addEventListener('change', () => {
+    const p = preview.plane, x = parseNum($('sliceAt').value);
+    if (!p || !Number.isFinite(x)) {
+      drawSlice();
+      return;
+    }
+    preview.index = Math.min(p.normal.n - 1, Math.max(0, indexOf(p.normal, x)));
+    $('sliceAt').blur();
+    loadSlice();
+  });
+  // Typed levels stay for every plane until auto (or per slice).
+  function setLevels() {
+    const lo = parseNum($('levelLo').value), hi = parseNum($('levelHi').value);
+    if (!Number.isFinite(lo) || !Number.isFinite(hi) || !(hi > lo)) {
+      drawSlice();
+      return;
+    }
+    preview.levelMode = 'set';
+    preview.levelSet = [lo, hi];
+    $('levelSlice').checked = false;
+    drawSlice();
+  }
+  for (const id of ['levelLo', 'levelHi']) $(id).addEventListener('change', setLevels);
+  $('levelAuto').addEventListener('click', () => {
+    preview.levelMode = 'volume';
+    preview.levelSet = null;
+    $('levelSlice').checked = false;
+    drawSlice();
+  });
+  $('levelSlice').addEventListener('change', () => {
+    preview.levelMode = $('levelSlice').checked ? 'slice' : 'volume';
+    preview.levelSet = null;
+    drawSlice();
+  });
   for (const b of $('planeSeg').children) {
     b.addEventListener('click', () => {
       preview.normal = Number(b.dataset.normal);

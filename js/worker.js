@@ -318,6 +318,30 @@ function converterWorker(self, h5wasm, Converter, Processing, wgpuFftWeb) {
     // The plane of the grid with grid axis `normal` fixed at `index` (or at
     // the plane nearest the coordinate `coord` along it), as float32 rows from
     // the top (the second in-plane axis increases upwards).
+    // Colour levels over the whole volume (from a sample of it), so the page
+    // keeps one scale while it moves through the planes: robust linear and
+    // log ranges, and the largest |value| for the diverging scale.
+    const levelCache = new WeakMap();
+    function volumeLevels(values) {
+        const cached = levelCache.get(values);
+        if (cached) return cached;
+        const step = Math.max(1, Math.floor(values.length / 400000));
+        const all = [], pos = [], abs = [];
+        for (let i = 0; i < values.length; i += step) {
+            const x = values[i];
+            if (!Number.isFinite(x)) continue;
+            all.push(x);
+            abs.push(Math.abs(x));
+            if (x > 0) pos.push(x);
+        }
+        const sorted = a => Float64Array.from(a).sort();
+        const q = (a, p) => (a.length ? a[Math.min(a.length - 1, Math.round(p * (a.length - 1)))] : NaN);
+        const [s, sp, sa] = [sorted(all), sorted(pos), sorted(abs)];
+        const out = { lin: [q(s, 0.005), q(s, 0.995)], log: [q(sp, 0.01), q(sp, 0.998)], abs: q(sa, 0.998) };
+        levelCache.set(values, out);
+        return out;
+    }
+
     function slicePlane(geo, normal, index, coord) {
         const [nh, nk, nl] = geo.dims;
         const [ax, ay] = [0, 1, 2].filter(a => a !== normal);
@@ -505,7 +529,9 @@ function converterWorker(self, h5wasm, Converter, Processing, wgpuFftWeb) {
         async slice({ stage, normal, index, at }) {
             const source = stage === 'processed' ? state.processed && { model: state.processed.plan.model } : state.data;
             if (!source) throw new Error(stage === 'processed' ? 'no processed preview yet' : 'no data file loaded');
-            const plane = slicePlane(geometryOf(source), normal, index, at);
+            const geo = geometryOf(source);
+            const plane = slicePlane(geo, normal, index, at);
+            plane.levels = volumeLevels(geo.values);
             return { result: plane, transfer: [plane.values.buffer] };
         },
 
