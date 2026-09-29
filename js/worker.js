@@ -22,7 +22,10 @@ function converterWorker(self, h5wasm, Converter, Processing, wgpuFftWeb) {
     'use strict';
 
     const MOUNT = '/work';
-    const state = { files: {}, data: null, struct: null, extras: {}, plan: null };
+    const state = {
+        files: {}, data: null, struct: null, extras: {}, plan: null, processed: null,
+        dataVersion: 0, extrasVersion: 0, structVersion: 0,
+    };
     const cancelled = new Set();
     const acks = new Map();
     let outSeq = 0;
@@ -182,6 +185,40 @@ function converterWorker(self, h5wasm, Converter, Processing, wgpuFftWeb) {
         };
     }
 
+    // Plan the conversion (cell, Q -> hkl) and run the recipe. The result is
+    // kept in state.processed and reused while the data, the extra volumes,
+    // the cell and the recipe stay the same.
+    async function processData(params, ctx) {
+        if (!state.data) throw new Error('no data file loaded');
+        const recipe = params.recipe && params.recipe.steps && params.recipe.steps.length
+            ? Processing.normalizeRecipe(params.recipe) : null;
+        const key = JSON.stringify([state.dataVersion, state.extrasVersion, state.structVersion, params.manual || null,
+            params.cellPrefer || null, params.grid || null, params.customFrame || null, params.radiation || null, recipe]);
+        if (state.processed && state.processed.key === key) {
+            ctx.log('Using the processed data from the preview.');
+            return state.processed;
+        }
+        const input = state.data.grid ? { grid: state.data.grid } : { model: state.data.model };
+        const plan = Converter.planConversion(input, Object.assign({}, params, { format: 'unified', structure: state.struct }));
+        for (const line of plan.logs) ctx.log(line);
+        let process = null;
+        if (recipe) {
+            ctx.log(`Processing ${plan.model.dims.join(' x ')} voxels with ${recipe.steps.length} step(s):`);
+            const t0 = Date.now();
+            plan.model = await Processing.applyRecipe(plan.model, recipe, {
+                cell: plan.cell, extras: recipeExtras(recipe, params), fft: fftEngine(ctx.log),
+                tick: ctx.tick, progress: f => ctx.progress('Processing', f), log: ctx.log,
+            });
+            ctx.log(`Processed in ${((Date.now() - t0) / 1000).toFixed(1)} s`);
+            process = {
+                program: '3DSConvert', recipe,
+                description: recipe.steps.map((s, n) => `${n + 1}. ${Processing.describeStep(s)}`).join('\n'),
+            };
+        }
+        state.processed = { key, plan, process };
+        return state.processed;
+    }
+
     // The extra volumes a recipe's combine steps name, on hkl grids.
     function recipeExtras(recipe, params) {
         const extras = {};
@@ -200,19 +237,74 @@ function converterWorker(self, h5wasm, Converter, Processing, wgpuFftWeb) {
     }
 
     function summarize(data) {
+        const geo = geometryOf(data);
+        const common = { corner: geo.corner, vectors: geo.vectors, names: geo.names, nonFinite: Converter.countNonFinite(geo.values) };
         if (data.model) {
             const m = data.model;
-            return {
+            return Object.assign(common, {
                 kind: data.kind, dims: m.dims, cellLengths: m.cellLengths, cellAngles: m.cellAngles,
                 axesType: m.axesType, content: m.content || null, legacyContract: !!m.legacyContract,
                 notes: m.notes || [], precision: m.values instanceof Float32Array ? 'float32' : 'float64',
-            };
+            });
         }
         const g = data.grid;
-        return {
+        return Object.assign(common, {
             kind: data.kind, dims: g.dims, frame: g.frame, title: g.title || '', notes: g.notes || [],
             datHeader: g.datHeader || null, precision: 'float64',
+        });
+    }
+
+    // Grid geometry in the file's own frame, for summaries and the preview:
+    // corner, step vectors and a component name per axis (hkl, uvw or Q).
+    function geometryOf(data) {
+        if (data.model) {
+            const m = data.model;
+            const names = m.axesType === 'uvw' ? ['u', 'v', 'w'] : m.axesType === 'Q' ? ['Qx', 'Qy', 'Qz'] : ['h', 'k', 'l'];
+            return { dims: m.dims, values: m.values, corner: m.corner, vectors: m.vectors, names };
+        }
+        const g = data.grid;
+        const names = g.frame === 'hkl' ? ['h', 'k', 'l'] : ['Qx', 'Qy', 'Qz'];
+        if (g.qCorner) return { dims: g.dims, values: g.values, corner: g.qCorner, vectors: g.qVectors, names };
+        const vectors = [0, 1, 2].map(a => [0, 1, 2].map(c => (a === c ? g.spacing[a] : 0)));
+        return { dims: g.dims, values: g.values, corner: g.origin, vectors, names };
+    }
+
+    // The plane of the grid with grid axis `normal` fixed at `index`, as
+    // float32 rows from the top (the second in-plane axis increases upwards).
+    function slicePlane(geo, normal, index) {
+        const [nh, nk, nl] = geo.dims;
+        const [ax, ay] = [0, 1, 2].filter(a => a !== normal);
+        const w = geo.dims[ax], h = geo.dims[ay];
+        let i0;
+        if (index === null || index === undefined) {
+            // The plane through 0 along the normal, else the middle one.
+            const v = geo.vectors[normal].map(Math.abs), c = v.indexOf(Math.max(...v));
+            const k = geo.vectors[normal][c] ? Math.round(-geo.corner[c] / geo.vectors[normal][c]) : 0;
+            i0 = k >= 0 && k < geo.dims[normal] ? k : Math.floor(geo.dims[normal] / 2);
+        } else {
+            i0 = Math.max(0, Math.min(geo.dims[normal] - 1, Math.round(index)));
+        }
+        const out = new Float32Array(w * h);
+        const at = [0, 0, 0];
+        at[normal] = i0;
+        for (let y = 0; y < h; y++) {
+            at[ay] = y;
+            const row = (h - 1 - y) * w;
+            for (let x = 0; x < w; x++) {
+                at[ax] = x;
+                out[row + x] = geo.values[(at[2] * nk + at[1]) * nh + at[0]];
+            }
+        }
+        const axis = a => {
+            const v = geo.vectors[a].map(Math.abs);
+            const c = v.indexOf(Math.max(...v));
+            return {
+                name: geo.names[c], n: geo.dims[a], from: geo.corner[c],
+                to: geo.corner[c] + (geo.dims[a] - 1) * geo.vectors[a][c],
+            };
         };
+        const at0 = [0, 1, 2].map(c => geo.corner[c] + i0 * geo.vectors[normal][c]);
+        return { width: w, height: h, values: out, x: axis(ax), y: axis(ay), normal: Object.assign(axis(normal), { index: i0, at: at0 }) };
     }
 
     const methods = {
@@ -226,6 +318,8 @@ function converterWorker(self, h5wasm, Converter, Processing, wgpuFftWeb) {
         async loadData({ files, paths, yellSpace, nexusPath }, ctx) {
             state.data = null;
             state.plan = null;
+            state.processed = null;
+            state.dataVersion++;
             files = (files || []).filter(Boolean);
             state.files.data = files.map((file, i) => ({ at: `${i}/${file.name}`, file }));
             mountFiles();
@@ -292,6 +386,7 @@ function converterWorker(self, h5wasm, Converter, Processing, wgpuFftWeb) {
 
         async loadStructure({ file }) {
             state.struct = null;
+            state.structVersion++;
             state.files.struct = file || null;
             mountFiles();
             if (!file) return { result: null };
@@ -322,6 +417,7 @@ function converterWorker(self, h5wasm, Converter, Processing, wgpuFftWeb) {
         // axes from the parent cell when a recipe uses them.
         async loadExtras({ files }, ctx) {
             state.extras = {};
+            state.extrasVersion++;
             state.files.extras = (files || []).filter(Boolean);
             mountFiles();
             const out = [];
@@ -346,28 +442,31 @@ function converterWorker(self, h5wasm, Converter, Processing, wgpuFftWeb) {
             return { result: out };
         },
 
-        // params: { format, radiation, manual, grid, customFrame, precision,
-        // layout, compression, recipe, profileWidth } - see
+        // A plane of the loaded data ('input') or of the last previewRecipe
+        // result ('processed'); see slicePlane.
+        async slice({ stage, normal, index }) {
+            const source = stage === 'processed' ? state.processed && { model: state.processed.plan.model } : state.data;
+            if (!source) throw new Error(stage === 'processed' ? 'no processed preview yet' : 'no data file loaded');
+            const plane = slicePlane(geometryOf(source), normal, index);
+            return { result: plane, transfer: [plane.values.buffer] };
+        },
+
+        // Runs the recipe for the preview and keeps the result, which the
+        // next prepare() with the same data, cell and recipe reuses.
+        async previewRecipe(params, ctx) {
+            const plan = await processData(params, ctx);
+            return { result: { dims: plan.plan.model.dims, axesType: plan.plan.model.axesType || 'hkl' } };
+        },
+
+        // params: { format, radiation, manual, cellPrefer, grid, customFrame,
+        // precision, layout, compression, recipe, profileWidth } - see
         // Converter.planConversion and Processing.applyRecipe.
         async prepare(params, ctx) {
             state.plan = null;
-            if (!state.data) throw new Error('no data file loaded');
-            const input = state.data.grid ? { grid: state.data.grid } : { model: state.data.model };
-            const plan = Converter.planConversion(input, Object.assign({}, params, { structure: state.struct }));
-            for (const line of plan.logs) ctx.log(line);
-            let process = null;
-            if (params.recipe && params.recipe.steps && params.recipe.steps.length) {
-                const recipe = Processing.normalizeRecipe(params.recipe);
-                ctx.log(`Processing ${plan.model.dims.join(' x ')} voxels with ${recipe.steps.length} step(s):`);
-                plan.model = await Processing.applyRecipe(plan.model, recipe, {
-                    cell: plan.cell, extras: recipeExtras(recipe, params), fft: fftEngine(ctx.log),
-                    tick: ctx.tick, progress: f => ctx.progress('Processing', f), log: ctx.log,
-                });
-                Converter.checkWritable(plan.model, params.format);
-                process = {
-                    program: '3DSConvert', recipe,
-                    description: recipe.steps.map((s, n) => `${n + 1}. ${Processing.describeStep(s)}`).join('\n'),
-                };
+            const { plan, process } = await processData(params, ctx);
+            Converter.checkWritable(plan.model, params.format);
+            if ((params.format === 'dat' || params.format === 'vtk') && Converter.isUnitMetric(plan.cell.lengths, plan.cell.angles)) {
+                throw new Error(`cannot write ${params.format} with a unit-metric cell - supply a structure file or a manual parent cell`);
             }
             state.plan = { plan, params, process };
             const text = params.format === 'dat' || params.format === 'vtk';

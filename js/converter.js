@@ -1985,10 +1985,13 @@
 
     // ------------------------------------------------------------ conversions
 
-    // Parent cell for a conversion: the data file's own real cell first, then
-    // a structure file, then the manual entry.
+    // Parent cell for a conversion: sources.prefer ('structure' | 'manual')
+    // when that source is given, else the data file's own real cell first,
+    // then a structure file, then the manual entry.
     function resolveCell(model, sources) {
         sources = sources || {};
+        if (sources.prefer === 'manual' && sources.manual) return { cell: sources.manual, source: 'manual entry' };
+        if (sources.prefer === 'structure' && sources.structure) return { cell: sources.structure, source: 'structure file' };
         if (model && model.cellLengths && !isUnitMetric(model.cellLengths, model.cellAngles)) {
             return {
                 cell: { lengths: model.cellLengths.slice(), angles: model.cellAngles.slice() },
@@ -2009,19 +2012,18 @@
         const text = params.format === 'dat' || params.format === 'vtk';
         let model, resolved;
         if (input.grid && input.grid.frame === 'q') {
-            const parent = params.structure || params.manual;
-            if (!parent) {
+            resolved = resolveCell(null, { structure: params.structure, manual: params.manual, prefer: params.cellPrefer });
+            if (!resolved) {
                 throw new Error((input.grid.source === 'vtk' ? 'Q-space VTK' : 'old-format .dat') +
                     ' input needs a structure file or a manual parent cell');
             }
-            model = toHklModel(input.grid, parent, { grid: params.grid, customFrame: params.customFrame });
-            resolved = { cell: parent, source: params.structure ? 'structure file' : 'manual entry' };
+            model = toHklModel(input.grid, resolved.cell, { grid: params.grid, customFrame: params.customFrame });
             if (model.nsecOriginal > 1) {
                 logs.push(`Note: input has ${model.nsecOriginal} symmetry sections; section 1 Q coordinates used.`);
             }
         } else {
             model = input.grid ? toHklModel(input.grid, null) : input.model;
-            resolved = resolveCell(model, params);
+            resolved = resolveCell(model, { structure: params.structure, manual: params.manual, prefer: params.cellPrefer });
             if (!resolved) {
                 if (text) {
                     throw new Error('data file stores the unit metric - supply a structure file or a manual parent cell');

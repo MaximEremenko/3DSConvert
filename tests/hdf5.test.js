@@ -251,3 +251,17 @@ test('unified: /scattering/data shape that fits neither layout is refused', asyn
     });
     await assert.rejects(Converter.readUnifiedData(f), /does not match the h\/k\/l coordinate lengths 3\/2\/4/);
 });
+
+test('a chosen cell source wins over the data file cell when it is given', () => {
+    const model = {
+        dims: [2, 2, 2], corner: [0, 0, 0], vectors: [[1, 0, 0], [0, 1, 0], [0, 0, 1]], values: new Float64Array(8),
+        cellLengths: [4, 4, 4], cellAngles: [90, 90, 90], axes: [1, 2, 3], axesType: 'hkl',
+    };
+    const manual = { lengths: [4.1, 4.1, 4.1], angles: [90, 90, 90] };
+    const structure = { lengths: [4.2, 4.2, 4.2], angles: [90, 90, 90] };
+    const plan = prefer => Converter.planConversion({ model }, { format: 'unified', manual, structure, cellPrefer: prefer });
+    assert.equal(plan(undefined).cellSource, 'data file');
+    assert.equal(plan('manual').cell, manual);
+    assert.equal(plan('structure').cell, structure);
+    assert.equal(Converter.planConversion({ model }, { format: 'unified', structure, cellPrefer: 'manual' }).cellSource, 'data file');
+});
