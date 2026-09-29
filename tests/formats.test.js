@@ -270,3 +270,74 @@ test('legacy VTK in binary: big-endian float32 after the header, and read back',
     assert.deepEqual(Array.from(back.values), Array.from(ascii.values));
     assert.throws(() => Converter.readVtkBinary(u.subarray(0, u.length - 9)), /truncated/);
 });
+
+// ------------------------------------------------------ 3DSCalculator exports
+
+// 3DSCalculator's cellGeometry: cell2vec (c along z, rows = lattice
+// vectors), Bq = 2 pi transpose(inverse(direct)), and Q = [h, k, l] * Bq.
+function calculatorBq(a, b, c, al, be, ga) {
+    const r = x => x * Math.PI / 180;
+    [al, be, ga] = [al, be, ga].map(r);
+    const v = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+    v[2][0] = a * Math.cos(be);
+    v[1][1] = b * Math.sin(al);
+    v[2][1] = b * Math.cos(al);
+    v[2][2] = c;
+    v[1][0] = (a * b * Math.cos(ga) - v[2][0] * v[2][1]) / v[1][1];
+    v[0][0] = Math.sqrt(Math.max(0, a * a - v[1][0] * v[1][0] - v[2][0] * v[2][0]));
+    const direct = [[v[0][0], v[1][0], v[2][0]], [v[0][1], v[1][1], v[2][1]], [v[0][2], v[1][2], v[2][2]]];
+    const [[p, q, s], [t, u, w], [x, y, z]] = direct;
+    const det = p * (u * z - w * y) - q * (t * z - w * x) + s * (t * y - u * x);
+    const inv = [[u * z - w * y, s * y - q * z, q * w - s * u], [w * x - t * z, p * z - s * x, s * t - p * w], [t * y - u * x, q * x - p * y, p * u - q * t]]
+        .map(row => row.map(e => e / det));
+    return [0, 1, 2].map(i => [0, 1, 2].map(j => 2 * Math.PI * inv[j][i]));
+}
+
+test('3DSCalculator .json: grid, l-fastest intensities, NaN as null, and the cell from Bq', () => {
+    const shape = [3, 2, 4], hAxis = [-1, -0.5, 0], kAxis = [0, 0.25], lAxis = [0, 0.5, 1, 1.5];
+    const intensity = [];
+    for (let i = 0; i < 3; i++) for (let j = 0; j < 2; j++) for (let m = 0; m < 4; m++) intensity.push(100 * i + 10 * j + m);
+    intensity[5] = null;                                                     // (0, 1, 1), JSON's NaN
+    const Bq = calculatorBq(4, 4, 6, 90, 90, 120);
+    const text = JSON.stringify({
+        sourceFile: 'x.rmc6f', atoms: 10, supercell: [5, 5, 3], cellDeg: [20, 20, 18, 90, 90, 120], shape, hAxis, kAxis, lAxis,
+        Bq, Bp: null, hklToQ: 'Q = [h,k,l] * Bq', minI: 0, maxI: 213, backend: 'cpu', options: {}, intensity,
+    });
+    assert.ok(Converter.is3dsCalculatorJson(text.slice(0, 4096)));
+    assert.equal(Converter.is3dsCalculatorJson('{"version":1,"steps":[]}'), false);
+    const m = Converter.read3dsCalculatorJson(text);
+    assert.deepEqual(m.dims, shape);
+    assert.deepEqual(m.corner, [-1, 0, 0]);
+    assert.deepEqual(m.vectors, [[0.5, 0, 0], [0, 0.25, 0], [0, 0, 0.5]]);
+    assert.ok(maxAbs(m.cellLengths, [4, 4, 6]) < 1e-9 && maxAbs(m.cellAngles, [90, 90, 120]) < 1e-9);
+    assert.ok(!/differs/.test(m.notes.join('\n')));
+    const at = (i, j, l) => m.values[(l * 2 + j) * 3 + i];                  // h fastest inside
+    assert.equal(at(2, 1, 3), 213);
+    assert.equal(at(1, 0, 2), 102);
+    assert.ok(Number.isNaN(at(0, 1, 1)));
+    // Q from the recovered cell (a along x) has the same length as 3DSCalculator's (c along z)
+    const B = Converter.reciprocalBasis(Converter.cellToLattice(m.cellLengths, m.cellAngles));
+    const hkl = [0.5, 0.25, 1.5];
+    const ours = Converter.hklToQ(B, hkl);
+    const theirs = [0, 1, 2].map(j => hkl[0] * Bq[0][j] + hkl[1] * Bq[1][j] + hkl[2] * Bq[2][j]);
+    assert.ok(Math.abs(Math.hypot(...ours) - Math.hypot(...theirs)) < 1e-12);
+    const cut = Converter.read3dsCalculatorJson(text, { crop: { l: [0.5, 1] } });
+    assert.deepEqual(cut.dims, [3, 2, 2]);
+    assert.equal(cut.values[0], 1);
+    assert.throws(() => Converter.read3dsCalculatorJson(JSON.stringify({ shape: [2, 1, 1], hAxis: [0, 1], kAxis: [0], lAxis: [0], intensity: [1] })),
+        /1 intensities for a 2 x 1 x 1 grid/);
+});
+
+test('3DSCalculator .dat: "# h k l intensity" rows read as an hkl list', () => {
+    const rows = ['# h k l intensity'];
+    for (let i = 0; i < 3; i++) for (let j = 0; j < 2; j++) for (let m = 0; m < 2; m++) rows.push(`${-1 + 0.5 * i} ${0.25 * j} ${m} ${i === 1 && j === 1 && m === 0 ? 'NaN' : 100 * i + 10 * j + m}`);
+    const text = rows.join('\n');
+    assert.ok(Converter.is3dsCalculatorDat(text) && Converter.isHklList(text));
+    assert.equal(Converter.is3dsCalculatorDat('1 2 3 4\n'), false);
+    assert.ok(Converter.isHklList('1 2 3 NaN\n1 2 4 5\n'));
+    const m = Converter.hklListModel(Converter.parseHklList(text));
+    assert.deepEqual(m.dims, [3, 2, 2]);
+    assert.deepEqual(m.corner, [-1, 0, 0]);
+    assert.equal(m.values[(1 * 2 + 1) * 3 + 2], 211);
+    assert.ok(Number.isNaN(m.values[(0 * 2 + 1) * 3 + 1]));
+});

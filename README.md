@@ -22,6 +22,7 @@ No installation, no server, and no upload: files never leave your computer.
 | VTK `STRUCTURED_POINTS` (`.vtk`, ASCII or binary) | yes | yes | Scatty, Spinteract, 3DSCalculator; also loads in ParaView |
 | VTK XML image data (`.vti`) | no | yes | ParaView 5.10+ (any grid, through its Direction matrix) |
 | NumPy (`.npz`) | yes | yes | `np.load` in Python scripts |
+| 3DSCalculator export (`.dat`, `.json`) | yes | no | 3DSCalculator (calculated or loaded intensities) |
 | CCP4/MRC map (`.mrc`) | no | yes | ChimeraX, Coot, PyMOL (3D-ΔPDF maps) |
 | NeXus: Mantid MDHistoWorkspace (`.nxs`) | yes | no | Mantid `SaveMD` (CORELLI, TOPAZ, WAND², DEMAND, SXD, ...) |
 | NeXus: NXdata (`.nxs`) | yes | no | NXrefine (APS 6-ID-D, CHESS QM2), other NeXus writers |
@@ -102,6 +103,12 @@ and a CCP4/MRC map holds only them.
   out (Scatty stops on them), and the log shows the matching `ORIGIN`
   (Spinteract) or `CENTRE` (Scatty) config lines. The file is named as the
   target program expects.
+- **3DSCalculator exports**: the `.dat` (`# h k l intensity`, then rows
+  with l fastest) is read as an hkl list; the `.json` gives the grid from
+  its `hAxis`/`kAxis`/`lAxis`, the intensities (l fastest, `null` for NaN)
+  and the parent cell from the metric of `Bq` (`Q = [h,k,l] * Bq`), so its
+  c-along-z Cartesian frame does not matter. A `.json` dropped on the page
+  is taken as data when it has 3DSCalculator's keys, else as a recipe.
 - **NumPy `.npz`**: an uncompressed archive (read it with `np.load`) of
   `values` and, when known, `sigma`, as C-order arrays `[nl, nk, nh]`
   (`values[l, k, h]`), `corner`, `step_vectors` (one row per grid axis),

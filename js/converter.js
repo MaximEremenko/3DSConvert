@@ -1693,7 +1693,75 @@
         if (rows.length < 2) return false;
         const cols = rows.map(r => r.split(/\s+/));
         return cols[0].length >= 4 && cols[0].length === cols[1].length &&
-            cols.every(c => c.every(x => Number.isFinite(num(x))));
+            cols.every(c => c.every(x => Number.isFinite(num(x)) || /^[-+]?nan$/i.test(x)));
+    }
+
+    // 3DSCalculator's .dat export: "# h k l intensity", then an hkl list
+    // (l fastest).
+    const is3dsCalculatorDat = head => /^\s*#\s*h\s+k\s+l\s+intensity\s*$/im.test(head.split(/\r?\n/, 1)[0]);
+
+    // 3DSCalculator's .json export (keys in its order: ..., shape, hAxis, ...).
+    const is3dsCalculatorJson = head => /^\s*\{/.test(head) && /"shape"\s*:/.test(head) && /"hAxis"\s*:/.test(head);
+
+    // 3DSCalculator's .json export: shape [nh, nk, nl], the hAxis/kAxis/lAxis
+    // coordinates, Bq (Q = [h, k, l] * Bq, 1/Angstrom with 2*pi, parent cell)
+    // and the intensity with l fastest (NaN saved as null). The cell comes
+    // from the metric of Bq, so 3DSCalculator's c-along-z frame does not
+    // matter. opts.crop as for the HDF5 readers.
+    function read3dsCalculatorJson(text, opts) {
+        const p = JSON.parse(text);
+        if (!Array.isArray(p.shape) || !Array.isArray(p.intensity) || !Array.isArray(p.hAxis)) {
+            throw new Error('not a 3DSCalculator .json export (no shape, hAxis and intensity)');
+        }
+        const dims = p.shape.map(Number);
+        const n = dims[0] * dims[1] * dims[2];
+        if (p.intensity.length !== n) throw new Error(`3DSCalculator .json: ${p.intensity.length} intensities for a ${dims.join(' x ')} grid`);
+        const notes = [];
+        const corner = [0, 0, 0], vectors = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+        [p.hAxis, p.kAxis, p.lAxis].forEach((axis, a) => {
+            if (!Array.isArray(axis) || axis.length !== dims[a]) throw new Error(`3DSCalculator .json: axis ${'hkl'[a]} does not match the shape`);
+            corner[a] = Number(axis[0]);
+            if (dims[a] < 2) return;
+            const step = (axis[dims[a] - 1] - axis[0]) / (dims[a] - 1);
+            if (axis.some((x, i) => Math.abs(x - (axis[0] + i * step)) > 1e-6 * Math.max(1e-12, Math.abs(step)))) {
+                throw new Error(`3DSCalculator .json: the ${'hkl'[a]} axis is not evenly spaced`);
+            }
+            vectors[a][a] = step;
+        });
+        let cellLengths = [1, 1, 1], cellAngles = [90, 90, 90];
+        if (Array.isArray(p.Bq) && p.Bq.length === 3) {
+            // reciprocal metric from the rows of Bq, then the direct cell
+            const t = 4 * Math.PI * Math.PI;
+            const Gs = [0, 1, 2].map(i => [0, 1, 2].map(j => (p.Bq[i][0] * p.Bq[j][0] + p.Bq[i][1] * p.Bq[j][1] + p.Bq[i][2] * p.Bq[j][2]) / t));
+            const G = invert3x3(Gs);
+            cellLengths = [0, 1, 2].map(i => Math.sqrt(G[i][i]));
+            const ang = (i, j) => Math.acos(Math.max(-1, Math.min(1, G[i][j] / (cellLengths[i] * cellLengths[j])))) / DEG;
+            cellAngles = [ang(1, 2), ang(0, 2), ang(0, 1)];
+            if (Array.isArray(p.cellDeg) && Array.isArray(p.supercell)) {
+                const parent = p.cellDeg.slice(0, 3).map((x, i) => x / p.supercell[i]);
+                if (parent.some((x, i) => Math.abs(x - cellLengths[i]) > 1e-4 * x)) {
+                    notes.push(`the supercell over its dimensions (${parent.map(x => +x.toFixed(5)).join(' ')}) differs from the cell of Bq`);
+                }
+            }
+            notes.push(`cell ${cellLengths.map(x => +x.toFixed(6)).join(' ')} ${cellAngles.map(x => +x.toFixed(4)).join(' ')} from Bq`);
+        } else {
+            notes.push('no Bq in the file, so no cell: supply one for Q-space output');
+        }
+        const flat = Float64Array.from(p.intensity, x => (x === null ? NaN : Number(x)));
+        let values = lFastestToHFastest(flat, dims[0], dims[1], dims[2], false);
+        let grid = { dims, corner, vectors: vectors.map((v, a) => (dims[a] > 1 ? v : [0, 0, 0])) };
+        const box = readBox(grid.dims, grid.corner, grid.vectors, opts, notes, 'hkl');
+        if (box) {
+            values = cutBox(values, dims, box);
+            grid = boxedGrid(box, grid.dims, grid.corner, grid.vectors);
+        }
+        if (p.backend) notes.push(`3DSCalculator ${p.backend === 'data' ? 'loaded data' : 'calculation'}` +
+            (p.sourceFile ? ` from ${p.sourceFile}` : ''));
+        return {
+            dims: grid.dims, corner: grid.corner, vectors: grid.vectors, values, cellLengths, cellAngles,
+            radiation: normalizeRadiation(p.options && p.options.radiation), axes: pickAxes(grid.vectors, grid.dims),
+            axesType: 'hkl', notes,
+        };
     }
 
     // The grid of an hkl list: from a grid config ({ corner, vectors, dims },
@@ -2850,6 +2918,7 @@
         isVtk, vtkFrame, parseGridConfig, parseVtk, readVtkStream, writeVtk, writeVtkChunks,
         isHklList, parseHklList, readHklListStream, hklListModel, writeHklListChunks, hklConfigSnippet,
         writeNpz, readNpz, writeVtiChunks, writeMrc, crc32, readVtkBinary, isBinaryVtk,
+        is3dsCalculatorDat, is3dsCalculatorJson, read3dsCalculatorJson,
         toHklModel, resolveCell, planConversion, checkWritable, estimateOutputBytes, outputDtype,
         writeUnifiedData, writeYell,
     };

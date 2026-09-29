@@ -273,6 +273,7 @@
     yell: 'Yell 1.0', unified: 'Unified HDF5', 'mantid-md': 'Mantid MDHistoWorkspace', nexus: 'NeXus NXdata',
     dat: 'RMCProfile .dat', 'dat-hkl': 'RMCProfile .dat · hkl', 'dat-amp': 'RMCProfile amplitudes',
     vtk: 'VTK · Q', 'vtk-hkl': 'VTK · r.l.u.', hkl: 'hkl list', npz: 'NumPy .npz',
+    'calc-dat': '3DSCalculator .dat', 'calc-json': '3DSCalculator .json',
   };
 
   // Per grid axis: the component it runs along, its range and step.
@@ -366,14 +367,14 @@
         info = `${KIND_LABEL[s.kind]} | grid ${s.dims.join(' x ')} in ${s.kind === 'dat-hkl' ? 'hkl' : 'Q'}`;
       } else if (s.kind === 'vtk') {
         info = `VTK STRUCTURED_POINTS in Q | grid ${s.dims.join(' x ')}`;
-      } else if (s.kind === 'hkl') {
-        info = `hkl list | grid ${s.dims.join(' x ')}${s.hasSigma ? ' | σ' : ''}`;
+      } else if (s.kind === 'hkl' || s.kind === 'calc-dat') {
+        info = `${KIND_LABEL[s.kind]} | grid ${s.dims.join(' x ')}${s.hasSigma ? ' | σ' : ''}`;
       } else if (s.kind === 'vtk-hkl') {
         info = `VTK STRUCTURED_POINTS in r.l.u. ("${s.title}") | grid ${s.dims.join(' x ')}`;
       } else {
         const label = {
           yell: 'Yell 1.0', unified: 'Unified data format', 'mantid-md': 'Mantid MDHistoWorkspace', nexus: `NeXus ${s.nexusPath}`,
-          npz: 'NumPy .npz',
+          npz: 'NumPy .npz', 'calc-json': '3DSCalculator .json',
         }[s.kind];
         info = label + ` | grid ${s.dims.join(' x ')}` +
           (s.kind === 'unified' || s.kind === 'nexus' || s.kind === 'npz' ? ` | axes ${s.axesType || 'hkl'}` : '') +
@@ -460,11 +461,11 @@
   }
 
   // Dropped or chosen files by content: recipes, structures, grid configs
-  // and everything else as data.
+  // and everything else as data (3DSCalculator's .json exports included).
   async function routeFiles(files) {
     const data = [];
     for (const f of files) {
-      if (/\.json$/i.test(f.name)) await loadRecipeFile(f);
+      if (/\.json$/i.test(f.name) && !Converter.is3dsCalculatorJson(await f.slice(0, 4096).text())) await loadRecipeFile(f);
       else if (/\.rmc6f$/i.test(f.name)) await loadStructureFile(f);
       else if (f.size < 65536 && !/\.(vtk|dat|h5|nxs|nx5|hdf5?)$/i.test(f.name) &&
         /^\s*(CENTRE|ORIGIN|X_AXIS)\b/m.test(await f.slice(0, 4096).text())) await loadGridConfig(f);

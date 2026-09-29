@@ -419,6 +419,20 @@ const scenarios = [
         await setFile('#dataFile', npz);
         await waitLog(/NumPy \.npz \| grid 5 x 5 x 5 \| axes hkl/);
     }],
+    ['a dropped 3DSCalculator .json loads as data, a recipe .json as a recipe', async () => {
+        const t = 2 * Math.PI / 4;
+        const calc = JSON.stringify({ shape: [2, 2, 1], hAxis: [0, 0.5], kAxis: [0, 0.5], lAxis: [1],
+            Bq: [[t, 0, 0], [0, t, 0], [0, 0, t]], intensity: [1, 2, 3, 4], backend: 'cpu' });
+        const recipe = JSON.stringify({ version: 1, steps: [{ op: 'scale', factor: 2, offset: 0 }] });
+        await evaluate(`(() => {
+            const dt = new DataTransfer();
+            dt.items.add(new File([${JSON.stringify(calc)}], 'calc.json', { type: 'application/json' }));
+            dt.items.add(new File([${JSON.stringify(recipe)}], 'recipe.json', { type: 'application/json' }));
+            window.dispatchEvent(new DragEvent('drop', { dataTransfer: dt, bubbles: true, cancelable: true }));
+        })()`);
+        await waitLog(/3DSCalculator \.json \| grid 2 x 2 x 1 \| float64 \| stored cell: 4\.00000 4\.00000 4\.00000 \/ 90\.00 90\.00 90\.00/);
+        await waitLog(/Recipe "recipe\.json": 1 step/);
+    }],
     ['crop on read: only the chosen hkl box is read', async () => {
         await evaluate(`(() => {
             for (const [axis, end, v] of [['h', 0, -0.5], ['h', 1, 1], ['l', 0, 0], ['l', 1, 0.5]]) {

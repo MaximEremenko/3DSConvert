@@ -143,9 +143,13 @@ function converterWorker(self, h5wasm, Converter, Processing, wgpuFftWeb) {
         if (/_hkl\.dat$/i.test(file.name)) {
             return { kind: 'dat-hkl', grid: await Converter.readOldDatStream(file.stream(), Object.assign({ frame: 'hkl' }, opts)) };
         }
+        if (Converter.is3dsCalculatorJson(head)) {
+            return { kind: 'calc-json', model: Converter.read3dsCalculatorJson(await file.text(), opts) };
+        }
         if (Converter.isHklList(head)) {
             const list = await Converter.readHklListStream(file.stream(), opts);
-            return { kind: 'hkl', model: Converter.hklListModel(list, opts.grid || null) };
+            const kind = Converter.is3dsCalculatorDat(head) ? 'calc-dat' : 'hkl';
+            return { kind, model: Converter.hklListModel(list, opts.grid || null) };
         }
         const vtk = Converter.isVtk(head);
         if (vtk && Converter.isBinaryVtk(head)) {
