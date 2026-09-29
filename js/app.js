@@ -939,7 +939,8 @@
       ['highPass', 'num', 'Fourier high-pass: broader than this many line widths stays'],
       ['smooth', 'num', 'Fourier low-pass: finer than this many line widths is noise'],
       ['bragg', 'num', 'leave the sample’s Bragg regions out of the estimate: radius (r.l.u.; 0 = none)'],
-      ['passes', 'num', 'passes (1–10)']]],
+      ['passes', 'num', 'passes (1–10)'],
+      ['local', 'num', 'then fit the ring’s strength locally, in patches of about this many voxels (0 = off): texture and grains along a ring']]],
     backgroundDebyeWaller: ['Background: Laue + thermal (Debye–Waller)', [
       ['composition', 'text', 'sites, e.g. Pb; Mg 0.333 + Nb 0.667; 3*O'], ['uiso', 'text', 'Uiso (Å²): one value, or e.g. 0.01, Pb 0.03'],
       ['radiation', ['auto', 'xray', 'neutron', 'electron'], 'radiation (auto: the data’s)'],
@@ -1002,7 +1003,7 @@
       resolution: 0.004, voxelWidth: true, shift: 0.002, maskSpots: false, highPass: 6, sectors: 8, coverage: 0.25, cutoff: 0.05, width: 0.005,
       positive: true },
     filterRings: { materials: 'aluminium', temperature: 0, radiation: 'auto', axis: 'auto', angleStep: 1, azimuth: 4, window: 3, highPass: 4, smooth: 0.4,
-      bragg: 0.3, passes: 3 },
+      bragg: 0.3, passes: 3, local: 30 },
     backgroundDebyeWaller: { composition: '', uiso: '0.01', radiation: 'auto', fit: true, percentile: 5, width: 0.05, offset: false, scale: 1 },
     correctUB: { mode: 'refine', centring: 'P', radius: 0.25, snr: 10, peaks: 300, shift: false, ub: [], ubNew: [] },
     despike: { size: 1, k: 5 }, window: { kind: 'lorch', qmax: 0 },
@@ -1016,7 +1017,7 @@
         fitWidth: true, sigma0: 0.005, resolution: 0.004, voxelWidth: true, shift: 0.002, maskSpots: false, highPass: 6, sectors: 8,
         coverage: 0.25, cutoff: 0.05, width: 0.005, positive: true },
       { op: 'filterRings', materials: 'aluminium, copper', temperature: 0, radiation: 'auto', axis: 'auto', angleStep: 1, azimuth: 4,
-        window: 3, highPass: 4, smooth: 0.4, bragg: 0.3, passes: 3 },
+        window: 3, highPass: 4, smooth: 0.4, bragg: 0.3, passes: 3, local: 30 },
       { op: 'symmetrize', laue: 'm-3m', mode: 'clip', k: 3, expand: true }] },
     { name: 'Subtract a background volume', note: 'load it under Other volumes', steps: [
       { op: 'combine', operation: 'subtract', scale: 1 }] },
@@ -1027,7 +1028,7 @@
         fitWidth: true, sigma0: 0.005, resolution: 0.004, voxelWidth: true, shift: 0.002, maskSpots: false, highPass: 6, sectors: 8,
         coverage: 0.25, cutoff: 0.05, width: 0.005, positive: true },
       { op: 'filterRings', materials: 'aluminium, copper', temperature: 0, radiation: 'auto', axis: 'auto', angleStep: 1, azimuth: 4,
-        window: 3, highPass: 4, smooth: 0.4, bragg: 0.3, passes: 3 }] },
+        window: 3, highPass: 4, smooth: 0.4, bragg: 0.3, passes: 3, local: 30 }] },
   ];
 
   for (const [group, ops] of STEP_GROUPS) {

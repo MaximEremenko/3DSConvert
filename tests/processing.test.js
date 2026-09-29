@@ -634,6 +634,7 @@ test('filterRings: what the ring fit leaves goes by a Fourier filter over the an
     const out = await Processing.applyRecipe(fitted, { steps: [{ op: 'filterRings', materials: 'aluminium' }] }, { cell, memo, log: t => logs.push(t) });
     const text = logs.join('\n');
     assert.match(text, /the lines of aluminium as the ring removal before fitted them/);
+    assert.match(text, /local ring strength over patches of about 30 voxels/);
     const found = /rotation axis along \[([-\d. ]+)\] \(found from the rings\)/.exec(text);
     assert.ok(found, text);
     const dir = found[1].trim().split(/\s+/).map(Number), cosang = Math.abs(dir.reduce((s, x, c) => s + x * axis[c], 0)) / Math.hypot(...dir);

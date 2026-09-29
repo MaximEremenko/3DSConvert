@@ -297,7 +297,7 @@
         },
         filterRings: {
             materials: 'aluminium', temperature: 0, radiation: 'auto', window: 3, highPass: 4, smooth: 0.4, axis: 'auto', angleStep: 1,
-            azimuth: 4, bragg: 0.3, passes: 3,
+            azimuth: 4, bragg: 0.3, passes: 3, local: 30,
         },
         backgroundDebyeWaller: { radiation: 'auto', uiso: '0.01', fit: true, scale: 1, offset: false, percentile: 5, width: 0.05 },
         correctUB: { mode: 'refine', centring: 'P', radius: 0.25, snr: 10, peaks: 300, shift: false },
@@ -1852,6 +1852,186 @@
         return e;
     }
 
+    // A can's ring varies along itself (texture, large grains) more finely
+    // than the angular model of the filter follows. Per line, over patches of
+    // directions about the axis that hold about `least` voxels each (their
+    // angle grows as 1/|Q|), Huber-weighted least squares of the voxels
+    // within four widths of the line on a quadratic background and the
+    // line's Gaussian profile give the ring's local amplitude left there
+    // (the scattering that crosses a ring is broad across it, so the
+    // background takes it). The amplitude is shrunk by its significance
+    // (A (1 - se^2/A^2)), held within the ring's height, smoothed over
+    // neighbouring patches (weights 1/se^2) and interpolated between their
+    // centres. Patches round the sample's reflections at the line's |Q| are
+    // not fitted (a ring and a Bragg cloud cannot be told apart there) and
+    // take their neighbours' value; voxels near the Bragg positions are not
+    // fitted either. Voxels nearer another line belong to that line.
+    function localRingAmplitudes(o) {
+        const { lines, s0, r, fv, wi, wq, wd, wt, wphi, wfar, nw, NT, e, e1, e2, Qm } = o;
+        if (!lines.length) return;
+        const W = 4, qs = lines.map(x => x.q);
+        const aStar = Math.min(...[0, 1, 2].map(c => Math.hypot(Qm[0][c], Qm[1][c], Qm[2][c])));
+        // per window voxel: its line (nearest in widths) and offset in widths
+        const owner = new Int16Array(nw).fill(-1), xs = new Float32Array(nw);
+        for (let t = 0; t < nw; t++) {
+            const q = wq[t], w0 = s0 * s0 + r * r * q * q, sv2 = (wd[t] * wd[t] - 1) * w0;
+            let best = -1, bx = Infinity;
+            for (let k = 0; k < qs.length; k++) {
+                const x = (q - qs[k]) / Math.sqrt(s0 * s0 + r * r * qs[k] * qs[k] + sv2);
+                if (Math.abs(x) < Math.abs(bx)) { bx = x; best = k; }
+            }
+            if (best >= 0 && Math.abs(bx) < W + 1) {
+                owner[t] = best;
+                xs[t] = bx;
+            }
+        }
+        const zetaOf = t => Math.cos((wt[t] + 0.5) / NT * Math.PI);
+        let sumCorr = 0, nCorr = 0;
+        const report = [];
+        lines.forEach((line, k) => {
+            const sig = Math.hypot(line.s || Math.hypot(s0, r * line.q), o.svAvg), cover = Math.max(0.1, Math.min(1, line.cover || 0.5));
+            const area = o.least * o.cellQ / (2 * W * sig * cover);
+            const P = Math.min(20, Math.max(2, Math.sqrt(area) / line.q * 180 / Math.PI)) * Math.PI / 180;
+            const nz = Math.max(1, Math.ceil(2 / P)), nphi = new Int32Array(nz), offs = new Int32Array(nz + 1);
+            for (let b = 0; b < nz; b++) {
+                const zc = -1 + (b + 0.5) * 2 / nz;
+                nphi[b] = Math.max(1, Math.round(2 * Math.PI * Math.sqrt(1 - zc * zc) / P));
+                offs[b + 1] = offs[b] + nphi[b];
+            }
+            const NP = offs[nz], centre = new Float64Array(3 * NP);
+            for (let b = 0; b < nz; b++) {
+                const zc = -1 + (b + 0.5) * 2 / nz, rc = Math.sqrt(1 - zc * zc);
+                for (let j = 0; j < nphi[b]; j++) {
+                    const ph = -Math.PI + (j + 0.5) * 2 * Math.PI / nphi[b], p = offs[b] + j;
+                    for (let c = 0; c < 3; c++) centre[3 * p + c] = rc * (Math.cos(ph) * e1[c] + Math.sin(ph) * e2[c]) + zc * e[c];
+                }
+            }
+            const patchOf = (zeta, phi) => {
+                const b = Math.min(nz - 1, Math.max(0, Math.floor((zeta + 1) / 2 * nz)));
+                return offs[b] + Math.min(nphi[b] - 1, Math.floor((phi + Math.PI) / (2 * Math.PI) * nphi[b]));
+            };
+            // patches round the sample's reflections at this |Q|: not fitted
+            const blocked = new Uint8Array(NP), cone = Math.cos(Math.min(Math.PI / 2, 1.2 * Math.max(o.bragg, 0.1) * aStar / line.q));
+            const hmax = Math.ceil((line.q + 3 * sig) / aStar) + 1;
+            let nref = 0;
+            for (let h = -hmax; h <= hmax; h++) for (let kk = -hmax; kk <= hmax; kk++) for (let l = -hmax; l <= hmax; l++) {
+                if (!h && !kk && !l) continue;
+                const g = mulMV(Qm, [h, kk, l]), qh = Math.hypot(...g);
+                if (Math.abs(qh - line.q) > 3 * sig) continue;
+                nref++;
+                for (let p = 0; p < NP; p++) {
+                    if ((centre[3 * p] * g[0] + centre[3 * p + 1] * g[1] + centre[3 * p + 2] * g[2]) / qh > cone) blocked[p] = 1;
+                }
+            }
+            // the voxels of this line
+            const mine = [];
+            for (let t = 0; t < nw; t++) if (owner[t] === k) mine.push(t);
+            const pid = Int32Array.from(mine, t => patchOf(zetaOf(t), wphi[t]));
+            const fitIdx = mine.map((t, m) => m).filter(m => wfar[mine[m]] && Math.abs(xs[mine[m]]) < W && !blocked[pid[m]]);
+            const bv = new Float64Array(4);
+            const basis = x => {
+                bv[0] = 1;
+                bv[1] = x;
+                bv[2] = x * x;
+                bv[3] = Math.exp(-0.5 * x * x);
+                return bv;
+            };
+            const sol = new Float64Array(4 * NP), cnt = new Int32Array(NP), wgt = new Float64Array(fitIdx.length).fill(1);
+            let Minv = null, s2 = null;
+            for (let it = 0; it < 3; it++) {
+                const M = new Float64Array(16 * NP), rhs = new Float64Array(4 * NP);
+                cnt.fill(0);
+                fitIdx.forEach((m, i) => {
+                    const t = mine[m], p = pid[m], bv = basis(xs[t]), y = fv[wi[t]], wv = wgt[i];
+                    cnt[p]++;
+                    for (let a = 0; a < 4; a++) {
+                        rhs[4 * p + a] += wv * bv[a] * y;
+                        for (let c = 0; c < 4; c++) M[16 * p + 4 * a + c] += wv * bv[a] * bv[c];
+                    }
+                });
+                Minv = new Array(NP).fill(null);
+                for (let p = 0; p < NP; p++) {
+                    if (cnt[p] < Math.max(12, 0.5 * o.least)) continue;
+                    const Mp = [0, 1, 2, 3].map(a => [0, 1, 2, 3].map(c => M[16 * p + 4 * a + c] + (a === c ? 1e-9 * M[16 * p] : 0)));
+                    const x = solveSmall(Mp, [0, 1, 2, 3].map(a => rhs[4 * p + a]));
+                    if (!x) continue;
+                    for (let a = 0; a < 4; a++) sol[4 * p + a] = x[a];
+                    Minv[p] = Mp;
+                }
+                // Huber weights at twice each patch's residual rms
+                const ss = new Float64Array(NP), res = new Float64Array(fitIdx.length);
+                fitIdx.forEach((m, i) => {
+                    const t = mine[m], p = pid[m], bv = basis(xs[t]);
+                    res[i] = fv[wi[t]] - (sol[4 * p] * bv[0] + sol[4 * p + 1] * bv[1] + sol[4 * p + 2] * bv[2] + sol[4 * p + 3] * bv[3]);
+                    ss[p] += wgt[i] * res[i] * res[i];
+                });
+                s2 = Float64Array.from(ss, (x, p) => x / Math.max(1, cnt[p] - 4));
+                fitIdx.forEach((m, i) => {
+                    const c = 2 * Math.sqrt(s2[pid[m]]), a = Math.abs(res[i]);
+                    wgt[i] = a <= c ? 1 : c / Math.max(a, 1e-30);
+                });
+            }
+            // amplitude, its uncertainty, shrinkage and the cap
+            const amp = new Float64Array(NP), wAmp = new Float64Array(NP);
+            let fitted = 0, significant = 0;
+            for (let p = 0; p < NP; p++) {
+                if (!Minv[p]) continue;
+                const unit = solveSmall(Minv[p], [0, 0, 0, 1]);
+                if (!unit) continue;
+                const se = Math.sqrt(Math.max(0, s2[p] * unit[3])), A = sol[4 * p + 3];
+                fitted++;
+                if (!(se > 0) || A === 0) continue;
+                const f = Math.max(0, 1 - (se / A) ** 2);
+                if (f > 0) significant++;
+                amp[p] = Math.max(-Math.abs(line.height), Math.min(Math.abs(line.height), A * f));
+                wAmp[p] = 1 / (se * se);
+            }
+            // smoothed over neighbouring patches (Gaussian of the patch size)
+            const kap = 1 / (2 * (1 - Math.cos(P))), reach = Math.cos(Math.min(Math.PI, 3 * P)), sm = new Float64Array(NP);
+            for (let b = 0; b < nz; b++) {
+                for (let j = 0; j < nphi[b]; j++) {
+                    const p = offs[b] + j, ph = -Math.PI + (j + 0.5) * 2 * Math.PI / nphi[b];
+                    let num = 0, den = 0;
+                    for (let b2 = Math.max(0, b - 4); b2 <= Math.min(nz - 1, b + 4); b2++) {
+                        const n2 = nphi[b2], m = Math.ceil(3 * P / (2 * Math.PI / n2)) + 1, jc = Math.floor((ph + Math.PI) / (2 * Math.PI) * n2);
+                        const all = 2 * m + 1 >= n2;
+                        for (let d = all ? 0 : -m; d <= (all ? n2 - 1 : m); d++) {
+                            const p2 = offs[b2] + (all ? d : (((jc + d) % n2) + n2) % n2);
+                            if (!wAmp[p2]) continue;
+                            const dd = centre[3 * p] * centre[3 * p2] + centre[3 * p + 1] * centre[3 * p2 + 1] + centre[3 * p + 2] * centre[3 * p2 + 2];
+                            if (dd < reach) continue;
+                            const wk = Math.exp(kap * (dd - 1)) * wAmp[p2];
+                            num += wk * amp[p2];
+                            den += wk;
+                        }
+                    }
+                    sm[p] = den > 0 ? num / den : 0;
+                }
+            }
+            // interpolated between patch centres and taken off
+            const valueAt = (zeta, phi) => {
+                const fzb = (zeta + 1) / 2 * nz - 0.5, b0 = Math.max(0, Math.min(nz - 1, Math.floor(fzb))), b1 = Math.min(nz - 1, b0 + 1);
+                const tb = Math.max(0, Math.min(1, fzb - b0));
+                const inBand = b => {
+                    const fp = (phi + Math.PI) / (2 * Math.PI) * nphi[b] - 0.5, j0 = Math.floor(fp), tj = fp - j0;
+                    const a0 = ((j0 % nphi[b]) + nphi[b]) % nphi[b], a1 = (a0 + 1) % nphi[b];
+                    return (1 - tj) * sm[offs[b] + a0] + tj * sm[offs[b] + a1];
+                };
+                return (1 - tb) * inBand(b0) + tb * inBand(b1);
+            };
+            mine.forEach(t => {
+                const x = Math.abs(xs[t]), taper = x <= W ? 1 : 0.5 * (1 + Math.cos(Math.PI * (x - W)));
+                const corr = valueAt(zetaOf(t), wphi[t]) * Math.exp(-0.5 * x * x) * taper;
+                fv[wi[t]] -= corr;
+                sumCorr += corr * corr;
+                nCorr++;
+            });
+            report.push(`${line.q.toFixed(3)}: ${(P * 180 / Math.PI).toFixed(1)}°, ${significant} of ${fitted}` + (nref ? ` (${nref} reflections kept out)` : ''));
+        });
+        o.log(`local ring strength over patches of about ${o.least} voxels: ${report.join('; ')}; RMS correction ` +
+            `${Math.sqrt(sumCorr / Math.max(1, nCorr)).toPrecision(2)}`);
+    }
+
     // Powder rings in data from a crystal turned about one axis depend on
     // |Q| and on the angle to that axis (a detector pixel sees a ring at one
     // angle to the axis whatever the turn, so detector edges and gaps, the
@@ -1988,7 +2168,7 @@
         const NT = Math.max(1, Math.round(180 / step.angleStep)), K = step.azimuth, NP = K > 0 ? Math.max(4, 4 * K) : 1, NZ = 24;
         const fv = new Float64Array(nf), axKey = new Int32Array(nf).fill(-1), azKey = K > 0 ? new Int32Array(nf).fill(-1) : null;
         const wi = new Int32Array(nw), wu = new Float32Array(nw), wt = new Float32Array(nw), wz = new Float32Array(nw);
-        const wphi = new Float32Array(nw), ww = new Float32Array(nw), wd = new Float32Array(nw);
+        const wphi = new Float32Array(nw), ww = new Float32Array(nw), wd = new Float32Array(nw), wq = new Float32Array(nw), wfar = new Uint8Array(nw);
         let f = 0, w = 0;
         j = 0;
         for (let il = 0; il < nl; il++)
@@ -2008,8 +2188,9 @@
                     const u = uOf(q), ub = Math.floor(u / du) - b0;
                     const cz = Math.max(-1, Math.min(1, (x * e[0] + y * e[1] + z * e[2]) / q)), th = Math.acos(cz);
                     const phi = Math.atan2(x * e2[0] + y * e2[1] + z * e2[2], x * e1[0] + y * e1[1] + z * e1[2]);
-                    if (ub >= 0 && ub < nbr && farFrom(c0[0] + ih * va[0] + ik * vb[0] + il * vc[0], c0[1] + ih * va[1] + ik * vb[1] + il * vc[1],
-                        c0[2] + ih * va[2] + ik * vb[2] + il * vc[2])) {
+                    const isFar = farFrom(c0[0] + ih * va[0] + ik * vb[0] + il * vc[0], c0[1] + ih * va[1] + ik * vb[1] + il * vc[1],
+                        c0[2] + ih * va[2] + ik * vb[2] + il * vc[2]);
+                    if (ub >= 0 && ub < nbr && isFar) {
                         axKey[f] = Math.min(NT - 1, Math.floor(th / Math.PI * NT)) * nbr + ub;
                         if (azKey) {
                             const iz = Math.min(NZ - 1, Math.floor((cz + 1) / 2 * NZ)), ip = Math.min(NP - 1, Math.floor((phi + Math.PI) / (2 * Math.PI) * NP));
@@ -2025,6 +2206,8 @@
                         wz[w] = (cz + 1) / 2 * NZ - 0.5;
                         wphi[w] = phi;
                         ww[w] = wv;
+                        wq[w] = q;
+                        wfar[w] = isFar ? 1 : 0;
                         w++;
                     }
                     f++;
@@ -2187,6 +2370,12 @@
         for (let t = 0; t < nw; t++) if (ww[t]) changed++;
         ctx.log(`${changed} voxels (${(100 * changed / Math.max(1, nf)).toFixed(1)} % of the data) changed; RMS correction per pass ` +
             `(along the axis${azimuthal ? ' + azimuthal' : ''}): ${rms.join(', ')}`);
+        if (step.local > 0 && !flat) {
+            localRingAmplitudes({
+                lines: kept.map(x => Object.assign({ cover: covered[lines.indexOf(x)] }, x)), s0, r, fv, wi, wq, wd, wt, wphi, wfar, nw, NT, e, e1, e2,
+                Qm, cellQ, svAvg, least: step.local, bragg: step.bragg, log: ctx.log,
+            });
+        }
         const values = copyValues(model);
         f = 0;
         for (let i = 0; i < N; i++) if (values[i] === values[i]) values[i] = fv[f++];
@@ -3505,6 +3694,7 @@ D|0.413048 0.294953 0.187491 0.080701 0.023736 15.56995 32.39847 5.711404 61.889
             fields: {
                 materials: 'any', temperature: 'nonnegative', radiation: 'radiation', window: 'positive', highPass: 'positive', smooth: 'nonnegative',
                 axis: 'axisSpec', angleStep: 'angleStep', azimuth: 'azimuthOrder', bragg: 'nonnegative', passes: 'filterPasses',
+                local: 'localVoxels',
             },
         },
         scale: { run: stepScale, fields: { factor: 'number', offset: 'number', positive: 'boolean' } },
@@ -3561,6 +3751,7 @@ D|0.413048 0.294953 0.187491 0.080701 0.023736 15.56995 32.39847 5.711404 61.889
             angleStep: v => finite(v) && v >= 0.1 && v <= 10,
             azimuthOrder: v => Number.isInteger(v) && v >= 0 && v <= 4,
             filterPasses: v => Number.isInteger(v) && v >= 1 && v <= 10,
+            localVoxels: v => v === 0 || (Number.isInteger(v) && v >= 8 && v <= 5000),
             ubMode: v => v === 'refine' || v === 'matrix',
             despikeSize: v => v === 1 || v === 2,
             nonnegative: v => finite(v) && v >= 0,
@@ -3632,7 +3823,8 @@ D|0.413048 0.294953 0.187491 0.080701 0.023736 15.56995 32.39847 5.711404 61.889
                 `(${String(step.axis).trim().toLowerCase() === 'auto' ? 'found from the rings' : `along ${Array.isArray(step.axis) ? step.axis.join(' ') : step.axis}`}` +
                 `, ${step.angleStep}° bins${step.azimuth > 0 ? `, azimuthal orders up to ${step.azimuth}` : ''}), band-passed from ${step.highPass} to ` +
                 `${step.smooth} line widths within ${step.window} widths of each line, ${step.passes} pass${step.passes === 1 ? '' : 'es'}` +
-                (step.bragg > 0 ? `; the sample's Bragg regions (${step.bragg} r.l.u.) left out of the estimate` : '');
+                (step.bragg > 0 ? `; the sample's Bragg regions (${step.bragg} r.l.u.) left out of the estimate` : '') +
+                (step.local > 0 ? `; then the ring's strength fitted locally, in patches of about ${step.local} voxels` : '');
             case 'maskQ': return `mask |Q| outside ${step.min === undefined || step.min === null ? 0 : step.min}..${step.max === undefined || step.max === null ? 'inf' : step.max} 1/A`;
             case 'despike': return step.k > 0
                 ? `despike: voxels beyond ${step.k} robust sigma of the median of their ${step.size === 2 ? '5 x 5 x 5' : '3 x 3 x 3'} neighbourhood take that median`

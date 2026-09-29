@@ -503,6 +503,15 @@ FFT (what is broader than four line widths, and the noise finer than 0.4
 of a width, come off), smoothed over the angle (more widely where the bins
 hold few voxels, near the axis), then the same over coarse cells of angle
 and azimuth for the Fourier orders up to 4 about the axis; three passes.
+Last, the ring's strength is fitted locally: a can's ring varies along
+itself (texture, large grains) more finely than that angular model. Over
+patches of directions holding about 30 voxels each (their angle grows as
+1/|Q|), Huber-weighted least squares of the voxels within four widths of a
+line on a quadratic background and the line's profile give the amplitude
+left there - the scattering that crosses a ring is broad across it, so the
+background takes it - shrunk by its significance, held within the ring's
+height, smoothed over neighbouring patches and interpolated between them.
+Patches round the sample's reflections at the line's |Q| are not fitted.
 The axis is found from the rings - a Legendre fit of the line excess over
 300 direction cells gives a first axis, refined to where the excess binned
 by a degree of angle is sharpest (on CORELLI data 0.26° from the vertical
@@ -520,7 +529,9 @@ filter's own (alone it leaves the broad foot of a strong ring, about a
 third of it: run it after the removal). On the CORELLI volume of PMN-PT in
 aluminium the scatter of the ring excess over 300 directions, in units of
 its errors (χ²/n; 1–2 where there are no rings), goes from 78, 25 and 20 at
-Al (111), (200) and (220) after the fit to 17, 6 and 4 after the filter; in
+Al (111), (200) and (220) after the fit to 17, 6 and 4 after the filter
+(5.3, 4.0 and 1.7 with the local strengths; 1.2-1.8 where there are no
+rings); in
 the half-integer planes the (111) ring, 0.12 high, leaves less than 0.005.
 What remains has none of the crystal's symmetry: ring structure that
 changes with the azimuth faster than the fourth order, and the broad part
