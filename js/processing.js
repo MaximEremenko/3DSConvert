@@ -283,14 +283,15 @@
 
     const DEFAULTS = {
         maskBragg: { shape: 'box', centring: 'P' },
+        maskRings: { q: [], powder: 'none' },
         maskRange: {},
-        scale: { factor: 1, offset: 0 },
+        scale: { factor: 1, offset: 0, positive: false },
         backgroundShells: { percentile: 0, smooth: 0 },
         combine: { scale: 1 },
         clip: { below: 0, to: 0 },
         symmetrize: { mode: 'average', expand: false },
         deltaPdf: { taper: 0, engine: 'cpu', fill: 0 },
-        normalize: { background: '', backgroundNorm: '', scale: 1, laue: 'none' },
+        normalize: { background: '', backgroundNorm: '', scale: 1, fitScale: false, laue: 'none' },
     };
 
     function stepCrop(model, step) {
@@ -434,9 +435,36 @@
         return withValues(model, values);
     }
 
+    // Sample-holder metals: cubic lattice and room-temperature a (Angstrom).
+    const POWDER = { aluminium: { lattice: 'fcc', a: 4.0495 }, copper: { lattice: 'fcc', a: 3.6149 }, vanadium: { lattice: 'bcc', a: 3.024 } };
+
+    // |Q| of the powder lines of `name` up to qmax: fcc lines have h, k, l all
+    // odd or all even, bcc ones h + k + l even; Q = 2 pi sqrt(h^2+k^2+l^2) / a.
+    function powderLines(name, a, qmax) {
+        const p = POWDER[name];
+        if (!p) throw new Error(`maskRings: unknown powder ${name}`);
+        const A = a > 0 ? a : p.a, nmax = Math.floor((qmax * A / (2 * Math.PI)) ** 2);
+        const found = new Set(), top = Math.ceil(Math.sqrt(nmax));
+        for (let h = 0; h <= top; h++) for (let k = 0; k <= h; k++) for (let l = 0; l <= k; l++) {
+            const n = h * h + k * k + l * l;
+            if (!n || n > nmax) continue;
+            if (p.lattice === 'fcc' ? h % 2 === k % 2 && k % 2 === l % 2 : (h + k + l) % 2 === 0) found.add(n);
+        }
+        return [...found].sort((x, y) => x - y).map(n => 2 * Math.PI * Math.sqrt(n) / A);
+    }
+
     function stepMaskRings(model, step, ctx) {
         needCell(ctx.cell, 'a powder-ring mask');
-        const rings = step.q.slice().sort((a, b) => a - b);
+        let qmax = 0;                                    // |Q| is largest at a corner of the grid
+        const Q = qMatrix(ctx.cell), [nh, nk, nl] = model.dims;
+        for (const i of [0, nh - 1]) for (const j of [0, nk - 1]) for (const k of [0, nl - 1]) {
+            const hkl = [0, 1, 2].map(c => model.corner[c] + i * model.vectors[0][c] + j * model.vectors[1][c] + k * model.vectors[2][c]);
+            qmax = Math.max(qmax, Math.hypot(...mulMV(Q, hkl)));
+        }
+        const lines = step.powder && step.powder !== 'none' ? powderLines(step.powder, step.a, qmax + step.width) : [];
+        if (lines.length) ctx.log(`${lines.length} ${step.powder} lines up to |Q| ${qmax.toFixed(2)} 1/A`);
+        const rings = (step.q || []).concat(lines).sort((a, b) => a - b);
+        if (!rings.length) throw new Error('maskRings: no rings - give their |Q| or a powder');
         const values = copyValues(model);
         let masked = 0;
         forEachQ(model, ctx.cell, (i, q) => {
@@ -468,9 +496,21 @@
         return withValues(model, values);
     }
 
-    function stepScale(model, step) {
+    // I * factor + offset; `positive` then shifts the values up by 1.01 x the
+    // lowest one when that is negative, so no voxel is 0 or below (RMCProfile
+    // reads I = 0 as a masked point).
+    function stepScale(model, step, ctx) {
         const values = copyValues(model);
         for (let i = 0; i < values.length; i++) values[i] = values[i] * step.factor + step.offset;
+        if (step.positive) {
+            let min = Infinity;
+            for (let i = 0; i < values.length; i++) if (values[i] < min) min = values[i];
+            if (min < 0) {
+                const shift = -1.01 * min;
+                for (let i = 0; i < values.length; i++) values[i] += shift;
+                if (ctx) ctx.log(`shifted up by ${+shift.toPrecision(6)}, 1.01 x the lowest value`);
+            }
+        }
         let sigma = model.sigma;
         if (sigma) {
             sigma = model.sigma.slice();
@@ -482,17 +522,20 @@
 
     // B(|Q|) as a function: constant [c], linear [a, b] (a + b Q),
     // exponential [a, b, c] (a - b c^Q) or table [[Q, B], ...] (linear, flat
-    // beyond the ends).
+    // beyond the ends; two rows at the same |Q| make a step there).
     function backgroundCurve(kind, params) {
         if (kind === 'constant') return () => params[0];
         if (kind === 'linear') return q => params[0] + params[1] * q;
         if (kind === 'exponential') return q => params[0] - params[1] * Math.pow(params[2], q);
         if (kind === 'table') {
-            const t = params.slice().sort((a, b) => a[0] - b[0]);
+            const t = params.slice().sort((a, b) => a[0] - b[0]);      // stable: a step keeps its order
             return q => {
-                if (q <= t[0][0]) return t[0][1];
+                if (q < t[0][0]) return t[0][1];
                 for (let i = 1; i < t.length; i++) {
-                    if (q <= t[i][0]) return t[i - 1][1] + (t[i][1] - t[i - 1][1]) * (q - t[i - 1][0]) / (t[i][0] - t[i - 1][0]);
+                    if (q < t[i][0] || (q === t[i][0] && !(i + 1 < t.length && t[i + 1][0] === q))) {
+                        const d = t[i][0] - t[i - 1][0];
+                        return d > 0 ? t[i - 1][1] + (t[i][1] - t[i - 1][1]) * (q - t[i - 1][0]) / d : t[i][1];
+                    }
                 }
                 return t[t.length - 1][1];
             };
@@ -914,6 +957,27 @@
             sums = r.sums;
             if (sigmaOf.length) mult = stabilizerCounts(model, step.laue, space);
         }
+        // fitScale: the scale by least squares of Sigma data / Sigma norm against
+        // Sigma bkg / Sigma bkg norm over the voxels that have both (data =
+        // scale * background + offset; the offset is not subtracted).
+        let scale = step.scale;
+        if (step.background && step.fitScale) {
+            let n = 0, sx = 0, sy = 0, sxx = 0, sxy = 0;
+            for (let i = 0; i < N; i++) {
+                if (!(sums[1][i] > 0 && sums[3][i] > 0)) continue;
+                const y = sums[0][i] / sums[1][i], x = sums[2][i] / sums[3][i];
+                n++;
+                sx += x;
+                sy += y;
+                sxx += x * x;
+                sxy += x * y;
+            }
+            const det = n * sxx - sx * sx;
+            if (!(n > 2 && det > 0)) throw new Error('normalize: too few voxels with both data and background to fit the scale');
+            scale = (n * sxy - sx * sy) / det;
+            ctx.log(`background scale fitted by least squares: ${+scale.toPrecision(6)} ` +
+                `(offset ${+((sy - scale * sx) / n).toPrecision(4)}, not subtracted; ${n} voxels)`);
+        }
         const values = new Float64Array(N);
         const sigma = sigmaOf.length ? new Float64Array(N) : undefined;
         let empty = 0;
@@ -922,8 +986,8 @@
             let v = n > 0 ? sums[0][i] / n : NaN, var2 = n > 0 && sigmaOf.includes(0) ? sums[4][i] / (n * n) : 0;
             if (step.background) {
                 const bn = sums[3][i];
-                v = bn > 0 ? v - step.scale * sums[2][i] / bn : NaN;
-                if (sigmaOf.includes(2) && bn > 0) var2 += step.scale * step.scale * sums[4 + sigmaOf.indexOf(2)][i] / (bn * bn);
+                v = bn > 0 ? v - scale * sums[2][i] / bn : NaN;
+                if (sigmaOf.includes(2) && bn > 0) var2 += scale * scale * sums[4 + sigmaOf.indexOf(2)][i] / (bn * bn);
             }
             if (v !== v) empty++;
             values[i] = v;
@@ -933,6 +997,55 @@
         const changes = { weights: sums[1], sigma };
         if (step.laue !== 'none') Object.assign(changes, { symmetrized: 'laue', laueGroup: step.laue });
         return withValues(model, values, changes);
+    }
+
+    // Gaussian smoothing, sigma in voxels along every grid axis, as a
+    // normalised convolution: empty voxels neither count nor get filled.
+    // Uncertainties are dropped (the smoothing correlates the voxels).
+    async function stepSmooth(model, step, ctx) {
+        const dims = model.dims, N = voxelCount(model), s = step.sigma;
+        let v = new Float64Array(N), w = new Float64Array(N);
+        for (let i = 0; i < N; i++) {
+            const x = model.values[i];
+            if (x === x) {
+                v[i] = x;
+                w[i] = 1;
+            }
+        }
+        const r = Math.ceil(3 * s), kern = Float64Array.from({ length: 2 * r + 1 }, (_, i) => Math.exp(-0.5 * ((i - r) / s) ** 2));
+        const stride = [1, dims[0], dims[0] * dims[1]];
+        for (let a = 0; a < 3; a++) {
+            const n = dims[a], st = stride[a];
+            if (n < 2) continue;
+            const v2 = new Float64Array(N), w2 = new Float64Array(N);
+            for (let start = 0; start < N; start++) {
+                if (Math.floor(start / st) % n !== 0) continue;          // the first voxel of each line along axis a
+                for (let j = 0; j < n; j++) {
+                    let sv = 0, sw = 0;
+                    for (let t = Math.max(-r, -j); t <= Math.min(r, n - 1 - j); t++) {
+                        const m = start + (j + t) * st, k = kern[t + r];
+                        sv += k * v[m];
+                        sw += k * w[m];
+                    }
+                    v2[start + j * st] = sv;
+                    w2[start + j * st] = sw;
+                }
+            }
+            v = v2;
+            w = w2;
+            if (ctx.tick) await ctx.tick();
+        }
+        const values = newValues(model, N);
+        for (let i = 0; i < N; i++) values[i] = model.values[i] === model.values[i] && w[i] > 0 ? v[i] / w[i] : NaN;
+        return withValues(model, values, { sigma: undefined });
+    }
+
+    // Empty voxels next to data take the mean of their measured neighbours,
+    // one layer per pass, `passes` layers deep (see fillHoles).
+    function stepFill(model, step, ctx) {
+        const { values, filled } = fillHoles(model, step.passes);
+        ctx.log(`${filled} empty voxels filled from their neighbours (${step.passes} passes)`);
+        return withValues(model, model.values instanceof Float32Array ? Float32Array.from(values) : values);
     }
 
     // ------------------------------------------------------------------ 3D-ΔPDF
@@ -1102,9 +1215,11 @@
         resample: { run: stepResample, fields: { h: 'axis', k: 'axis', l: 'axis' } },
         rebin: { run: stepRebin, fields: { factors: 'ints3' } },
         maskBragg: { run: stepMaskBragg, fields: { shape: 'string', size: 'positive', centring: 'string' } },
-        maskRings: { run: stepMaskRings, fields: { q: 'numbers', width: 'positive' } },
+        maskRings: { run: stepMaskRings, fields: { q: 'numbers?', width: 'positive', powder: 'powder', a: 'number?' } },
         maskRange: { run: stepMaskRange, fields: { min: 'number?', max: 'number?' } },
-        scale: { run: stepScale, fields: { factor: 'number', offset: 'number' } },
+        scale: { run: stepScale, fields: { factor: 'number', offset: 'number', positive: 'boolean' } },
+        smooth: { run: stepSmooth, fields: { sigma: 'positive' } },
+        fill: { run: stepFill, fields: { passes: 'passes' } },
         backgroundFunction: { run: stepBackgroundFunction, fields: { kind: 'string', params: 'any' } },
         backgroundShells: { run: stepBackgroundShells, fields: { width: 'positive', percentile: 'number', smooth: 'number' } },
         combine: { run: stepCombine, fields: { operation: 'string', file: 'string', scale: 'number' } },
@@ -1113,7 +1228,7 @@
         deltaPdf: { run: stepDeltaPdf, fields: { taper: 'number', engine: 'engine', fill: 'passes' } },
         normalize: {
             run: stepNormalize,
-            fields: { norm: 'string', background: 'string?', backgroundNorm: 'string?', scale: 'number', laue: 'laue?' },
+            fields: { norm: 'string', background: 'string?', backgroundNorm: 'string?', scale: 'number', fitScale: 'boolean', laue: 'laue?' },
         },
     };
 
@@ -1128,6 +1243,8 @@
             number: finite,
             'number?': v => v === undefined || v === null || finite(v),
             numbers: v => Array.isArray(v) && v.length > 0 && v.every(finite),
+            'numbers?': v => v === undefined || v === null || (Array.isArray(v) && v.every(finite)),
+            powder: v => v === 'none' || Object.prototype.hasOwnProperty.call(POWDER, v),
             boolean: v => typeof v === 'boolean',
             clipTo: v => v === 'nan' || finite(v),
             engine: v => v === 'cpu' || v === 'gpu',
@@ -1169,16 +1286,21 @@
             case 'resample': return 'resample onto' + ['h', 'k', 'l'].map(n => ` ${n} ${step[n][0]}..${step[n][1]} step ${step[n][2]}`).join(',');
             case 'rebin': return `rebin by ${step.factors.join(' x ')}`;
             case 'maskBragg': return `mask Bragg positions (${step.shape} ${step.size}${step.shape === 'sphere' ? ' 1/A' : ' r.l.u.'}, centring ${step.centring})`;
-            case 'maskRings': return `mask powder rings at |Q| ${step.q.join(', ')} +/- ${step.width} 1/A`;
+            case 'maskRings': return 'mask powder rings' + ((step.q || []).length ? ` at |Q| ${step.q.join(', ')}` : '') +
+                (step.powder && step.powder !== 'none'
+                    ? `${(step.q || []).length ? ' and' : ''} of ${step.powder} (a = ${step.a > 0 ? step.a : POWDER[step.powder].a} A)` : '') +
+                ` +/- ${step.width} 1/A`;
             case 'maskRange': return `mask values outside ${step.min === undefined || step.min === null ? '-inf' : step.min}..${step.max === undefined || step.max === null ? 'inf' : step.max}`;
-            case 'scale': return `scale: I * ${step.factor} + ${step.offset}`;
+            case 'scale': return `scale: I * ${step.factor} + ${step.offset}` + (step.positive ? ', then shift up to positive' : '');
+            case 'smooth': return `Gaussian smoothing, sigma ${step.sigma} voxel${step.sigma === 1 ? '' : 's'} (empty voxels left out)`;
+            case 'fill': return `fill empty voxels from their neighbours, ${step.passes} voxel${step.passes === 1 ? '' : 's'} deep`;
             case 'backgroundFunction': return `subtract ${step.kind} background ${JSON.stringify(step.params)}`;
             case 'backgroundShells': return `subtract background from |Q| shells of ${step.width} 1/A (${step.percentile ? step.percentile + 'th percentile' : 'minimum'}${step.smooth ? ', smoothed over ' + step.smooth : ''})`;
             case 'combine': return `${step.operation} "${step.file}"${step.scale !== 1 ? ' x ' + step.scale : ''}`;
             case 'clip': return `set values below ${step.below} to ${step.to}`;
             case 'symmetrize': return `symmetrize with Laue group ${step.laue} (${step.mode}${step.expand ? ', extend the grid' : ''})`;
             case 'normalize': return `Σdata/Σnorm with "${step.norm}"` +
-                (step.background ? ` − ${step.scale} × Σ"${step.background}"/Σ"${step.backgroundNorm}"` : '') +
+                (step.background ? ` − ${step.fitScale ? 'fitted scale' : step.scale} × Σ"${step.background}"/Σ"${step.backgroundNorm}"` : '') +
                 (step.laue !== 'none' ? `, summed over ${step.laue}` : '');
             case 'deltaPdf': return `3D-ΔPDF by FFT on the ${step.engine === 'gpu' ? 'GPU (float32)' : 'CPU (float64)'}` +
                 (step.fill ? `, holes filled ${step.fill} voxel${step.fill === 1 ? '' : 's'} deep` : '') +

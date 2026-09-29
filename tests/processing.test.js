@@ -355,3 +355,72 @@ test('the example files survive a crop-mask-symmetrize recipe', async () => {
     assert.deepEqual(out.dims, [5, 5, 4]);
     assert.ok(Converter.countNonFinite(out.values) < out.values.length);
 });
+
+// ---- smoothing, filling, powder lines, fitted scales, shifts
+
+test('smooth: a NaN-aware Gaussian keeps a constant, spreads a spike, leaves holes empty', async () => {
+    const flat = grid(2, 0.5, () => 5);
+    flat.values[10] = NaN;
+    const s = await run(flat, [{ op: 'smooth', sigma: 1 }]);
+    assert.ok(Number.isNaN(s.values[10]));
+    assert.ok(s.values.every((x, i) => i === 10 || Math.abs(x - 5) < 1e-12), 'a constant stays constant around a hole');
+    const spike = grid(2, 0.5, (h, k, l) => (h === 0 && k === 0 && l === 0 ? 1 : 0));
+    const t = await run(spike, [{ op: 'smooth', sigma: 0.5 }]);
+    const c = value(t, 4, 4, 4), n1 = value(t, 5, 4, 4), n2 = value(t, 6, 4, 4);
+    assert.ok(c < 1 && n1 > 0 && n1 < c && n2 < n1, `${c} ${n1} ${n2}`);
+    assert.ok(Math.abs(n1 / c - Math.exp(-2)) < 1e-12, 'one voxel away: exp(-1/(2 sigma^2))');
+});
+
+test('fill: empty voxels take their measured neighbours, n layers deep', async () => {
+    const m = grid(2, 0.5, () => 3);
+    for (const i of [60, 61, 62]) m.values[i] = NaN;                     // a short run of holes
+    const f = await run(m, [{ op: 'fill', passes: 1 }]);
+    assert.ok([60, 61, 62].every(i => f.values[i] === 3));
+    assert.match(Processing.describeStep(Processing.normalizeRecipe({ steps: [{ op: 'fill', passes: 2 }] }).steps[0]), /2 voxels deep/);
+});
+
+test('backgroundFunction table: two rows at one |Q| make a step', async () => {
+    const m = grid(2, 0.5, () => 10);
+    const steps = [{ op: 'backgroundFunction', kind: 'table', params: [[0, 1], [2, 1], [2, 3], [9, 3]] }];
+    const b = await run(m, steps);
+    const Q = (h, k, l) => 2 * Math.PI * Math.hypot(h, k, l) / 4;
+    for (let il = 0; il < 9; il++) for (let ik = 0; ik < 9; ik++) for (let ih = 0; ih < 9; ih++) {
+        const q = Q(-2 + ih * 0.5, -2 + ik * 0.5, -2 + il * 0.5);
+        assert.ok(Math.abs(value(b, ih, ik, il) - (10 - (q < 2 ? 1 : 3))) < 1e-9, `|Q| ${q}`);
+    }
+});
+
+test('normalize: the background scale fitted by least squares', async () => {
+    const x = (h, k, l) => 1 + 0.3 * h * h + 0.1 * k - 0.2 * l;       // the background ratio
+    const data = grid(1, 0.5, (h, k, l) => 2.5 * x(h, k, l) + 0.7);     // = 2.5 x + 0.7, norm 1
+    const extras = { norm: grid(1, 0.5, () => 1), bkg: grid(1, 0.5, (h, k, l) => 4 * x(h, k, l)), bkgNorm: grid(1, 0.5, () => 4) };
+    const logs = [];
+    const r = await run(data, [{ op: 'normalize', norm: 'norm', background: 'bkg', backgroundNorm: 'bkgNorm', fitScale: true }],
+        { extras, log: t => logs.push(t) });
+    assert.ok(r.values.every(v => Math.abs(v - 0.7) < 1e-9), 'data - 2.5 x leaves the offset');
+    assert.match(logs.join('\n'), /background scale fitted by least squares: 2\.5 \(offset 0\.7/);
+});
+
+test('scale: shift up to positive (1.01 x the lowest value)', async () => {
+    const m = grid(1, 0.5, (h, k, l) => h * 10);                       // from -10 to 10
+    const s = await run(m, [{ op: 'scale', factor: 1, offset: 0, positive: true }]);
+    assert.ok(Math.abs(Math.min(...s.values) - 0.1) < 1e-12);
+    assert.ok(Math.abs(Math.max(...s.values) - 20.1) < 1e-12);
+    const pos = await run(grid(1, 0.5, () => 2), [{ op: 'scale', factor: 1, offset: 0, positive: true }]);
+    assert.ok(pos.values.every(v => v === 2), 'already positive: unchanged');
+});
+
+test('maskRings: aluminium powder lines from the lattice parameter', async () => {
+    // a line of voxels along h in a cubic cell (a = 4.05): Al (111) sits at |Q| = 2 pi sqrt(3) / 4.0495
+    const m = grid(0, 0.01, () => 1, [601, 1, 1], [0, 0, 0]);
+    const cell = cubic(4.05);
+    const r = await run(m, [{ op: 'maskRings', powder: 'aluminium', width: 0.01 }], { cell });
+    const q111 = 2 * Math.PI * Math.sqrt(3) / 4.0495, q200 = 2 * Math.PI * 2 / 4.0495;
+    const hOf = q => q * 4.05 / (2 * Math.PI);
+    const at = h => r.values[Math.round(h / 0.01)];
+    assert.ok(Number.isNaN(at(hOf(q111))) && Number.isNaN(at(hOf(q200))));
+    assert.equal(at(hOf((q111 + q200) / 2)), 1);
+    await assert.rejects(run(m, [{ op: 'maskRings', width: 0.01 }], { cell }), /no rings/);
+    assert.match(Processing.describeStep(Processing.normalizeRecipe({ steps: [{ op: 'maskRings', powder: 'aluminium', width: 0.03 }] }).steps[0]),
+        /of aluminium \(a = 4\.0495 A\) \+\/- 0\.03/);
+});

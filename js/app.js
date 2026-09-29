@@ -677,9 +677,14 @@
     maskBragg: ['Mask Bragg peaks', [['shape', ['box', 'sphere'], 'shape'],
       ['size', 'num', 'half-width (box, r.l.u.) or radius (sphere, Å⁻¹)'],
       ['centring', ['P', 'I', 'F', 'C', 'A', 'B', 'R'], 'lattice centring']]],
-    maskRings: ['Mask powder rings', [['q', 'nums', '|Q| of the rings (Å⁻¹)'], ['width', 'num', 'half-width (Å⁻¹)']]],
+    maskRings: ['Mask powder rings', [['powder', ['none', 'aluminium', 'copper', 'vanadium'], 'the lines of a sample holder'],
+      ['a', 'num?', 'its lattice parameter (Å; blank: room temperature)'], ['q', 'nums', 'more rings at |Q| (Å⁻¹)'],
+      ['width', 'num', 'half-width (Å⁻¹)']]],
     maskRange: ['Mask a value range', [['min', 'num?', 'keep from'], ['max', 'num?', 'keep up to']]],
-    scale: ['Scale and offset', [['factor', 'num', 'factor'], ['offset', 'num', 'offset']]],
+    scale: ['Scale and offset', [['factor', 'num', 'factor'], ['offset', 'num', 'offset'],
+      ['positive', 'bool', 'then shift up so every value is positive (RMCProfile reads 0 as masked)']]],
+    smooth: ['Smooth (Gaussian)', [['sigma', 'num', 'σ in voxels; empty voxels are left out']]],
+    fill: ['Fill empty voxels', [['passes', 'num', 'voxels deep, from their measured neighbours']]],
     backgroundFunction: ['Subtract B(|Q|)', [
       ['kind', ['constant', 'linear', 'exponential', 'table'], 'kind'],
       ['params', 'json', 'parameters: [c], [a, b] for a + bQ, [a, b, c] for a − b c^Q, or [[Q, B], …]']]],
@@ -687,6 +692,7 @@
       ['percentile', 'num', 'percentile per shell (0 = minimum)'], ['smooth', 'num', 'smooth over ± shells']]],
     normalize: ['Normalize by Mantid norms', [['norm', 'extra', 'norm volume'], ['background', 'extra?', 'background data'],
       ['backgroundNorm', 'extra?', 'background norm'], ['scale', 'num', 'background times'],
+      ['fitScale', 'bool', 'fit that scale by least squares instead'],
       ['laue', ['none'].concat(Processing.LAUE_GROUPS), 'sum over the Laue group']]],
     combine: ['Combine with a volume', [['operation', ['subtract', 'add', 'multiply', 'divide'], 'operation'],
       ['file', 'extra', 'volume'], ['scale', 'num', 'times']]],
@@ -697,24 +703,25 @@
       ['fill', 'num', 'fill holes, voxels deep (0 = count them as 0)']]],
   };
   const STEP_GROUPS = [
-    ['Grid', ['crop', 'resample', 'rebin']], ['Masks', ['maskBragg', 'maskRings', 'maskRange']],
-    ['Background', ['normalize', 'backgroundShells', 'backgroundFunction', 'combine']], ['Values', ['scale', 'clip']],
+    ['Grid', ['crop', 'resample', 'rebin']], ['Masks', ['maskBragg', 'maskRings', 'maskRange', 'fill']],
+    ['Background', ['normalize', 'backgroundShells', 'backgroundFunction', 'combine']], ['Values', ['scale', 'clip', 'smooth']],
     ['Symmetry', ['symmetrize']], ['Transform', ['deltaPdf']],
   ];
   const STEP_ICON = {
     crop: 'crop', resample: 'grid', rebin: 'grid', maskBragg: 'mask', maskRings: 'rings', maskRange: 'sliders',
     scale: 'sliders', backgroundFunction: 'curve', backgroundShells: 'curve', combine: 'layers', normalize: 'layers', clip: 'sliders',
-    symmetrize: 'sym', deltaPdf: 'wave',
+    symmetrize: 'sym', deltaPdf: 'wave', smooth: 'curve', fill: 'wand',
   };
   // Starting values of a new step.
   const STEP_START = {
     crop: {}, resample: { h: [-2, 2, 0.05], k: [-2, 2, 0.05], l: [0, 0, 0] }, rebin: { factors: [2, 2, 2] },
-    maskBragg: { shape: 'box', size: 0.1, centring: 'P' }, maskRings: { q: [], width: 0.05 }, maskRange: { min: 0 },
-    scale: { factor: 1, offset: 0 }, backgroundFunction: { kind: 'constant', params: [0] },
+    maskBragg: { shape: 'box', size: 0.1, centring: 'P' }, maskRings: { powder: 'aluminium', q: [], width: 0.03 }, maskRange: { min: 0 },
+    scale: { factor: 1, offset: 0, positive: false }, backgroundFunction: { kind: 'constant', params: [0] },
+    smooth: { sigma: 0.5 }, fill: { passes: 2 },
     backgroundShells: { width: 0.05, percentile: 5, smooth: 1 }, combine: { operation: 'subtract', scale: 1 },
     clip: { below: 0, to: 0 }, symmetrize: { laue: 'm-3m', mode: 'average', expand: false },
     deltaPdf: { taper: 0, engine: 'cpu', fill: 0 },
-    normalize: { background: '', backgroundNorm: '', scale: 1, laue: 'none' },
+    normalize: { background: '', backgroundNorm: '', scale: 1, fitScale: false, laue: 'none' },
   };
   const PRESETS = [
     { name: '3D-ΔPDF of a cubic crystal', note: 'm-3m symmetrize · Bragg mask · ΔPDF', steps: [
@@ -724,6 +731,12 @@
       { op: 'combine', operation: 'subtract', scale: 1 }] },
     { name: 'Diffuse scattering only', note: 'Bragg mask · background from |Q| shells', steps: [
       { op: 'maskBragg', shape: 'box', size: 0.1, centring: 'P' }, { op: 'backgroundShells', width: 0.05, percentile: 5, smooth: 1 }] },
+    { name: 'CORELLI → RMCProfile .dat', note: 'positive · Al rings · shell background · clip · Bragg mask', steps: [
+      { op: 'scale', factor: 1, offset: 0, positive: true },
+      { op: 'maskRings', powder: 'aluminium', q: [], width: 0.03 },
+      { op: 'backgroundShells', width: 0.05, percentile: 0, smooth: 2 },
+      { op: 'clip', below: 0, to: 0.001 },
+      { op: 'maskBragg', shape: 'box', size: 0.1, centring: 'P' }] },
   ];
 
   for (const [group, ops] of STEP_GROUPS) {
