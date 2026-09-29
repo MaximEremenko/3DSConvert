@@ -17,6 +17,7 @@
     }
   }
   * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
   body {
     margin: 0; padding: 2rem 1rem; background: var(--bg); color: var(--text);
     font: 15px/1.5 system-ui, "Segoe UI", Roboto, sans-serif;
@@ -63,6 +64,22 @@
   }
   .ok { color: var(--ok); } .err { color: var(--err); }
   code { font-family: ui-monospace, Consolas, monospace; font-size: .85em; }
+  .inline { display: flex; gap: .5rem; align-items: center; flex-wrap: wrap; }
+  .inline select { width: auto; flex: 1 1 12rem; }
+  .steps { list-style: none; margin: 0; padding: 0; }
+  .steps:empty::before { content: 'No steps: the data are written as read.'; color: var(--muted2); font-size: .9rem; }
+  .step { border: 1px solid var(--line); border-radius: 8px; padding: .5rem .75rem; margin-bottom: .5rem; }
+  .stephead { display: flex; align-items: center; gap: .5rem; }
+  .stephead b { flex: 1 1 auto; }
+  .stephead button { padding: .1rem .55rem; }
+  .fields { display: flex; flex-wrap: wrap; gap: .3rem 1rem; margin: .35rem 0 .2rem; }
+  .fields label { display: inline; font-weight: 400; margin: 0 .3rem 0 0; color: var(--muted2); font-size: .85rem; }
+  .fields input:not([type=checkbox]), .fields select, #profileWidth {
+    width: 6.5em; padding: .25rem .35rem; border: 1px solid var(--line); border-radius: 6px;
+    background: var(--bg); color: var(--text); font: inherit; display: inline-block;
+  }
+  .fields input.wide { width: 14em; }
+  .fields select { width: auto; }
 </style>
 </head>
 <body>
@@ -74,7 +91,8 @@
     <b>Yell&nbsp;1.0</b> HDF5 (DISCUS / Yell / Meerkat), the
     <b>RMCProfile old text</b> format, and <b>VTK</b> (Scatty / Spinteract / 3DSCalculator),
     and reads <b>NeXus</b> volumes (Mantid MDHistoWorkspace, NXdata such as NXrefine).
-    Everything runs locally in your browser &mdash; no upload.
+    On the way it can crop, rebin, mask, subtract backgrounds, symmetrize and compute the
+    <b>3D-&Delta;PDF</b>. Everything runs locally in your browser &mdash; no upload.
   </p>
 
   <div class="panel">
@@ -131,7 +149,36 @@
   </div>
 
   <div class="panel">
-    <h2>3 &middot; Output</h2>
+    <h2>3 &middot; Processing
+      <span class="hint">&mdash; optional steps, applied in order before the data are written</span></h2>
+    <ol id="steps" class="steps"></ol>
+    <div class="row">
+      <div>
+        <label>Add a step</label>
+        <div class="inline">
+          <select id="stepOp"></select>
+          <button id="addStep" type="button" class="secondary">Add</button>
+        </div>
+      </div>
+      <div>
+        <label>Recipe <span class="hint">(the steps as JSON; processed unified output records it)</span></label>
+        <div class="inline">
+          <button id="saveRecipe" type="button" class="secondary">Save&hellip;</button>
+          <button id="loadRecipe" type="button" class="secondary">Load&hellip;</button>
+          <button id="clearRecipe" type="button" class="secondary">Clear</button>
+          <input type="file" id="recipeFile" accept=".json,application/json" hidden>
+        </div>
+      </div>
+    </div>
+    <label>Other volumes
+      <span class="hint">(for &ldquo;combine&rdquo; steps, e.g. an empty-can measurement or a calculated
+      pattern; any readable format)</span></label>
+    <input type="file" id="extraFiles" multiple>
+    <div id="extraInfo" class="hint"></div>
+  </div>
+
+  <div class="panel">
+    <h2>4 &middot; Output</h2>
     <div class="row">
       <div>
         <label>Output format</label>
@@ -140,7 +187,12 @@
           <option value="yell">Yell 1.0 (.h5)</option>
           <option value="dat">RMCProfile old format (.dat)</option>
           <option value="vtk">Scatty VTK (.vtk)</option>
+          <option value="profile">|Q| profile: shell averages (.txt)</option>
         </select>
+        <div id="profileOpts" class="inline" hidden>
+          <label for="profileWidth">shell width <span class="hint">(1/&Aring;)</span></label>
+          <input id="profileWidth" value="0.05">
+        </div>
       </div>
       <div>
         <label>Radiation <span class="hint">(metadata for HDF5 output)</span></label>
@@ -192,6 +244,8 @@
 
 <script src="js/h5wasm.js"></script>
 <script src="js/converter.js"></script>
+<script src="js/processing.js"></script>
+<script src="js/wgpu_fft_web.js"></script>
 <script src="js/worker.js"></script>
 <script>
 'use strict';
@@ -226,7 +280,9 @@
     const source = [
       'var h5wasm = (' + h5wasmModule.toString() + ')();',
       'var Converter = (' + ConverterFactory.toString() + ')();',
-      '(' + converterWorker.toString() + ')(self, h5wasm, Converter);',
+      'var Processing = (' + ProcessingFactory.toString() + ')(Converter);',
+      'var wgpuFftWeb = (' + wgpuFftWebModule.toString() + ')();',
+      '(' + converterWorker.toString() + ')(self, h5wasm, Converter, Processing, wgpuFftWeb);',
     ].join('\n');
     const url = URL.createObjectURL(new Blob([source], { type: 'text/javascript' }));
     const worker = new Worker(url);
@@ -242,6 +298,8 @@
       if (!call) return;
       if (msg.type === 'progress') {
         if (call.onProgress) call.onProgress(msg.phase, msg.fraction);
+      } else if (msg.type === 'log') {
+        if (call.onLog) call.onLog(msg.text);
       } else if (msg.type === 'chunk') {
         try {
           await call.onChunk(msg.chunk);
@@ -279,7 +337,7 @@
     };
   }
 
-  const state = { data: null, struct: null, dataFiles: [], gridConfig: null };
+  const state = { data: null, struct: null, dataFiles: [], gridConfig: null, recipe: [], extraNames: [] };
   let client, current = null, hardCancelTimer = null;
 
   try {
@@ -301,7 +359,8 @@
     $('busy').hidden = !on;
     $('progressBar').removeAttribute('value');   // indeterminate until the first report
     $('progressText').textContent = label || '';
-    for (const id of ['dataFile', 'structFile', 'gridConfigFile', 'yellSpace', 'nexusPath']) $(id).disabled = on;
+    for (const id of ['dataFile', 'structFile', 'gridConfigFile', 'yellSpace', 'nexusPath', 'extraFiles',
+      'addStep', 'loadRecipe', 'clearRecipe']) $(id).disabled = on;
     updateButton();
   }
 
@@ -312,7 +371,7 @@
 
   // Run one worker call with the progress bar and Cancel button.
   async function run(label, method, args, hooks) {
-    const call = client.call(method, args, Object.assign({ onProgress: showProgress }, hooks));
+    const call = client.call(method, args, Object.assign({ onProgress: showProgress, onLog: text => log(text) }, hooks));
     current = call;
     setBusy(label);
     try {
@@ -336,10 +395,11 @@
       state.data = null;
       state.struct = null;
       state.dataFiles = [];
-      for (const id of ['dataFile', 'structFile']) $(id).value = '';
+      state.extraNames = [];
+      for (const id of ['dataFile', 'structFile', 'extraFiles']) $(id).value = '';
       $('nexusPick').hidden = true;
-      $('dataInfo').textContent = '';
-      $('structInfo').textContent = '';
+      for (const id of ['dataInfo', 'structInfo', 'extraInfo']) $(id).textContent = '';
+      renderSteps();
       log('The worker did not stop in time and was restarted; select the files again.', 'err');
     }, 5000);
   });
@@ -483,6 +543,268 @@
     return { lengths: vals.slice(0, 3), angles: vals.slice(3, 6) };
   }
 
+  // ------------------------------------------------------------ processing
+  // Form fields per step op: [key, type, label]. A type is a list of
+  // choices, or 'num', 'num?' (blank = none), 'nums' (a list), 'range'
+  // (min max, blank = all), 'axis' (min max step), 'ints3', 'json', 'bool',
+  // 'clipTo' (a number or nan) or 'extra' (a loaded volume).
+  const STEP_FORMS = {
+    crop: ['Crop to hkl ranges', [['h', 'range', 'h'], ['k', 'range', 'k'], ['l', 'range', 'l']]],
+    resample: ['Resample onto an hkl grid', [['h', 'axis', 'h min max step'], ['k', 'axis', 'k'], ['l', 'axis', 'l']]],
+    rebin: ['Rebin (average blocks of voxels)', [['factors', 'ints3', 'factors along the grid axes']]],
+    maskBragg: ['Mask Bragg positions', [['shape', ['box', 'sphere'], 'shape'],
+      ['size', 'num', 'half-width (box, r.l.u.) or radius (sphere, 1/Å)'],
+      ['centring', ['P', 'I', 'F', 'C', 'A', 'B', 'R'], 'lattice centring']]],
+    maskRings: ['Mask powder rings', [['q', 'nums', '|Q| of the rings (1/Å)'], ['width', 'num', 'half-width (1/Å)']]],
+    maskRange: ['Mask values outside a range', [['min', 'num?', 'min'], ['max', 'num?', 'max']]],
+    scale: ['Scale and offset: I × factor + offset', [['factor', 'num', 'factor'], ['offset', 'num', 'offset']]],
+    backgroundFunction: ['Subtract a background B(|Q|)', [
+      ['kind', ['constant', 'linear', 'exponential', 'table'], 'kind'],
+      ['params', 'json', 'parameters: [c], [a, b] for a + bQ, [a, b, c] for a − b c^Q, or [[Q, B], …]']]],
+    backgroundShells: ['Subtract a background estimated in |Q| shells', [['width', 'num', 'shell width (1/Å)'],
+      ['percentile', 'num', 'percentile per shell (0 = minimum)'], ['smooth', 'num', 'smooth over ± shells']]],
+    combine: ['Combine with another volume', [['operation', ['subtract', 'add', 'multiply', 'divide'], 'operation'],
+      ['file', 'extra', 'volume'], ['scale', 'num', 'times']]],
+    clip: ['Replace low values', [['below', 'num', 'below'], ['to', 'clipTo', 'with (a number or nan)']]],
+    symmetrize: ['Symmetrize with a Laue group', [['laue', Processing.LAUE_GROUPS, 'Laue group'],
+      ['mode', ['average', 'fill'], 'average all, or fill empty voxels only'], ['expand', 'bool', 'extend the grid']]],
+    deltaPdf: ['3D-ΔPDF (inverse Fourier transform)', [['taper', 'num', 'Tukey taper (0–1)'],
+      ['engine', ['cpu', 'gpu'], 'FFT on']]],
+  };
+  // Starting values of a new step.
+  const STEP_START = {
+    crop: {}, resample: { h: [-2, 2, 0.05], k: [-2, 2, 0.05], l: [0, 0, 0] }, rebin: { factors: [2, 2, 2] },
+    maskBragg: { shape: 'box', size: 0.1, centring: 'P' }, maskRings: { q: [], width: 0.05 }, maskRange: { min: 0 },
+    scale: { factor: 1, offset: 0 }, backgroundFunction: { kind: 'constant', params: [0] },
+    backgroundShells: { width: 0.05, percentile: 5, smooth: 1 }, combine: { operation: 'subtract', scale: 1 },
+    clip: { below: 0, to: 0 }, symmetrize: { laue: 'm-3m', mode: 'average', expand: false },
+    deltaPdf: { taper: 0, engine: 'cpu' },
+  };
+
+  for (const [op, [title]] of Object.entries(STEP_FORMS)) {
+    const opt = document.createElement('option');
+    opt.value = op;
+    opt.textContent = title;
+    $('stepOp').appendChild(opt);
+  }
+
+  const blankOr = (x, text) => (x === undefined || x === null || Number.isNaN(x) ? '' : text);
+  const numberIn = text => (text.trim() === '' ? NaN : Number(text));
+
+  // One form field; returns { node, read } where read() gives the value.
+  function makeField(type, value, changed) {
+    const node = document.createElement('span');
+    const input = (text, wide, hint) => {
+      const e = document.createElement('input');
+      e.value = text;
+      if (wide) e.className = 'wide';
+      if (hint) e.placeholder = hint;
+      e.addEventListener('input', changed);
+      node.appendChild(e);
+      return e;
+    };
+    const select = (choices, current, labels) => {
+      const e = document.createElement('select');
+      choices.forEach((c, i) => {
+        const opt = document.createElement('option');
+        opt.value = c;
+        opt.textContent = labels ? labels[i] : c;
+        e.appendChild(opt);
+      });
+      e.value = current;
+      e.addEventListener('change', changed);
+      node.appendChild(e);
+      return e;
+    };
+    if (Array.isArray(type)) {
+      const e = select(type, value);
+      return { node, read: () => e.value };
+    }
+    if (type === 'num') {
+      const e = input(blankOr(value, String(value)));
+      return { node, read: () => numberIn(e.value) };
+    }
+    if (type === 'num?') {
+      const e = input(blankOr(value, String(value)));
+      return { node, read: () => (e.value.trim() === '' ? undefined : Number(e.value)) };
+    }
+    if (type === 'nums') {
+      const e = input((value || []).join(', '), true);
+      return { node, read: () => e.value.split(/[\s,;]+/).filter(Boolean).map(Number) };
+    }
+    if (type === 'range') {
+      const [a, b] = ['min', 'max'].map((hint, i) => input(value ? String(value[i]) : '', false, hint));
+      return { node, read: () => (a.value.trim() === '' && b.value.trim() === '' ? undefined : [numberIn(a.value), numberIn(b.value)]) };
+    }
+    if (type === 'axis' || type === 'ints3') {
+      const hints = type === 'axis' ? ['min', 'max', 'step'] : ['', '', ''];
+      const es = hints.map((hint, i) => input(value ? String(value[i]) : '', false, hint));
+      return { node, read: () => es.map(e => numberIn(e.value)) };
+    }
+    if (type === 'json') {
+      const e = input(value === undefined ? '' : JSON.stringify(value), true);
+      return {
+        node, read: () => {
+          try {
+            return JSON.parse(e.value);
+          } catch (_) {
+            return undefined;
+          }
+        },
+      };
+    }
+    if (type === 'bool') {
+      const e = document.createElement('input');
+      e.type = 'checkbox';
+      e.checked = !!value;
+      e.addEventListener('change', changed);
+      node.appendChild(e);
+      return { node, read: () => e.checked };
+    }
+    if (type === 'clipTo') {
+      const e = input(value === undefined ? '' : String(value));
+      return { node, read: () => (e.value.trim().toLowerCase() === 'nan' ? 'nan' : numberIn(e.value)) };
+    }
+    // 'extra': the loaded volumes, and a recipe's name that is not loaded
+    const names = state.extraNames.slice();
+    const labels = names.slice();
+    if (value && !names.includes(value)) {
+      names.push(value);
+      labels.push(value + ' (not loaded)');
+    }
+    if (!names.length) {
+      names.push('');
+      labels.push('(load a volume below)');
+    }
+    const e = select(names, value || names[0], labels);
+    return { node, read: () => e.value };
+  }
+
+  // The step as valid recipe JSON, or the reason it is not.
+  function checkStep(step) {
+    try {
+      const normal = Processing.normalizeRecipe({ steps: [step] }).steps[0];
+      return { text: Processing.describeStep(normal) };
+    } catch (e) {
+      return { error: e.message.replace(/^recipe step 1 /, '') };
+    }
+  }
+
+  function renderSteps() {
+    const list = $('steps');
+    list.textContent = '';
+    state.recipe.forEach((step, n) => {
+      const [title, fields] = STEP_FORMS[step.op];
+      const item = document.createElement('li');
+      item.className = 'step';
+      const head = document.createElement('div');
+      head.className = 'stephead';
+      const name = document.createElement('b');
+      name.textContent = `${n + 1}. ${title}`;
+      head.appendChild(name);
+      for (const [text, tip, act] of [['↑', 'move up', -1], ['↓', 'move down', 1], ['✕', 'remove', 0]]) {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.className = 'secondary';
+        b.textContent = text;
+        b.title = tip;
+        b.disabled = act === -1 ? n === 0 : act === 1 ? n === state.recipe.length - 1 : false;
+        b.addEventListener('click', () => {
+          const [moved] = state.recipe.splice(n, 1);
+          if (act) state.recipe.splice(n + act, 0, moved);
+          renderSteps();
+        });
+        head.appendChild(b);
+      }
+      item.appendChild(head);
+      const box = document.createElement('div');
+      box.className = 'fields';
+      const status = document.createElement('div');
+      status.className = 'hint';
+      const readers = [];
+      const update = () => {
+        const next = { op: step.op };
+        for (const [key, read] of readers) {
+          const v = read();
+          if (v !== undefined) next[key] = v;
+        }
+        state.recipe[n] = next;
+        const c = checkStep(next);
+        status.textContent = c.error || c.text;
+        status.className = c.error ? 'hint err' : 'hint';
+      };
+      for (const [key, type, label] of fields) {
+        const wrap = document.createElement('span');
+        const l = document.createElement('label');
+        l.textContent = label;
+        wrap.appendChild(l);
+        const field = makeField(type, step[key], update);
+        wrap.appendChild(field.node);
+        readers.push([key, field.read]);
+        box.appendChild(wrap);
+      }
+      item.appendChild(box);
+      item.appendChild(status);
+      list.appendChild(item);
+      update();
+    });
+  }
+
+  $('addStep').addEventListener('click', () => {
+    const op = $('stepOp').value;
+    const step = Object.assign({ op }, JSON.parse(JSON.stringify(STEP_START[op] || {})));
+    if (op === 'combine' && state.extraNames.length) step.file = state.extraNames[0];
+    state.recipe.push(step);
+    renderSteps();
+  });
+
+  $('clearRecipe').addEventListener('click', () => {
+    state.recipe = [];
+    renderSteps();
+  });
+
+  $('saveRecipe').addEventListener('click', () => {
+    const text = JSON.stringify({ version: 1, steps: state.recipe }, null, 2) + '\n';
+    download([text], ((state.data && state.data.baseName) || 'processing') + '_recipe.json', 'application/json');
+  });
+
+  $('loadRecipe').addEventListener('click', () => $('recipeFile').click());
+  $('recipeFile').addEventListener('change', async ev => {
+    const file = ev.target.files[0];
+    if (!file) return;
+    try {
+      state.recipe = Processing.normalizeRecipe(JSON.parse(await file.text())).steps;
+      renderSteps();
+      log(`Recipe "${file.name}": ${state.recipe.length} step(s)`);
+    } catch (e) {
+      log(`Error reading recipe "${file.name}": ${e.message}`, 'err');
+    }
+    ev.target.value = '';
+  });
+
+  $('extraFiles').addEventListener('change', async ev => {
+    const files = Array.from(ev.target.files);
+    $('extraInfo').textContent = '';
+    state.extraNames = [];
+    try {
+      const list = await run('Reading volumes…', 'loadExtras', { files });
+      state.extraNames = list.map(x => x.name);
+      $('extraInfo').textContent = list.map(x => `${x.name}: grid ${x.dims.join(' x ')}`).join('; ');
+      for (const x of list) {
+        log(`Volume "${x.name}": grid ${x.dims.join(' x ')}` + (x.frame === 'q' ? ' in Q' : ''));
+        logNotes(x.notes);
+      }
+    } catch (e) {
+      $('extraInfo').textContent = 'Error: ' + (e.cancelled ? 'reading cancelled' : e.message);
+      log('Error reading volumes: ' + e.message, 'err');
+    }
+    renderSteps();
+  });
+
+  $('outFormat').addEventListener('change', () => {
+    $('profileOpts').hidden = $('outFormat').value !== 'profile';
+  });
+
   // ------------------------------------------------------------ output
   function download(bytes, filename, mime) {
     const blob = new Blob(Array.isArray(bytes) ? bytes : [bytes], { type: mime });
@@ -499,12 +821,13 @@
   async function openTextSink(filename, format) {
     if ('showSaveFilePicker' in window) {
       try {
+        const [description, extension] = {
+          dat: ['RMCProfile old diffuse text format', '.dat'], vtk: ['VTK legacy file', '.vtk'],
+          profile: ['|Q| profile', '.txt'],
+        }[format];
         const handle = await window.showSaveFilePicker({
           suggestedName: filename,
-          types: [{
-            description: format === 'dat' ? 'RMCProfile old diffuse text format' : 'VTK legacy file',
-            accept: { 'text/plain': ['.' + format] },
-          }],
+          types: [{ description, accept: { 'text/plain': [extension] } }],
         });
         const writable = await handle.createWritable();
         return {
@@ -532,7 +855,7 @@
   $('convertBtn').addEventListener('click', async () => {
     clearLog();
     const format = $('outFormat').value;
-    const text = format === 'dat' || format === 'vtk';
+    const text = format === 'dat' || format === 'vtk' || format === 'profile';
     const params = {
       format,
       radiation: $('radiation').value,
@@ -540,7 +863,18 @@
       precision: $('precision').value,
       layout: $('layout').value,
       compression: Number($('compression').value),
+      recipe: state.recipe.length ? { version: 1, steps: state.recipe } : null,
+      profileWidth: Number($('profileWidth').value),
     };
+    const bad = state.recipe.map((s, n) => [n + 1, checkStep(s).error]).filter(x => x[1]);
+    if (bad.length) {
+      for (const [n, error] of bad) log(`Error: processing step ${n}: ${error}`, 'err');
+      return;
+    }
+    if (format === 'profile' && !(params.profileWidth > 0)) {
+      log('Error: the |Q| shell width must be a positive number', 'err');
+      return;
+    }
     if (state.gridConfig && state.data.kind === 'vtk') {
       const index = pickGrid(state.gridConfig, state.data.main);
       params.grid = state.gridConfig.grids[index];
@@ -549,17 +883,23 @@
         log(`Using grid ${index + 1} of ${state.gridConfig.grids.length} from the config.`);
       }
     }
-    const suffix = { unified: '_unified.h5', yell: '_yell.h5', dat: '_diffuse3d.dat', vtk: '_diffuse.vtk' }[format];
-    const outName = (state.data.baseName || 'converted') + suffix;
+    const suffix = {
+      unified: '_unified.h5', yell: '_yell.h5', dat: '_diffuse3d.dat', vtk: '_diffuse.vtk', profile: '_profile.txt',
+    }[format];
     let sink = null;
     try {
-      const plan = await run('Preparing…', 'prepare', params);
-      for (const line of plan.logs) log(line);
+      const plan = await run(params.recipe ? 'Processing…' : 'Preparing…', 'prepare', params);
       logNotes(plan.notes);
-      log(`Grid ${plan.dims.join(' x ')} (${plan.dims[0] * plan.dims[1] * plan.dims[2]} points)`);
+      const direct = plan.axesType === 'uvw';
+      log(`Grid ${plan.dims.join(' x ')} (${plan.dims[0] * plan.dims[1] * plan.dims[2]} points)` +
+          (direct ? ' in direct space (u, v, w)' : ''));
       log(`Cell for hkl <-> Q: ${fmtCell(plan.cell)}  [from ${plan.cellSource}]`);
-      log(`Output: about ${fmtBytes(plan.estimate)}` +
-          (!text && params.compression ? ' before compression' : '') + '.');
+      if (plan.estimate) {
+        log(`Output: about ${fmtBytes(plan.estimate)}` +
+            (!text && params.compression ? ' before compression' : '') + '.');
+      }
+      const tag = !plan.processed ? '' : direct && state.data.axesType !== 'uvw' ? '_dpdf' : '_processed';
+      const outName = (state.data.baseName || 'converted') + tag + suffix;
       if (text) {
         if (plan.nonFinite) {
           log(`${plan.nonFinite} NaN/infinite voxels written as 0` +

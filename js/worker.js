@@ -1,7 +1,8 @@
 /*
  * Conversion worker for index.html. The page starts it from a Blob URL
  * assembled from the source text of h5wasmModule (js/h5wasm.js),
- * ConverterFactory (js/converter.js) and converterWorker below, so it also
+ * ConverterFactory (js/converter.js), ProcessingFactory (js/processing.js),
+ * wgpuFftWebModule (js/wgpu_fft_web.js) and converterWorker below, so it also
  * runs from a file:// page. Input files are mounted with WORKERFS: HDF5 reads
  * only the bytes it needs, and text files are parsed as streams. The loaded
  * data stay in the worker; the page only receives summaries.
@@ -12,15 +13,16 @@
  *   { type: 'ack', id }                  the page has consumed the last chunk
  * worker -> page:
  *   { type: 'progress', id, phase, fraction }
+ *   { type: 'log', id, text }            a line for the log (processing steps)
  *   { type: 'chunk', id, chunk }         text output; the worker waits for 'ack'
  *   { type: 'result', id, result }
  *   { type: 'error', id, message, cancelled }
  */
-function converterWorker(self, h5wasm, Converter) {
+function converterWorker(self, h5wasm, Converter, Processing, wgpuFftWeb) {
     'use strict';
 
     const MOUNT = '/work';
-    const state = { files: {}, data: null, struct: null, plan: null };
+    const state = { files: {}, data: null, struct: null, extras: {}, plan: null };
     const cancelled = new Set();
     const acks = new Map();
     let outSeq = 0;
@@ -70,6 +72,9 @@ function converterWorker(self, h5wasm, Converter) {
                     self.postMessage({ type: 'progress', id, phase, fraction });
                 }
             },
+            log(text) {
+                self.postMessage({ type: 'log', id, text });
+            },
             async emit(chunk) {
                 const consumed = new Promise(resolve => acks.set(id, resolve));
                 self.postMessage({ type: 'chunk', id, chunk });
@@ -81,7 +86,8 @@ function converterWorker(self, h5wasm, Converter) {
     }
 
     // Remount the inputs; HDF5 files are closed between calls.
-    // state.files.data: [{ at, file }] placed under data/<at>; .struct: File.
+    // state.files.data: [{ at, file }] placed under data/<at>; .struct: File;
+    // .extras: Files placed under extra/<index>/<name>.
     function mountFiles() {
         try {
             FS.unmount(MOUNT);
@@ -90,6 +96,7 @@ function converterWorker(self, h5wasm, Converter) {
         }
         const blobs = (state.files.data || []).map(x => ({ name: 'data/' + x.at, data: x.file }));
         if (state.files.struct) blobs.push({ name: 'struct/' + state.files.struct.name, data: state.files.struct });
+        (state.files.extras || []).forEach((file, i) => blobs.push({ name: `extra/${i}/${file.name}`, data: file }));
         FS.mount(FS.filesystems.WORKERFS, { blobs }, MOUNT);
     }
 
@@ -112,13 +119,93 @@ function converterWorker(self, h5wasm, Converter) {
         return Converter.isHdf5Signature(new Uint8Array(await file.slice(0, 8).arrayBuffer()));
     }
 
+    // Old-format .dat or VTK text, parsed as a stream: { kind, grid }.
+    async function readTextVolume(file, opts) {
+        const head = new TextDecoder().decode(await file.slice(0, 256).arrayBuffer());
+        const vtk = Converter.isVtk(head);
+        const grid = vtk ? await Converter.readVtkStream(file.stream(), opts)
+            : await Converter.readOldDatStream(file.stream(), opts);
+        return { kind: vtk ? (grid.frame === 'hkl' ? 'vtk-hkl' : 'vtk') : 'dat', grid };
+    }
+
+    // The model in an open HDF5 file of a known kind. opts also carries
+    // `space` (Yell) and `path` (the NeXus NXdata group).
+    function readModel(f, kind, opts) {
+        if (kind === 'yell') return Converter.readYell(f, opts);
+        if (kind === 'unified') return Converter.readUnifiedData(f, opts);
+        if (kind === 'mantid-md') return Converter.readMantidMD(f, opts);
+        if (kind === 'nexus') return Converter.readNexusData(f, opts);
+        throw new Error(Converter.unsupportedKindMessage(kind));
+    }
+
+    // The FFT behind Processing's 3D-ΔPDF step, from wgpuFFT: its CPU plan in
+    // float64, or WebGPU in float32. (wgpuFFT's double-float GPU plans are
+    // accurate, but Chrome takes 30-90 s to compile their shaders for each
+    // new grid size, far longer than the CPU transform.) The module and the
+    // device load on first use.
+    let fftModule = null, gpuDevice = null;
+    function fftEngine(log) {
+        return async (shape, data, direction, engine) => {
+            if (!fftModule) fftModule = wgpuFftWeb.load().catch(e => { fftModule = null; throw e; });
+            const api = await fftModule;
+            const dir = direction === 'inverse' ? api.WebFftDirection.Inverse : api.WebFftDirection.Forward;
+            const dims = Uint32Array.from(shape);
+            if (engine !== 'gpu') {
+                log(`FFT of ${shape.join(' x ')} on the CPU (float64)`);
+                return api.cpuFft(dims, data, dir, api.WebFftNormalization.None);
+            }
+            if (!gpuDevice) {
+                gpuDevice = (self.navigator && self.navigator.gpu ? api.WgpuFft.init()
+                    : Promise.reject(new Error('this browser offers no WebGPU to workers')))
+                    .catch(e => {
+                        gpuDevice = null;
+                        throw new Error(`no usable WebGPU (${(e && e.message) || e}); choose the CPU engine`);
+                    });
+            }
+            const gpu = await gpuDevice;
+            const plan = await gpu.createPlan(dims, 1, dir, api.WebFftPrecision.F32, api.WebFftNormalization.None);
+            let input = null, output = null;
+            try {
+                const staged = new Float32Array(plan.inputBytes / 4);
+                staged.set(data);
+                input = gpu.upload(staged);
+                output = gpu.createBuffer(plan.outputBytes);
+                log(`FFT of ${shape.join(' x ')} on ${gpu.adapterName || 'the GPU'} (float32, ${plan.route})`);
+                await plan.execute(input, output);
+                const bytes = await gpu.download(output);
+                return Float64Array.from(new Float32Array(bytes.buffer, bytes.byteOffset, data.length));
+            } finally {
+                if (input) input.free();
+                if (output) output.free();
+                plan.free();
+            }
+        };
+    }
+
+    // The extra volumes a recipe's combine steps name, on hkl grids.
+    function recipeExtras(recipe, params) {
+        const extras = {};
+        for (const step of recipe.steps) {
+            if (step.op !== 'combine' || extras[step.file]) continue;
+            const x = state.extras[step.file];
+            if (!x) continue;                 // the step reports the missing volume
+            try {
+                extras[step.file] = Converter.planConversion(x.grid ? { grid: x.grid } : { model: x.model },
+                    { format: 'unified', structure: state.struct, manual: params.manual }).model;
+            } catch (e) {
+                throw new Error(`volume "${step.file}": ${e.message}`);
+            }
+        }
+        return extras;
+    }
+
     function summarize(data) {
         if (data.model) {
             const m = data.model;
             return {
                 kind: data.kind, dims: m.dims, cellLengths: m.cellLengths, cellAngles: m.cellAngles,
-                axesType: m.axesType, legacyContract: !!m.legacyContract, notes: m.notes || [],
-                precision: m.values instanceof Float32Array ? 'float32' : 'float64',
+                axesType: m.axesType, content: m.content || null, legacyContract: !!m.legacyContract,
+                notes: m.notes || [], precision: m.values instanceof Float32Array ? 'float32' : 'float64',
             };
         }
         const g = data.grid;
@@ -158,11 +245,7 @@ function converterWorker(self, h5wasm, Converter) {
             const file = files[main];
             const opts = { size: file.size, tick: ctx.tick, progress: f => ctx.progress('Reading', f) };
             if (!hdf5[main]) {
-                const head = new TextDecoder().decode(await file.slice(0, 256).arrayBuffer());
-                const vtk = Converter.isVtk(head);
-                const grid = vtk ? await Converter.readVtkStream(file.stream(), opts)
-                    : await Converter.readOldDatStream(file.stream(), opts);
-                state.data = { kind: vtk ? (grid.frame === 'hkl' ? 'vtk-hkl' : 'vtk') : 'dat', grid };
+                state.data = await readTextVolume(file, opts);
                 return { result: Object.assign(summarize(state.data), { main: file.name }) };
             }
 
@@ -173,13 +256,9 @@ function converterWorker(self, h5wasm, Converter) {
             try {
                 const kind = Converter.detectH5Kind(f);
                 let model;
-                if (kind === 'yell') {
-                    model = await Converter.readYell(f, Object.assign({ space: yellSpace }, opts));
-                } else if (kind === 'unified') {
-                    model = await Converter.readUnifiedData(f, opts);
-                } else if (kind === 'mantid-md') {
-                    model = await Converter.readMantidMD(f, opts);
-                } else if (kind === 'nexus') {
+                if (kind !== 'nexus') {
+                    model = await readModel(f, kind, Object.assign({ space: yellSpace }, opts));
+                } else {
                     const candidates = Converter.nexusCandidates(f);
                     const path = candidates.some(c => c.path === nexusPath) ? nexusPath : candidates[0].path;
                     // Put the other selected files where the external links expect them.
@@ -200,11 +279,9 @@ function converterWorker(self, h5wasm, Converter) {
                             f = openAt('data/' + file.name);
                         }
                     }
-                    model = await Converter.readNexusData(f, Object.assign({ path }, opts));
+                    model = await readModel(f, kind, Object.assign({ path }, opts));
                     extra.candidates = candidates.map(c => ({ path: c.path, shape: c.shape, isDefault: c.isDefault }));
                     extra.nexusPath = path;
-                } else {
-                    throw new Error(Converter.unsupportedKindMessage(kind));
                 }
                 state.data = { kind, model };
             } finally {
@@ -240,18 +317,64 @@ function converterWorker(self, h5wasm, Converter) {
             return { result: parent };
         },
 
+        // Volumes for the recipe's combine steps, named by their file names.
+        // They are read whole and kept; Q-space text grids get their hkl
+        // axes from the parent cell when a recipe uses them.
+        async loadExtras({ files }, ctx) {
+            state.extras = {};
+            state.files.extras = (files || []).filter(Boolean);
+            mountFiles();
+            const out = [];
+            for (const [i, file] of state.files.extras.entries()) {
+                const opts = { size: file.size, tick: ctx.tick, progress: f => ctx.progress(`Reading ${file.name}`, f) };
+                let volume;
+                if (!(await isHdf5(file))) {
+                    volume = await readTextVolume(file, opts);
+                } else {
+                    const f = openAt(`extra/${i}/${file.name}`);
+                    try {
+                        const kind = Converter.detectH5Kind(f);
+                        const path = kind === 'nexus' ? Converter.nexusCandidates(f)[0].path : null;
+                        volume = { kind, model: await readModel(f, kind, Object.assign({ path }, opts)) };
+                    } finally {
+                        f.close();
+                    }
+                }
+                state.extras[file.name] = volume;
+                out.push(Object.assign({ name: file.name }, summarize(volume)));
+            }
+            return { result: out };
+        },
+
         // params: { format, radiation, manual, grid, customFrame, precision,
-        // layout, compression } - see Converter.planConversion.
-        async prepare(params) {
+        // layout, compression, recipe, profileWidth } - see
+        // Converter.planConversion and Processing.applyRecipe.
+        async prepare(params, ctx) {
             state.plan = null;
             if (!state.data) throw new Error('no data file loaded');
             const input = state.data.grid ? { grid: state.data.grid } : { model: state.data.model };
             const plan = Converter.planConversion(input, Object.assign({}, params, { structure: state.struct }));
-            state.plan = { plan, params };
+            for (const line of plan.logs) ctx.log(line);
+            let process = null;
+            if (params.recipe && params.recipe.steps && params.recipe.steps.length) {
+                const recipe = Processing.normalizeRecipe(params.recipe);
+                ctx.log(`Processing ${plan.model.dims.join(' x ')} voxels with ${recipe.steps.length} step(s):`);
+                plan.model = await Processing.applyRecipe(plan.model, recipe, {
+                    cell: plan.cell, extras: recipeExtras(recipe, params), fft: fftEngine(ctx.log),
+                    tick: ctx.tick, progress: f => ctx.progress('Processing', f), log: ctx.log,
+                });
+                Converter.checkWritable(plan.model, params.format);
+                process = {
+                    program: '3DSConvert', recipe,
+                    description: recipe.steps.map((s, n) => `${n + 1}. ${Processing.describeStep(s)}`).join('\n'),
+                };
+            }
+            state.plan = { plan, params, process };
             const text = params.format === 'dat' || params.format === 'vtk';
             return {
                 result: {
-                    logs: plan.logs, notes: plan.model.notes || [], dims: plan.model.dims,
+                    notes: plan.model.notes || [], dims: plan.model.dims,
+                    axesType: plan.model.axesType || 'hkl', processed: !!process,
                     cell: plan.cell, cellSource: plan.cellSource,
                     estimate: Converter.estimateOutputBytes(plan.model, params.format, params),
                     nonFinite: text ? Converter.countNonFinite(plan.model.values) : 0,
@@ -261,13 +384,13 @@ function converterWorker(self, h5wasm, Converter) {
 
         async write(_args, ctx) {
             if (!state.plan) throw new Error('nothing to write; prepare the conversion first');
-            const { plan, params } = state.plan;
+            const { plan, params, process } = state.plan;
             const progress = f => ctx.progress('Writing', f);
-            if (params.format === 'dat' || params.format === 'vtk') {
-                const chunks = params.format === 'dat'
-                    ? Converter.writeOldDatChunks(plan.model, plan.cell)
-                    : Converter.writeVtkChunks(plan.model, plan.cell);
-                const estimate = Converter.estimateOutputBytes(plan.model, params.format);
+            if (params.format === 'dat' || params.format === 'vtk' || params.format === 'profile') {
+                const chunks = params.format === 'dat' ? Converter.writeOldDatChunks(plan.model, plan.cell)
+                    : params.format === 'vtk' ? Converter.writeVtkChunks(plan.model, plan.cell)
+                    : Processing.writeProfileChunks(plan.model, plan.cell, params.profileWidth);
+                const estimate = Math.max(1, Converter.estimateOutputBytes(plan.model, params.format));
                 let written = 0;
                 for (const chunk of chunks) {
                     await ctx.emit(chunk);
@@ -286,7 +409,7 @@ function converterWorker(self, h5wasm, Converter) {
                     tick: ctx.tick, progress,
                 };
                 if (params.format === 'unified') {
-                    await Converter.writeUnifiedData(f, plan.model, plan.cell, {}, opts);
+                    await Converter.writeUnifiedData(f, plan.model, plan.cell, { process }, opts);
                 } else {
                     await Converter.writeYell(f, plan.model, plan.cell, opts);
                 }
