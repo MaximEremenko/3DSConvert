@@ -80,7 +80,21 @@ function vtkText(title, dims, origin, spacing, values) {
     ].join('\n') + '\n';
 }
 
+// wgpuFFT's cpuFft from the vendored js/wgpu_fft_web.js, as the page's
+// worker runs it for the CPU engine; the FFT for Processing's ctx.fft.
+let fftReady = null;
+async function cpuFft(shape, data, direction) {
+    if (!fftReady) {
+        const src = fs.readFileSync(path.join(ROOT, 'js', 'wgpu_fft_web.js'), 'utf8');
+        fftReady = new Function(src + '\nreturn wgpuFftWebModule();')().load();
+    }
+    const api = await fftReady;
+    return api.cpuFft(Uint32Array.from(shape), data,
+        direction === 'inverse' ? api.WebFftDirection.Inverse : api.WebFftDirection.Forward,
+        api.WebFftNormalization.None);
+}
+
 module.exports = {
     ROOT, Converter, loadH5wasm, buildH5, openH5, openH5Bytes, readText, maxAbsDiff, vtkText,
-    textBlob, fileBlob,
+    textBlob, fileBlob, cpuFft,
 };
