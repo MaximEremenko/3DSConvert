@@ -4,7 +4,8 @@
 
 A browser-based converter for 3-D single-crystal diffuse-scattering data.
 It translates the same intensity grid between the file formats used by
-RMCProfile, DISCUS, Yell, Meerkat, and Scatty — entirely client-side.
+RMCProfile, DISCUS, Yell, Meerkat, and Scatty, and reads reduced NeXus
+volumes from Mantid and NXrefine — entirely client-side.
 No installation, no server, and no upload: files never leave your computer.
 
 ## Supported formats
@@ -15,9 +16,11 @@ No installation, no server, and no upload: files never leave your computer.
 | Yell 1.0 (HDF5) | yes | yes | DISCUS, Yell, Meerkat |
 | RMCProfile old text format (`.dat`) | yes | yes | RMCProfile Diffuse3D |
 | VTK `STRUCTURED_POINTS` (`.vtk`) | yes | yes | Scatty, Spinteract, 3DSCalculator; also loads in ParaView |
+| NeXus: Mantid MDHistoWorkspace (`.nxs`) | yes | no | Mantid `SaveMD` (CORELLI, TOPAZ, WAND², DEMAND, SXD, ...) |
+| NeXus: NXdata (`.nxs`) | yes | no | NXrefine (APS 6-ID-D, CHESS QM2), other NeXus writers |
 
-Any format can be converted to any other. The input format is detected
-automatically from the file content.
+Any readable format can be converted to any writable one. The input format
+is detected automatically from the file content.
 
 ### Format notes
 
@@ -83,6 +86,30 @@ automatically from the file content.
   grid to be axis-aligned and ascending, because `STRUCTURED_POINTS` cannot
   express other grids; NaN or infinite values are written as 0, since legacy
   VTK readers do not parse NaN.
+- **Mantid MDHistoWorkspace** (`SaveMD` version 2): `data/signal` is read
+  with dimension `D0` as the grid abscissa. `D0`–`D2` hold bin edges, so the
+  grid points are the bin centres. Only workspaces in the HKL frame are
+  read; each dimension may be a projection, taken from the columns of
+  `experiment0/logs/W_MATRIX` (cross-checked against names like `[H,H,0]`),
+  which gives a sheared hkl grid. Masked bins and the infinite values left by
+  normalising with zero become NaN, as do bins without events; the log
+  reports how many. The cell comes from
+  `experiment0/sample/oriented_lattice`, and the radiation is set to
+  neutron. Q-frame and 4-D workspaces, MDEventWorkspaces, event
+  workspaces and raw instrument files are refused with an explanation.
+- **NeXus NXdata**: the group named by the `@default` attributes is read,
+  or another one chosen from the list that appears when a file holds
+  several. Signals and axes are found from the current (`@signal`, `@axes`,
+  `@AXISNAME_indices`) and legacy (`signal=1`, `axes="Qh:Qk:Ql"`)
+  attributes, in any array order. Axes named h/k/l (`Qh`, `H (r.l.u.)`,
+  ...) or projections like `[H,H,0]` give an hkl grid; `Qx`/`Qy`/`Qz` in
+  1/Angstrom give Cartesian Q, converted to hkl with the parent cell. Axes
+  may hold points or bin edges and must be evenly spaced. A `weights`
+  dataset divides the signal (zero weight becomes NaN). The cell, Laue
+  group, temperature and wavelength are read from the entry's sample and
+  monochromator groups when present. For NXrefine, whose data sit in
+  separate files behind external links, select those files together with
+  the main one: they are placed where the links expect them.
 - **HDF5 compression**: the browser HDF5 engine decodes gzip/deflate,
   shuffle, szip, fletcher32, n-bit and scale-offset. Datasets compressed
   with plugin filters (LZF, Blosc, LZ4, bitshuffle, Zstandard, ...) are
@@ -109,10 +136,12 @@ then browse to `http://localhost:8000/`.
 
 ## Usage
 
-1. **Data file**: select the diffuse data file (`.h5`, `.nx5`, `.dat`, or
-   `.vtk`). The format, grid size, and stored cell are reported in the log.
-   For a Scatty or Spinteract VTK whose grid axes are not along a*, b*, c*,
-   also load the program's config file as the grid config.
+1. **Data file**: select the diffuse data file (`.h5`, `.nxs`, `.nx5`,
+   `.dat`, or `.vtk`). The format, grid size, and stored cell are reported
+   in the log. For NeXus data kept in linked files, select all of them at
+   once; when a NeXus file holds several NXdata groups, pick one from the
+   list that appears. For a Scatty or Spinteract VTK whose grid axes are not
+   along a*, b*, c*, also load the program's config file as the grid config.
 2. **Unit cell**: some conversions need the parent (crystallographic) unit
    cell, because the text and VTK formats do not store one, and some Yell
    files store only the unit metric. Provide either
@@ -160,12 +189,15 @@ compression reduce it. Text output streamed to disk has no such limit.
 | Old text `.dat` | yes, always |
 | Q-space `.vtk` (Scatty, Spinteract) | yes, always |
 | r.l.u. `.vtk` (3DSCalculator, Scatty supercell) | yes (for `.dat`/`.vtk` output; passed through for HDF5 output) |
+| Mantid `.nxs` with an oriented lattice | no |
+| NeXus NXdata, hkl axes | no if the file stores a cell; otherwise as for unit metric |
+| NeXus NXdata, Cartesian Q axes | yes, unless the file stores a cell |
 
 ## Examples
 
 The `Examples/` folder contains one small synthetic dataset (cubic parent
 cell a = 5.63 Angstrom, 5 x 5 x 5 grid, hkl from -1 to 1 in steps of 0.5)
-written in every supported format, plus a matching structure file:
+written in every format the converter writes, plus a matching structure file:
 
 | File | Demonstrates |
 | --- | --- |
