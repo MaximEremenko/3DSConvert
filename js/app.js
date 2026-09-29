@@ -915,7 +915,8 @@
     maskRange: ['Mask a value range', [['min', 'num?', 'keep from'], ['max', 'num?', 'keep up to']]],
     maskQ: ['Mask a |Q| range', [['min', 'num?', 'keep from |Q| (Å⁻¹)'], ['max', 'num?', 'keep up to |Q| (Å⁻¹)']]],
     removeRings: ['Remove powder rings', [
-      ['materials', 'text', 'materials: aluminium, copper, vanadium, niobium, titanium, ice, … or fcc Al 4.05 · any: every sharp ring'],
+      ['materials', 'text', 'materials: aluminium, copper, vanadium, niobium, titanium, ice, ice-ic, … or fcc Al 4.05 · any: every sharp ring'],
+      ['temperature', 'num', 'temperature of the aluminium (K; 0 = room): its lattice parameter, and a check of the |Q| scale'],
       ['radiation', ['auto', 'xray', 'neutron', 'electron'], 'radiation for the line intensities (auto: the data’s)'],
       ['intensities', ['structure', 'free'], 'line intensities from the structure factors, or each line its own'],
       ['refine', 'num', 'refine the lattice parameter within ± (fraction, e.g. 0.01)'], ['fitWidth', 'bool', 'fit the line widths'],
@@ -923,7 +924,7 @@
       ['highPass', 'num', 'Fourier high-pass: broader than this many line widths is background'],
       ['sectors', 'num', 'direction sectors (1 = whole shells)'], ['coverage', 'num', 'judge only shells covered at least this much (0–1)'],
       ['cutoff', 'num', 'any: remove what is sharper in |Q| than (Å⁻¹)'], ['width', 'num', 'any: |Q| profile bin (Å⁻¹)'],
-      ['positive', 'bool', 'any: only excess intensity (rings add, never take away)']]],
+      ['positive', 'bool', 'only positive rings (off after an empty-can subtraction, which can leave negative ones)']]],
     backgroundDebyeWaller: ['Background: Laue + thermal (Debye–Waller)', [
       ['composition', 'text', 'sites, e.g. Pb; Mg 0.333 + Nb 0.667; 3*O'], ['uiso', 'text', 'Uiso (Å²): one value, or e.g. 0.01, Pb 0.03'],
       ['radiation', ['auto', 'xray', 'neutron', 'electron'], 'radiation (auto: the data’s)'],
@@ -982,7 +983,7 @@
     deltaPdf: { taper: 0, engine: 'cpu', fill: 0 },
     normalize: { background: '', backgroundNorm: '', scale: 1, fitScale: false, laue: 'none' },
     maskQ: { min: 0.3 },
-    removeRings: { materials: 'aluminium', radiation: 'auto', intensities: 'free', refine: 0.01, fitWidth: true, sigma0: 0.005,
+    removeRings: { materials: 'aluminium', temperature: 0, radiation: 'auto', intensities: 'free', refine: 0.01, fitWidth: true, sigma0: 0.005,
       resolution: 0.004, highPass: 6, sectors: 8, coverage: 0.25, cutoff: 0.05, width: 0.005, positive: true },
     backgroundDebyeWaller: { composition: '', uiso: '0.01', radiation: 'auto', fit: true, percentile: 5, width: 0.05, offset: false, scale: 1 },
     correctUB: { mode: 'refine', centring: 'P', radius: 0.25, snr: 10, peaks: 300, shift: false, ub: [], ubNew: [] },
@@ -993,7 +994,7 @@
       { op: 'symmetrize', laue: 'm-3m', mode: 'average', k: 3, expand: true },
       { op: 'maskBragg', shape: 'box', size: 0.2, centring: 'P' }, { op: 'deltaPdf', taper: 0, engine: 'cpu' }] },
     { name: 'Clean up a volume', note: 'despike · aluminium rings · symmetrize without outliers', steps: [
-      { op: 'despike', size: 1, k: 5 }, { op: 'removeRings', materials: 'aluminium', radiation: 'auto', intensities: 'free', refine: 0.01,
+      { op: 'despike', size: 1, k: 5 }, { op: 'removeRings', materials: 'aluminium', temperature: 0, radiation: 'auto', intensities: 'free', refine: 0.01,
         fitWidth: true, sigma0: 0.005, resolution: 0.004, highPass: 6, sectors: 8, coverage: 0.25, cutoff: 0.05, width: 0.005, positive: true },
       { op: 'symmetrize', laue: 'm-3m', mode: 'clip', k: 3, expand: true }] },
     { name: 'Subtract a background volume', note: 'load it under Other volumes', steps: [

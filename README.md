@@ -434,27 +434,49 @@ a file lists the steps in the log.
 **Powder rings.** For each material the lines come from its structure:
 every reflection's integrated intensity m\|F\|²·exp(−2W) (X-ray, neutron or
 electron form factors, a Debye–Waller B) spread over the sphere of its
-\|Q\|, so a line's strength in a reciprocal-space volume is Σ\|F\|²/(4πQ²).
-The data enter as a robust profile, the median of every \|Q\| bin (per
-direction sector too) with its uncertainty. The bins are equal in the
-coordinate u = asinh(rQ/σ₀)/r, in which a line of width
-σ(Q) = √(σ₀² + (rQ)²) is one unit wide everywhere: u follows \|Q\| where
-the width is constant (monochromatic area detectors) and ln\|Q\| where it
-grows in proportion (time of flight). The same Gaussian high-pass (six line
-widths by default) is taken off the profile and off the model, so a smooth
-background and broad diffuse features drop out of the fit. The line
-amplitudes then follow from non-negative, Huber-weighted least squares
-(each line with an intensity of its own by default, since texture and
-absorption change the ratios; or the structure-factor ratios), with
+\|Q\|, so a line's strength in a reciprocal-space volume is Σ\|F\|²/(4πQ²),
+with no Lorentz or polarization factor (for aluminium and neutrons the
+(111) : (200) : (220) : (311) : (222) lines come out 100 : 55 : 49 : 66 :
+20). The library holds sample-environment metals, ice Ih (H₂O, D₂O) and
+cubic ice, and calibrants, with lattice parameters from COD entries, NIST
+certificates and CODATA; aluminium can be given its temperature (NIST's
+expansion fit for 6061-T6), and then the fitted lattice parameter checks
+the data's \|Q\| scale, the sample cell.
+
+The data enter as a robust profile, the median of every \|Q\| bin, with its
+uncertainty 1.2533 × 1.4826 × MAD/√n, over whole shells and over direction
+sectors (8 by default). The bins are equal in the coordinate
+u = asinh(rQ/σ₀)/r, in which a line of width σ(Q) = √(σ₀² + (rQ)²) is one
+unit wide everywhere: u follows \|Q\| where the width is constant
+(monochromatic area detectors) and ln\|Q\| where it grows in proportion
+(time of flight). The same Gaussian high-pass (six line widths by default)
+is taken off the profile and off the model, so a smooth background and
+broad diffuse features drop out of the fit; applying it to the model too
+keeps the amplitudes unbiased. The amplitudes follow from non-negative (or,
+after an empty-can subtraction, signed) Huber-weighted least squares, with
 one-dimensional searches for each lattice parameter (±1 % by default) and a
-joint search for σ₀ and r; the profile is rebuilt for the fitted widths
-when they end at a bound. Amplitudes under three standard errors are
-dropped, and a material whose lines explain under 2 % of the high-passed
-profile, or whose fit shows no clear lattice match, is left out and
-logged. With direction sectors (8 by default) the amplitudes are fitted
-again per sector, for rings whose strength changes around the sphere. On a
-CORELLI volume in an aluminium can the method finds a = 4.0491 Å for the
-aluminium and removes 96–104 % of the (111), (200) and (220) ring excess.
+joint search for σ₀ and r; the profile is rebuilt for the fitted widths when
+they end at a bound. By default every line has an intensity of its own
+where it is significant (texture and absorption change the ratios) and a
+weak one keeps the structure-factor ratio. A material is left out, and
+logged, when its lines explain under 2 % of the high-passed profile, show
+no clear lattice match or give fewer than two significant lines. A sector
+fits its own amplitudes when they beat one scale on the whole-shell lines
+by more than their number (Akaike's criterion); the subtraction blends the
+sectors smoothly by direction, so no seams are left. On a CORELLI volume in
+an aluminium can, the fit gives a = 4.0491 Å (0.012 % from aluminium at
+300 K) and removes 95–105 % of the (111), (200) and (220) ring excess.
+
+Recommended order: subtract an empty-can measurement if there is one, then
+remove the remaining rings, then treat the Bragg peaks (mask, punch and
+fill) and compute the 3D-ΔPDF. `any` instead removes every ring sharper
+than a cutoff, for phases that are not in the library.
+
+The method takes the angular low-pass of ring filters for images (rings
+have no angular frequency: Münch et al., Opt. Express 17, 8567 (2009);
+the azimuthal medians of DIALS, Parkhurst et al., IUCrJ 4, 626 (2017), and
+of pyFAI) into three dimensions, and fits the lines as ice-ring tools and
+Le Bail fits do (AUSPEX, Thorn et al., Acta Cryst. D73, 729 (2017)).
 
 **3D-ΔPDF.** The step computes P(r) = |det V| Σ I(q) exp(2πi q·r) over all
 grid points q, where the columns of V are the grid steps, so P approximates

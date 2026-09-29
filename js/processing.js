@@ -291,7 +291,8 @@
         clip: { below: 0, to: 0 },
         symmetrize: { mode: 'average', expand: true, k: 3 },
         removeRings: {
-            materials: 'aluminium', radiation: 'auto', intensities: 'free', refine: 0.01, fitWidth: true, sigma0: 0.005, resolution: 0.004,
+            materials: 'aluminium', temperature: 0, radiation: 'auto', intensities: 'free', refine: 0.01, fitWidth: true, sigma0: 0.005,
+            resolution: 0.004,
             width: 0.005, cutoff: 0.05, highPass: 6, sectors: 8, coverage: 0.25, positive: true,
         },
         backgroundDebyeWaller: { radiation: 'auto', uiso: '0.01', fit: true, scale: 1, offset: false, percentile: 5, width: 0.05 },
@@ -831,43 +832,53 @@
     // type, elements, lattice parameters (A; room temperature unless noted)
     // and an isotropic Debye-Waller B (A^2).
     const MATERIALS = {
-        aluminium: { type: 'fcc', el: ['Al'], a: 4.0495, B: 0.85 },
-        copper: { type: 'fcc', el: ['Cu'], a: 3.6149, B: 0.55 },
-        nickel: { type: 'fcc', el: ['Ni'], a: 3.524, B: 0.37 },
-        silver: { type: 'fcc', el: ['Ag'], a: 4.0853, B: 0.72 },
-        gold: { type: 'fcc', el: ['Au'], a: 4.0782, B: 0.6 },
-        platinum: { type: 'fcc', el: ['Pt'], a: 3.9242, B: 0.32 },
-        lead: { type: 'fcc', el: ['Pb'], a: 4.9508, B: 2.0 },
-        vanadium: { type: 'bcc', el: ['V'], a: 3.024, B: 0.55 },
-        niobium: { type: 'bcc', el: ['Nb'], a: 3.3004, B: 0.45 },
+        aluminium: { type: 'fcc', el: ['Al'], a: 4.0496, B: 0.86 },
+        copper: { type: 'fcc', el: ['Cu'], a: 3.615, B: 0.54 },
+        nickel: { type: 'fcc', el: ['Ni'], a: 3.5239, B: 0.4 },
+        silver: { type: 'fcc', el: ['Ag'], a: 4.0862, B: 0.69 },
+        gold: { type: 'fcc', el: ['Au'], a: 4.0782, B: 0.63 },
+        platinum: { type: 'fcc', el: ['Pt'], a: 3.9231, B: 0.32 },
+        lead: { type: 'fcc', el: ['Pb'], a: 4.95, B: 2.1 },
+        vanadium: { type: 'bcc', el: ['V'], a: 3.0241, B: 0.48 },
+        niobium: { type: 'bcc', el: ['Nb'], a: 3.3004, B: 0.49 },
         iron: { type: 'bcc', el: ['Fe'], a: 2.8665, B: 0.35 },
         chromium: { type: 'bcc', el: ['Cr'], a: 2.8846, B: 0.25 },
-        molybdenum: { type: 'bcc', el: ['Mo'], a: 3.147, B: 0.24 },
-        tantalum: { type: 'bcc', el: ['Ta'], a: 3.3013, B: 0.3 },
-        tungsten: { type: 'bcc', el: ['W'], a: 3.1652, B: 0.16 },
-        titanium: { type: 'hcp', el: ['Ti'], a: 2.9508, c: 4.6855, B: 0.6 },
-        zirconium: { type: 'hcp', el: ['Zr'], a: 3.2316, c: 5.1475, B: 0.5 },
-        beryllium: { type: 'hcp', el: ['Be'], a: 2.2858, c: 3.5843, B: 0.4 },
-        magnesium: { type: 'hcp', el: ['Mg'], a: 3.2094, c: 5.2108, B: 1.0 },
-        silicon: { type: 'diamond', el: ['Si'], a: 5.431, B: 0.47 },
-        germanium: { type: 'diamond', el: ['Ge'], a: 5.6579, B: 0.55 },
-        graphite: { type: 'graphite', el: ['C'], a: 2.4612, c: 6.7079, B: 0.6 },
-        ice: { type: 'iceIh', el: ['O', 'H'], a: 4.497, c: 7.322, B: 1.0 },
-        'ice-d2o': { type: 'iceIh', el: ['O', 'D'], a: 4.497, c: 7.322, B: 1.0 },
-        nacl: { type: 'rocksalt', el: ['Na', 'Cl'], a: 5.6402, B: 1.6 },
+        molybdenum: { type: 'bcc', el: ['Mo'], a: 3.1473, B: 0.26 },
+        tantalum: { type: 'bcc', el: ['Ta'], a: 3.3026, B: 0.33 },
+        tungsten: { type: 'bcc', el: ['W'], a: 3.1648, B: 0.19 },
+        titanium: { type: 'hcp', el: ['Ti'], a: 2.9511, c: 4.6843, B: 0.5 },
+        zirconium: { type: 'hcp', el: ['Zr'], a: 3.232, c: 5.147, B: 0.6 },
+        beryllium: { type: 'hcp', el: ['Be'], a: 2.2858, c: 3.5843, B: 0.48 },
+        magnesium: { type: 'hcp', el: ['Mg'], a: 3.2093, c: 5.2103, B: 1.3 },
+        silicon: { type: 'diamond', el: ['Si'], a: 5.431020511, B: 0.45 },
+        germanium: { type: 'diamond', el: ['Ge'], a: 5.65735, B: 0.57 },
+        graphite: { type: 'graphite', el: ['C'], a: 2.464, c: 6.711, B: 0.6 },
+        ice: { type: 'iceIh', el: ['O', 'H'], a: 4.4976, c: 7.322, B: 1.0 },
+        'ice-d2o': { type: 'iceIh', el: ['O', 'D'], a: 4.4976, c: 7.322, B: 1.0 },
+        'ice-ic': { type: 'iceIc', el: ['O', 'H'], a: 6.355, B: 1.0 },
+        nacl: { type: 'rocksalt', el: ['Na', 'Cl'], a: 5.6406, B: 1.4 },
         mgo: { type: 'rocksalt', el: ['Mg', 'O'], a: 4.2112, B: 0.3 },
-        caf2: { type: 'fluorite', el: ['Ca', 'F'], a: 5.4626, B: 0.5 },
-        ceo2: { type: 'fluorite', el: ['Ce', 'O'], a: 5.4116, B: 0.4 },
-        lab6: { type: 'lab6', el: ['La', 'B'], a: 4.15683, B: 0.3 },
+        caf2: { type: 'fluorite', el: ['Ca', 'F'], a: 5.463, B: 0.6 },
+        ceo2: { type: 'fluorite', el: ['Ce', 'O'], a: 5.41153, B: 0.4 },
+        lab6: { type: 'lab6', el: ['La', 'B'], a: 4.156826, B: 0.7 },
     };
     const MATERIAL_ALIASES = {
         al: 'aluminium', aluminum: 'aluminium', cu: 'copper', ni: 'nickel', ag: 'silver', au: 'gold', pt: 'platinum', pb: 'lead',
         v: 'vanadium', nb: 'niobium', fe: 'iron', cr: 'chromium', mo: 'molybdenum', ta: 'tantalum', w: 'tungsten',
         ti: 'titanium', zr: 'zirconium', be: 'beryllium', mg: 'magnesium', si: 'silicon', ge: 'germanium', c: 'graphite',
-        h2o: 'ice', 'ice-h2o': 'ice', d2o: 'ice-d2o',
+        h2o: 'ice', 'ice-h2o': 'ice', d2o: 'ice-d2o', 'ice-ih': 'ice', 'cubic-ice': 'ice-ic',
     };
     const STRUCTURE_TYPES = ['sc', 'fcc', 'bcc', 'diamond', 'hcp', 'rocksalt', 'fluorite'];
     const HEXAGONAL_TYPES = new Set(['hcp', 'graphite', 'iceIh']);
+
+    // Aluminium below room temperature: the linear expansion from 293 K of
+    // NIST's fit for 6061-T6 (dL/L x 10^5 = -412.77 - 0.30389 T +
+    // 8.7696e-3 T^2 - 9.9821e-6 T^3 above 18 K; -415.45 below).
+    function aluminiumAt(a293, T) {
+        if (!(T > 0) || T >= 293) return a293;
+        const d = T < 18 ? -415.45 : -412.77 - 0.30389 * T + 8.7696e-3 * T * T - 9.9821e-6 * T * T * T;
+        return a293 * (1 + d * 1e-5);
+    }
 
     // "aluminium, ice": materials by name (an alias such as Al, or a name
     // then new lattice parameters: "aluminium 4.032"), or by structure type,
@@ -919,14 +930,19 @@
             case 'fluorite': return at(A, FCC).concat(at(B, shift(FCC, [0.25, 0.25, 0.25]).concat(shift(FCC, [0.75, 0.75, 0.75]))));
             case 'graphite': return at(A, [[0, 0, 0.25], [0, 0, 0.75], [1 / 3, 2 / 3, 0.25], [2 / 3, 1 / 3, 0.75]]);
             case 'lab6': {
-                const x = 0.1996;
+                const x = 0.2021;
                 return at(A, [[0, 0, 0]]).concat(at(B, [[x, 0.5, 0.5], [1 - x, 0.5, 0.5], [0.5, x, 0.5], [0.5, 1 - x, 0.5], [0.5, 0.5, x], [0.5, 0.5, 1 - x]]));
             }
-            case 'iceIh': {
-                // O on 4f (z = 1/16, ideal tetrahedra) of P63/mmc; half an H
-                // (or D) 1.0 A from each O along each of its four O-O bonds
-                const z = 0.0625, O = [[1 / 3, 2 / 3, z], [2 / 3, 1 / 3, z + 0.5], [2 / 3, 1 / 3, -z], [1 / 3, 2 / 3, 0.5 - z]];
-                const L = Converter.cellToLattice([m.a, m.a, m.c], [90, 90, 120]), toCart = f => mulMV(L, f), Li = invert3(L);
+            case 'iceIh':
+            case 'iceIc': {
+                // O on 4f (z = 0.0618) of P63/mmc, or on the diamond sites
+                // of Fd-3m; half an H (or D) 1.0 A from each O along each of
+                // its four O-O bonds
+                const z = 0.0618, hex = m.type === 'iceIh';
+                const O = hex ? [[1 / 3, 2 / 3, z], [2 / 3, 1 / 3, z + 0.5], [2 / 3, 1 / 3, -z], [1 / 3, 2 / 3, 0.5 - z]]
+                    : FCC.concat(shift(FCC, [0.25, 0.25, 0.25]));
+                const L = hex ? Converter.cellToLattice([m.a, m.a, m.c], [90, 90, 120]) : Converter.cellToLattice([m.a, m.a, m.a], [90, 90, 90]);
+                const toCart = f => mulMV(L, f), Li = invert3(L);
                 const H = [];
                 for (const p of O) {
                     for (const q of O) for (let i = -1; i <= 1; i++) for (let j = -1; j <= 1; j++) for (let k = -1; k <= 1; k++) {
@@ -994,7 +1010,7 @@
     // stay out; a tiny ridge keeps nearly equal columns solvable. Returns
     // { x, M, idx }: the coefficients, and the normal matrix of the columns
     // kept.
-    function nonNegative(cols, y, wt, keep) {
+    function nonNegative(cols, y, wt, keep, signed) {
         const n = cols.length, x = new Array(n).fill(0);
         const dotw = (u, v) => { let s = 0; for (let b = 0; b < y.length; b++) if (wt[b]) s += wt[b] * u[b] * v[b]; return s; };
         const norms = cols.map(c => dotw(c, c)), top = Math.max(0, ...norms);
@@ -1007,7 +1023,7 @@
             if (!sol) return { x: x.fill(0), M: null, idx: [] };
             x.fill(0);
             idx.forEach((i, k) => { x[i] = sol[k]; });
-            const neg = idx.filter(i => !(x[i] >= 0));
+            const neg = idx.filter(i => !(signed ? Number.isFinite(x[i]) : x[i] >= 0));
             if (!neg.length) return { x, M, idx };
             for (const i of neg) active[i] = false;
         }
@@ -1032,7 +1048,10 @@
             unknown = true;
         }
         const { nb, nsec } = rp, qmax = rp.centre(nb);
-        const mats = parseMaterials(step.materials).map(m => Object.assign(m, { lines: materialLines(m, radiation, qmax * 1.05) }));
+        const mats = parseMaterials(step.materials).map(m => {
+            if (m.name === 'aluminium' && step.temperature > 0) m.a = aluminiumAt(m.a, step.temperature);
+            return Object.assign(m, { lines: materialLines(m, radiation, qmax * 1.05) });
+        });
         const centres = Float64Array.from({ length: nb }, (_, b) => rp.centre(b));
         // in the profile's coordinate every line is one width wide: the
         // high-pass takes off what is broader than `highPass` line widths
@@ -1090,8 +1109,9 @@
             const hp = cols.map(highPass);
             const resid = x => Float64Array.from(y, (yb, b) => (base[b] ? (yb - hp.reduce((s, c, i) => s + x[i] * c[b], 0)) * Math.sqrt(base[b]) : NaN));
             let wt = base, fit = null, z = null;
+            const signed = !step.positive;
             for (let it = 0; it < 3; it++) {
-                fit = nonNegative(hp, y, wt);
+                fit = nonNegative(hp, y, wt, null, signed);
                 // Huber reweighting of the standardized residuals: what the
                 // lines cannot explain (diffuse leakage) counts less, but
                 // nothing is dropped
@@ -1116,10 +1136,10 @@
                     e[k] = 1;
                     const col = solveSmall(fit.M, e);
                     const se = col ? Math.sqrt(Math.max(0, col[k] * s2)) : Infinity;
-                    keep[i] = x[i] > 3 * se;
+                    keep[i] = Math.abs(x[i]) > 3 * se;
                 });
-                if (keep.some((k, i) => !k && x[i] > 0)) {
-                    x = nonNegative(hp, y, wt, keep).x;
+                if (keep.some((k, i) => !k && x[i] !== 0)) {
+                    x = nonNegative(hp, y, wt, keep, signed).x;
                     z = resid(x);
                 }
             }
@@ -1130,7 +1150,25 @@
                 loss += huber(z[b]);
                 before += huber(y[b] * Math.sqrt(base[b]));
             }
-            return { x, owner, loss, before };
+            let judged = 0;
+            for (let b = 0; b < nb; b++) if (base[b]) judged++;
+            return { x, owner, loss, before, judged };
+        };
+        // one scale for the whole-shell lines in a profile (a sector), and
+        // its loss
+        const sectorShare = (prof, x, lambdas, s0, r, free, skip) => {
+            const f = fitProfile(prof, lambdas, s0, r, free, false, skip);
+            if (!f) return { t: 1, loss: Infinity };
+            const pre = prepared.get(prof), { cols } = columns(lambdas, s0, r, free, skip);
+            const sum = highPass(Float64Array.from(centres, (_, b) => cols.reduce((acc, c, i) => acc + x[i] * c[b], 0)));
+            const t = nonNegative([sum], pre.y, pre.base).x[0] || 0;
+            let loss = 0;
+            for (let b = 0; b < nb; b++) {
+                if (!pre.base[b]) continue;
+                const z = (pre.y[b] - t * sum[b]) * Math.sqrt(pre.base[b]);
+                loss += Math.abs(z) <= pre.c ? z * z : 2 * pre.c * Math.abs(z) - pre.c * pre.c;
+            }
+            return { t: t > 0 ? t : 1, loss };
         };
         const whole = rp.profile(-1);
         let lambdas = mats.map(() => 1), s0 = rp.s0init, r = step.resolution;
@@ -1202,19 +1240,52 @@
         mats.forEach((m, k) => {
             const without = fitProfile(whole, lambdas, s0, r, free, true, new Set([k]));
             const share = fit.before > 0 && without ? (without.loss - fit.loss) / fit.before : 0;
-            if (share < 0.02 || (step.refine > 0 && match[k] < 0.15)) {
+            const lines = fit.owner.filter(([owner], i) => owner === k && fit.x[i] !== 0).length;
+            if (share < 0.02 || (step.refine > 0 && match[k] < 0.15) || (free && lines < 2)) {
                 skip.add(k);
                 ctx.log(`${m.name}: no clear lines (they explain ${Math.round(100 * Math.max(0, share))} % of the profile` +
-                    (step.refine > 0 ? `, the lattice parameter is ${Math.round(100 * match[k])} % better than elsewhere` : '') + '); left out');
+                    (step.refine > 0 ? `, the lattice parameter is ${Math.round(100 * match[k])} % better than elsewhere` : '') +
+                    (free ? `, ${lines} significant` : '') + '); left out');
             }
         });
         if (skip.size) fit = fitProfile(whole, lambdas, s0, r, free, true, skip);
+        // lines of their own intensity keep it where it is significant; a
+        // weak line takes what the structure factors give it at the scale
+        // the material has in the same profile
+        const fillWeak = (f, prof) => {
+            if (!free || !f) return f;
+            const g = fitProfile(prof, lambdas, s0, r, false, true, skip);
+            if (!g) return f;
+            const scale = k => {
+                const i = g.owner.findIndex(([owner]) => owner === k);
+                return i >= 0 ? g.x[i] : 0;
+            };
+            return Object.assign({}, f, { x: f.x.map((x, i) => (x !== 0 ? x : scale(f.owner[i][0]))) });
+        };
+        fit = fillWeak(fit, whole);
         // scales of every column, per sector when asked
         const sectorScale = [];
+        let shared = 0;
         for (let s = 0; s < nsec; s++) {
-            const f = nsec > 1 ? fitProfile(rp.profile(s), lambdas, s0, r, free, true, skip) : fit;
-            sectorScale.push(f && f.x.some(t => t > 0) ? f.x : fit.x);
+            if (nsec === 1) {
+                sectorScale.push(fit.x);
+                continue;
+            }
+            const prof = rp.profile(s);
+            const f = fillWeak(fitProfile(prof, lambdas, s0, r, free, true, skip), prof);
+            const one = sectorShare(prof, fit.x, lambdas, s0, r, free, skip);
+            // lines of the sector's own only when they fit better than one
+            // scale by more than their number (Akaike's criterion); else the
+            // whole-shell lines with one texture factor
+            const own = f ? f.x.filter(t => t !== 0).length : 0;
+            if (f && f.judged >= 30 && own > 0 && one.loss - f.loss > 2 * (own - 1)) {
+                sectorScale.push(f.x);
+                continue;
+            }
+            shared++;
+            sectorScale.push(fit.x.map(x => x * one.t));
         }
+        if (shared) ctx.log(`${shared} of ${nsec} direction sectors take the whole-shell lines with a scale of their own`);
         const gain = fit.before > 0 ? 1 - fit.loss / fit.before : 0;
         mats.forEach((m, k) => {
             if (skip.has(k)) return;
@@ -1224,6 +1295,12 @@
             ctx.log(`${m.name}: ${HEXAGONAL_TYPES.has(m.type) ? `a = ${(m.a * lambdas[k]).toFixed(4)}, c = ${(m.c * lambdas[k]).toFixed(4)}`
                 : `a = ${(m.a * lambdas[k]).toFixed(4)}`} A (${((lambdas[k] - 1) * 100).toFixed(2)} %), ` +
                 `${m.lines.length} lines to |Q| ${qmax.toFixed(1)} 1/A, scale ${scale.toPrecision(3)}; strongest ${strongest}`);
+        });
+        mats.forEach((m, k) => {
+            if (skip.has(k) || m.name !== 'aluminium' || !(step.temperature > 0)) return;
+            ctx.log(`aluminium at ${step.temperature} K should have a = ${m.a.toFixed(4)} A; the fit differs by ` +
+                `${((lambdas[k] - 1) * 100).toFixed(3)} %, which, with the can at that temperature, is the error of the data's |Q| scale ` +
+                '(the sample cell)');
         });
         ctx.log(`ring width sigma = sqrt(${s0.toPrecision(3)}^2 + (${r.toPrecision(3)} Q)^2) 1/A; ` +
             `the rings account for ${Math.round(100 * gain)} % of the high-passed |Q| profile` +
@@ -1238,9 +1315,24 @@
         const curves = fit.owner.map(([k, lines]) => lineCurve(lines, lambdas[k], s0, r));
         const colTables = curves.map(f => Float64Array.from({ length: nf }, (_, i) => f(i * fine)));
         const tables = sectorScale.map(x => Float64Array.from({ length: nf }, (_, i) => colTables.reduce((sum, t, c) => sum + x[c] * t[i], 0)));
-        const ring = j => {
-            const q = rp.qs[j] / fine, i0 = Math.min(nf - 2, Math.floor(q)), t = q - i0, table = tables[rp.sec ? rp.sec[j] : 0];
+        const at = (table, q) => {
+            const f = q / fine, i0 = Math.min(nf - 2, Math.floor(f)), t = f - i0;
             return (1 - t) * table[i0] + t * table[i0 + 1];
+        };
+        // between sectors the tables are blended with weights exp(kappa
+        // cos angle) to the sector centres, so no seams are left
+        const dirs = nsec > 1 ? sphereDirections(nsec) : null;
+        const kappa = nsec > 1 ? 2 / (1 - Math.cos(Math.sqrt(4 * Math.PI / nsec))) : 0;
+        const ring = (j, n) => {
+            const q = rp.qs[j];
+            if (!dirs || !n) return at(tables[0], q);
+            let sum = 0, wsum = 0;
+            for (let d = 0; d < nsec; d++) {
+                const wd = Math.exp(kappa * (dirs[d][0] * n[0] + dirs[d][1] * n[1] + dirs[d][2] * n[2] - 1));
+                sum += wd * at(tables[d], q);
+                wsum += wd;
+            }
+            return sum / wsum;
         };
         return { ring, s0, r, atLimit };
     }
@@ -1296,7 +1388,23 @@
                 r0 = result.r;
             }
             logs.forEach(t => ctx.log(t));
-            for (let j = 0; j < N; j++) if (values[j] === values[j]) values[j] -= result.ring(j);
+            // the direction of every voxel, for the blend between sectors
+            const Qm = qMatrix(ctx.cell), q0 = mulMV(Qm, model.corner), [qa, qb, qc] = model.vectors.map(u => mulMV(Qm, u));
+            const [nh, nk, nl] = model.dims, n = [0, 0, 0];
+            let j = 0;
+            for (let il = 0; il < nl; il++)
+                for (let ik = 0; ik < nk; ik++)
+                    for (let ih = 0; ih < nh; ih++, j++) {
+                        if (values[j] !== values[j]) continue;
+                        const x = q0[0] + ih * qa[0] + ik * qb[0] + il * qc[0];
+                        const y = q0[1] + ih * qa[1] + ik * qb[1] + il * qc[1];
+                        const z = q0[2] + ih * qa[2] + ik * qb[2] + il * qc[2];
+                        const q = Math.sqrt(x * x + y * y + z * z);
+                        n[0] = x / q;
+                        n[1] = y / q;
+                        n[2] = z / q;
+                        values[j] -= result.ring(j, q > 0 ? n : null);
+                    }
         }
         return withValues(model, values);
     }
@@ -2603,7 +2711,7 @@ D|0.413048 0.294953 0.187491 0.080701 0.023736 15.56995 32.39847 5.711404 61.889
         removeRings: {
             run: stepRemoveRings,
             fields: {
-                materials: 'any', radiation: 'radiation', intensities: 'ringIntensities', refine: 'fraction', fitWidth: 'boolean',
+                materials: 'any', temperature: 'nonnegative', radiation: 'radiation', intensities: 'ringIntensities', refine: 'fraction', fitWidth: 'boolean',
                 sigma0: 'nonnegative', resolution: 'nonnegative', width: 'positive', cutoff: 'positive', highPass: 'positive', sectors: 'sectors', coverage: 'fraction',
                 positive: 'boolean',
             },
@@ -2714,7 +2822,8 @@ D|0.413048 0.294953 0.187491 0.080701 0.023736 15.56995 32.39847 5.711404 61.889
             case 'removeRings': return String(step.materials).trim().toLowerCase() === 'any'
                 ? `remove any ring sharper than ${step.cutoff} 1/A by Fourier filtering of the |Q| profile ` +
                   `(bins of ${step.width} 1/A${step.sectors > 1 ? `, ${step.sectors} direction sectors` : ''})`
-                : `remove the powder rings of ${step.materials}: lines from the structure, fitted to the |Q| profile ` +
+                : `remove the powder rings of ${step.materials}${step.temperature > 0 ? ` (aluminium at ${step.temperature} K)` : ''}: ` +
+                  'lines from the structure, fitted to the |Q| profile ' +
                   `high-passed at ${step.highPass} line widths (${step.intensities === 'free' ? 'free' : 'structure-factor'} intensities` +
                   `${step.refine > 0 ? `, lattice within ${+(100 * step.refine).toFixed(2)} %` : ''}${step.fitWidth ? ', widths fitted' : ''}` +
                   `${step.sectors > 1 ? `, ${step.sectors} direction sectors` : ''})`;

@@ -541,6 +541,12 @@ test('removeRings of materials: aluminium lines from the structure, fitted and t
     // each line an intensity of its own does the same
     const free = await Processing.applyRecipe(data, { steps: [{ op: 'removeRings', materials: 'Al', intensities: 'free' }] }, { cell });
     assert.ok(near(free) < 0.08 * near(data));
+    // aluminium near 5 K is 0.42 % smaller: the fit then reports how far the |Q| scale is off
+    const cold = [];
+    await Processing.applyRecipe(data, { steps: [{ op: 'removeRings', materials: 'aluminium', temperature: 5 }] },
+        { cell, log: t => cold.push(t) });
+    const check = /aluminium at 5 K should have a = (4\.03\d+) A; the fit differs by ([\d.]+) %/.exec(cold.join(' '));
+    assert.ok(check && Math.abs(Number(check[2]) - 100 * (aAl / Number(check[1]) - 1)) < 0.05, cold.join('\n'));
     // a custom material, and unknown ones refused
     assert.equal(Processing.normalizeRecipe({ steps: [{ op: 'removeRings', materials: 'hcp Ti 2.95 4.69, aluminium 4.03' }] }).steps.length, 1);
     assert.throws(() => Processing.normalizeRecipe({ steps: [{ op: 'removeRings', materials: 'unobtainium' }] }), /unknown "unobtainium"/);
