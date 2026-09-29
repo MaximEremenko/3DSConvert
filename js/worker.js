@@ -269,14 +269,18 @@ function converterWorker(self, h5wasm, Converter, Processing, wgpuFftWeb) {
         return { dims: g.dims, values: g.values, corner: g.origin, vectors, names };
     }
 
-    // The plane of the grid with grid axis `normal` fixed at `index`, as
-    // float32 rows from the top (the second in-plane axis increases upwards).
-    function slicePlane(geo, normal, index) {
+    // The plane of the grid with grid axis `normal` fixed at `index` (or at
+    // the plane nearest the coordinate `coord` along it), as float32 rows from
+    // the top (the second in-plane axis increases upwards).
+    function slicePlane(geo, normal, index, coord) {
         const [nh, nk, nl] = geo.dims;
         const [ax, ay] = [0, 1, 2].filter(a => a !== normal);
         const w = geo.dims[ax], h = geo.dims[ay];
         let i0;
-        if (index === null || index === undefined) {
+        const nv = geo.vectors[normal].map(Math.abs), nc = nv.indexOf(Math.max(...nv));
+        if (Number.isFinite(coord) && geo.vectors[normal][nc]) {
+            i0 = Math.max(0, Math.min(geo.dims[normal] - 1, Math.round((coord - geo.corner[nc]) / geo.vectors[normal][nc])));
+        } else if (index === null || index === undefined) {
             // The plane through 0 along the normal, else the middle one.
             const v = geo.vectors[normal].map(Math.abs), c = v.indexOf(Math.max(...v));
             const k = geo.vectors[normal][c] ? Math.round(-geo.corner[c] / geo.vectors[normal][c]) : 0;
@@ -444,10 +448,10 @@ function converterWorker(self, h5wasm, Converter, Processing, wgpuFftWeb) {
 
         // A plane of the loaded data ('input') or of the last previewRecipe
         // result ('processed'); see slicePlane.
-        async slice({ stage, normal, index }) {
+        async slice({ stage, normal, index, at }) {
             const source = stage === 'processed' ? state.processed && { model: state.processed.plan.model } : state.data;
             if (!source) throw new Error(stage === 'processed' ? 'no processed preview yet' : 'no data file loaded');
-            const plane = slicePlane(geometryOf(source), normal, index);
+            const plane = slicePlane(geometryOf(source), normal, index, at);
             return { result: plane, transfer: [plane.values.buffer] };
         },
 

@@ -1096,6 +1096,7 @@
   const DIVERGING = [[33, 64, 154], [67, 118, 190], [140, 180, 222], [246, 246, 244], [243, 179, 104], [218, 123, 34], [160, 72, 6]];
   const preview = {
     view: 'slice', stage: 'input', normal: 2, index: null, plane: null, profile: null, hover: -1,
+    point: null, names: null, cursor: null,
     ready: false, stale: false, seq: 0, timer: 0, ptimer: 0,
   };
 
@@ -1114,6 +1115,10 @@
     preview.index = null;
     preview.normal = s ? (s.dims.indexOf(1) >= 0 ? s.dims.indexOf(1) : 2) : 2;
     preview.profile = null;
+    preview.point = null;
+    preview.names = null;
+    preview.cursor = null;
+    $('sliceMark').hidden = true;
     $('previewEmpty').hidden = !!s;
     showView();
     $('previewSub').textContent = '';
@@ -1147,10 +1152,14 @@
     if (!state.data || current) return;
     const token = ++preview.seq;
     try {
-      const plane = await client.call('slice', { stage: preview.stage, normal: preview.normal, index: preview.index }).promise;
+      const at = preview.index === null && preview.point && preview.names ? preview.point[preview.names[preview.normal]] : undefined;
+      const plane = await client.call('slice', { stage: preview.stage, normal: preview.normal, index: preview.index, at }).promise;
       if (token !== preview.seq) return;
       preview.plane = plane;
       preview.index = plane.normal.index;
+      preview.names = [0, 1, 2].map(a => (a === preview.normal ? plane.normal.name
+        : a === [0, 1, 2].filter(b => b !== preview.normal)[0] ? plane.x.name : plane.y.name));
+      preview.cursor = null;
       const slider = $('sliceIndex');
       slider.max = String(plane.normal.n - 1);
       slider.value = String(plane.normal.index);
@@ -1164,9 +1173,51 @@
         $('previewSub').textContent = preview.stage === 'processed' ? 'after the recipe' : 'as read';
       }
       drawSlice();
+      placeMark();
     } catch (e) {
       if (token === preview.seq) $('previewSub').textContent = 'no preview: ' + e.message;
     }
+  }
+
+  // Grid coordinate of pixel i along a plane axis.
+  const coordOf = (axis, i) => (axis.n > 1 ? axis.from + i * (axis.to - axis.from) / (axis.n - 1) : axis.from);
+  const indexOf = (axis, x) => (axis.n > 1 && axis.to !== axis.from ? Math.round((x - axis.from) / (axis.to - axis.from) * (axis.n - 1)) : 0);
+
+  // The value under plane pixel (ix, iy from the top), as readout text.
+  function readoutAt(ix, iy) {
+    const p = preview.plane;
+    const x = coordOf(p.x, ix), y = coordOf(p.y, p.height - 1 - iy), z = coordOf(p.normal, p.normal.index);
+    const val = p.values[iy * p.width + ix];
+    const what = [p.x.name, p.y.name].includes('u') ? 'P' : 'I';
+    return `${p.x.name} ${fmtNum(x)}   ${p.y.name} ${fmtNum(y)}   ${p.normal.name} ${fmtNum(z)}   ` +
+      (val === val ? `${what} = ${fmtNum(val, 4)}` : 'no data');
+  }
+
+  // The marker at the pinned point (or the keyboard cursor) in this plane.
+  function placeMark() {
+    const p = preview.plane, mark = $('sliceMark');
+    let ix, iy;
+    if (p && preview.cursor) {
+      [ix, iy] = preview.cursor;
+    } else if (p && preview.point && [p.x.name, p.y.name].every(n => n in preview.point)) {
+      ix = indexOf(p.x, preview.point[p.x.name]);
+      iy = p.height - 1 - indexOf(p.y, preview.point[p.y.name]);
+    }
+    mark.hidden = !(ix >= 0 && ix < p.width && iy >= 0 && iy < p.height);
+    if (mark.hidden) return;
+    mark.style.left = `${(100 * (ix + 0.5) / p.width).toFixed(3)}%`;
+    mark.style.top = `${(100 * (iy + 0.5) / p.height).toFixed(3)}%`;
+  }
+
+  // Pin the point under plane pixel (ix, iy); other planes then go through it.
+  function pinPoint(ix, iy) {
+    const p = preview.plane;
+    preview.point = {
+      [p.x.name]: coordOf(p.x, ix), [p.y.name]: coordOf(p.y, p.height - 1 - iy), [p.normal.name]: coordOf(p.normal, p.normal.index),
+    };
+    preview.cursor = null;
+    placeMark();
+    $('readout').textContent = readoutAt(ix, iy) + '   · pinned; the other planes go through it';
   }
 
   function percentile(sorted, p) {
@@ -1273,12 +1324,37 @@
     const r = ev.currentTarget.getBoundingClientRect();
     const ix = Math.min(p.width - 1, Math.max(0, Math.floor((ev.clientX - r.left) / r.width * p.width)));
     const iy = Math.min(p.height - 1, Math.max(0, Math.floor((ev.clientY - r.top) / r.height * p.height)));
-    const coord = (axis, i) => (axis.n > 1 ? axis.from + i * (axis.to - axis.from) / (axis.n - 1) : axis.from);
-    const x = coord(p.x, ix), y = coord(p.y, p.height - 1 - iy), z = coord(p.normal, p.normal.index);
-    const val = p.values[iy * p.width + ix];
-    const what = [p.x.name, p.y.name].includes('u') ? 'P' : 'I';
-    $('readout').textContent = `${p.x.name} ${fmtNum(x)}   ${p.y.name} ${fmtNum(y)}   ${p.normal.name} ${fmtNum(z)}   ` +
-      (val === val ? `${what} = ${fmtNum(val, 4)}` : 'no data');
+    $('readout').textContent = readoutAt(ix, iy);
+  });
+  $('sliceCanvas').addEventListener('click', ev => {
+    const p = preview.plane;
+    if (!p) return;
+    const r = ev.currentTarget.getBoundingClientRect();
+    pinPoint(Math.min(p.width - 1, Math.max(0, Math.floor((ev.clientX - r.left) / r.width * p.width))),
+      Math.min(p.height - 1, Math.max(0, Math.floor((ev.clientY - r.top) / r.height * p.height))));
+  });
+  // Keyboard: arrows move a cursor, Enter or Space pins it, Page Up and
+  // Page Down step through the planes.
+  $('sliceCanvas').addEventListener('keydown', ev => {
+    const p = preview.plane;
+    if (!p) return;
+    const move = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1] }[ev.key];
+    if (move) {
+      ev.preventDefault();
+      const stride = ev.shiftKey ? 10 : 1;
+      const at = preview.cursor || [Math.floor(p.width / 2), Math.floor(p.height / 2)];
+      preview.cursor = [Math.min(p.width - 1, Math.max(0, at[0] + move[0] * stride)),
+        Math.min(p.height - 1, Math.max(0, at[1] + move[1] * stride))];
+      placeMark();
+      $('readout').textContent = readoutAt(preview.cursor[0], preview.cursor[1]);
+    } else if ((ev.key === 'Enter' || ev.key === ' ') && preview.cursor) {
+      ev.preventDefault();
+      pinPoint(preview.cursor[0], preview.cursor[1]);
+    } else if (ev.key === 'PageUp' || ev.key === 'PageDown') {
+      ev.preventDefault();
+      preview.index = Math.min(p.normal.n - 1, Math.max(0, p.normal.index + (ev.key === 'PageUp' ? 1 : -1)));
+      loadSlice();
+    }
   });
   $('sliceCanvas').addEventListener('mouseleave', () => {
     $('readout').textContent = 'Point at the slice to read values';

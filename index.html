@@ -239,7 +239,8 @@
       <div class="previewbody">
         <div class="plot">
           <span class="ax y" id="axisY"></span>
-          <canvas id="sliceCanvas" width="1" height="1" role="img" aria-label="Slice of the data"></canvas>
+          <div class="canvaswrap"><canvas id="sliceCanvas" width="1" height="1" tabindex="0" role="img"
+            aria-label="Slice of the data; click or press Enter to pin a point, arrow keys move it, Page Up and Page Down change the plane"></canvas><div class="mark" id="sliceMark" hidden></div></div>
           <span class="ax x" id="axisX"></span>
         </div>
         <div class="colorbar"><i id="colorbar"></i><div id="colorTicks"></div></div>

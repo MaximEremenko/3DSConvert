@@ -284,6 +284,15 @@ const scenarios = [
         for (let i = 0; i < 50 && !(await evaluate('document.getElementById("sliceCanvas").width === 5')); i++) await sleep(100);
         const stats = await evaluate('document.getElementById("sliceStats").textContent');
         if (!/l = 0 · 3 of 5/.test(stats)) throw new Error('slice stats: ' + stats);
+        // pin (h, k) = (0.5, 0.5) and switch to the h-l plane through it
+        await evaluate(`(() => {
+            const c = document.getElementById('sliceCanvas'), r = c.getBoundingClientRect();
+            c.dispatchEvent(new MouseEvent('click', { bubbles: true, clientX: r.left + r.width * 3.5 / 5, clientY: r.top + r.height * 1.5 / 5 }));
+            document.querySelector('#planeSeg [data-normal="1"]').click();
+        })()`);
+        for (let i = 0; i < 50 && !/k = 0\.5 · 4 of 5/.test(await evaluate('document.getElementById("sliceStats").textContent')); i++) await sleep(100);
+        const through = await evaluate('document.getElementById("sliceStats").textContent');
+        if (!/k = 0\.5 · 4 of 5/.test(through)) throw new Error('plane through the point: ' + through);
         await evaluate('document.getElementById("presetBtn").click()');
         await evaluate('document.querySelector("#presetMenu button").click()');
         await evaluate('document.querySelector("#stageSeg [data-stage=processed]").click()');
