@@ -189,19 +189,23 @@
 
   <section class="card" id="outCard">
     <div class="card-head">
-      <span class="num">4</span><h2>Output</h2><span class="sub">pick a format; the options apply to HDF5</span>
+      <span class="num">4</span><h2>Output</h2><span class="sub">pick a format; options it does not use are greyed out</span>
     </div>
     <div class="formats" id="formatCards">
       <button type="button" class="format" data-format="unified" aria-pressed="true"><b><svg class="i s16"><use href="#i-logo"/></svg>Unified HDF5</b><small data-note="RMCProfile · DISCUS · keeps cell, metadata and recipe">RMCProfile · DISCUS · keeps cell, metadata and recipe</small></button>
       <button type="button" class="format" data-format="yell" aria-pressed="false"><b><svg class="i s16"><use href="#i-layers"/></svg>Yell 1.0</b><small data-note="DISCUS · Yell · Meerkat">DISCUS · Yell · Meerkat</small></button>
       <button type="button" class="format" data-format="dat" aria-pressed="false"><b><svg class="i s16"><use href="#i-file"/></svg>RMCProfile .dat</b><small data-note="Text · Q in Å⁻¹ · masked voxels as I = 0">Text · Q in Å⁻¹ · masked voxels as I = 0</small></button>
-      <button type="button" class="format" data-format="vtk" aria-pressed="false"><b><svg class="i s16"><use href="#i-grid"/></svg>Scatty VTK</b><small data-note="Text · ParaView · axis-aligned grids">Text · ParaView · axis-aligned grids</small></button>
+      <button type="button" class="format" data-format="vtk" aria-pressed="false"><b><svg class="i s16"><use href="#i-grid"/></svg>Legacy VTK</b><small data-note="Legacy · Scatty · ParaView · axis-aligned Q grids">Legacy · Scatty · ParaView · axis-aligned Q grids</small></button>
       <button type="button" class="format" data-format="profile" aria-pressed="false"><b><svg class="i s16"><use href="#i-rings"/></svg>|Q| profile</b><small data-note="Shell averages as text">Shell averages as text</small></button>
       <button type="button" class="format" data-format="hkl" aria-pressed="false"><b><svg class="i s16"><use href="#i-file"/></svg>hkl list</b><small data-note="h k l I σ rows · Spinteract · Scatty">h k l I σ rows · Spinteract · Scatty</small></button>
+      <button type="button" class="format" data-format="npz" aria-pressed="false"><b><svg class="i s16"><use href="#i-code"/></svg>NumPy .npz</b><small data-note="np.load · values, σ, grid and cell · keeps NaN">np.load · values, σ, grid and cell · keeps NaN</small></button>
+      <button type="button" class="format" data-format="vti" aria-pressed="false"><b><svg class="i s16"><use href="#i-grid"/></svg>VTK XML .vti</b><small data-note="ParaView · any grid (Direction) · Q or Å">ParaView · any grid (Direction) · Q or Å</small></button>
+      <button type="button" class="format" data-format="mrc" aria-pressed="false"><b><svg class="i s16"><use href="#i-wave"/></svg>CCP4/MRC map</b><small data-note="3D-ΔPDF · ChimeraX · Coot · PyMOL">3D-ΔPDF · ChimeraX · Coot · PyMOL</small></button>
     </div>
     <select id="outFormat" hidden>
       <option value="unified">Unified</option><option value="yell">Yell</option><option value="dat">dat</option>
       <option value="vtk">VTK</option><option value="profile">profile</option><option value="hkl">hkl list</option>
+      <option value="npz">npz</option><option value="vti">vti</option><option value="mrc">mrc</option>
     </select>
     <div class="options">
       <div class="field"><span>Precision</span><div class="seg" role="group" aria-label="Precision" data-for="precision">
@@ -212,6 +216,8 @@
         <button type="button" data-value="0">None</button><button type="button" data-value="4">gzip</button></div></div>
       <label class="field"><span>Radiation</span><select id="radiation" class="text">
         <option value="">keep / unknown</option><option value="neutron">neutron</option><option value="xray">xray</option><option value="electron">electron</option></select></label>
+      <label class="field" id="vtkOpts" hidden><span>VTK encoding</span><select id="vtkEncoding" class="text">
+        <option value="ascii">ASCII (as Scatty writes it)</option><option value="binary">binary float32 (smaller)</option></select></label>
       <label class="field" id="profileOpts" hidden><span>Shell width (Å⁻¹)</span><input id="profileWidth" value="0.05" class="text" inputmode="decimal"></label>
       <label class="field" id="datOpts1" hidden><span>.dat coordinates</span><select id="datFrame" class="text">
         <option value="q">Q (Å⁻¹)</option><option value="hkl">hkl (r.l.u., _hkl.dat)</option></select></label>

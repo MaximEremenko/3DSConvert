@@ -122,6 +122,15 @@ function converterWorker(self, h5wasm, Converter, Processing, wgpuFftWeb) {
         return Converter.isHdf5Signature(new Uint8Array(await file.slice(0, 8).arrayBuffer()));
     }
 
+    // A volume that is not HDF5: NumPy .npz (by its ZIP signature) or text.
+    async function readOtherVolume(file, opts) {
+        const sig = new Uint8Array(await file.slice(0, 4).arrayBuffer());
+        if (sig.length === 4 && sig[0] === 0x50 && sig[1] === 0x4b && sig[2] === 3 && sig[3] === 4) {
+            return { kind: 'npz', model: Converter.readNpz(new Uint8Array(await file.arrayBuffer()), opts) };
+        }
+        return readTextVolume(file, opts);
+    }
+
     // Old-format .dat, VTK or an hkl list, parsed as a stream: { kind, grid }
     // or, for an hkl list (placed on opts.grid when a config gives one),
     // { kind, model }.
@@ -139,6 +148,10 @@ function converterWorker(self, h5wasm, Converter, Processing, wgpuFftWeb) {
             return { kind: 'hkl', model: Converter.hklListModel(list, opts.grid || null) };
         }
         const vtk = Converter.isVtk(head);
+        if (vtk && Converter.isBinaryVtk(head)) {
+            const grid = Converter.readVtkBinary(new Uint8Array(await file.arrayBuffer()));
+            return { kind: grid.frame === 'hkl' ? 'vtk-hkl' : 'vtk', grid };
+        }
         const grid = vtk ? await Converter.readVtkStream(file.stream(), opts)
             : await Converter.readOldDatStream(file.stream(), opts);
         return { kind: vtk ? (grid.frame === 'hkl' ? 'vtk-hkl' : 'vtk') : 'dat', grid };
@@ -231,6 +244,16 @@ function converterWorker(self, h5wasm, Converter, Processing, wgpuFftWeb) {
         state.processed = { key, plan, process };
         return state.processed;
     }
+
+    // Output written in pieces through the page's file sink (text, and the
+    // binary legacy VTK); the others come back whole.
+    const STREAMED = new Set(['dat', 'vtk', 'profile', 'hkl', 'vti']);
+
+    // estimateOutputBytes options for the conversion parameters.
+    const estimateOpts = params => Object.assign({}, params, {
+        binary: params.vtkEncoding === 'binary',
+        nsec: params.datSections && params.datSections !== 'none' ? Processing.laueOperations(params.datSections).length : 1,
+    });
 
     // Sort key that puts the identity operation first.
     const identityFirst = G => (G.flat().join() === '1,0,0,0,1,0,0,0,1' ? 0 : 1);
@@ -361,7 +384,7 @@ function converterWorker(self, h5wasm, Converter, Processing, wgpuFftWeb) {
             const file = files[main];
             const opts = { size: file.size, tick: ctx.tick, progress: f => ctx.progress('Reading', f), crop, sigma: !!readSigma, grid };
             if (!hdf5[main]) {
-                state.data = await readTextVolume(file, opts);
+                state.data = await readOtherVolume(file, opts);
                 return { result: Object.assign(summarize(state.data), { main: file.name }) };
             }
 
@@ -447,7 +470,7 @@ function converterWorker(self, h5wasm, Converter, Processing, wgpuFftWeb) {
                 const opts = { size: file.size, tick: ctx.tick, progress: f => ctx.progress(`Reading ${file.name}`, f), sigma: !!readSigma };
                 let volume;
                 if (!(await isHdf5(file))) {
-                    volume = await readTextVolume(file, opts);
+                    volume = await readOtherVolume(file, opts);
                 } else {
                     const f = openAt(`extra/${i}/${file.name}`);
                     try {
@@ -502,19 +525,24 @@ function converterWorker(self, h5wasm, Converter, Processing, wgpuFftWeb) {
             state.plan = null;
             const { plan, process } = await processData(params, ctx);
             Converter.checkWritable(plan.model, params.format);
-            if (((params.format === 'dat' && params.datFrame !== 'hkl') || params.format === 'vtk') &&
-                Converter.isUnitMetric(plan.cell.lengths, plan.cell.angles)) {
+            const unitMetric = Converter.isUnitMetric(plan.cell.lengths, plan.cell.angles);
+            if (((params.format === 'dat' && params.datFrame !== 'hkl') || params.format === 'vtk' || params.format === 'mrc') && unitMetric) {
                 throw new Error(`cannot write ${params.format} with a unit-metric cell - supply a structure file or a manual parent cell`);
             }
             state.plan = { plan, params, process };
-            const text = params.format === 'dat' || params.format === 'vtk';
+            // formats that have no NaN and write empty voxels as 0
+            const zeroed = params.format === 'dat' || params.format === 'vtk' || params.format === 'mrc';
+            const notes = (plan.model.notes || []).slice();
+            if (params.format === 'vti' && unitMetric) {
+                notes.push(`no real cell, so the .vti axes are in ${plan.model.axesType === 'uvw' ? 'lattice units' : 'r.l.u.'}`);
+            }
             return {
                 result: {
-                    notes: plan.model.notes || [], dims: plan.model.dims,
+                    notes, dims: plan.model.dims,
                     axesType: plan.model.axesType || 'hkl', processed: !!process,
                     cell: plan.cell, cellSource: plan.cellSource,
-                    estimate: Converter.estimateOutputBytes(plan.model, params.format, params),
-                    nonFinite: text ? Converter.countNonFinite(plan.model.values) : 0,
+                    estimate: Converter.estimateOutputBytes(plan.model, params.format, estimateOpts(params)),
+                    nonFinite: zeroed ? Converter.countNonFinite(plan.model.values) : 0,
                 },
             };
         },
@@ -523,16 +551,17 @@ function converterWorker(self, h5wasm, Converter, Processing, wgpuFftWeb) {
             if (!state.plan) throw new Error('nothing to write; prepare the conversion first');
             const { plan, params, process } = state.plan;
             const progress = f => ctx.progress('Writing', f);
-            if (params.format === 'dat' || params.format === 'vtk' || params.format === 'profile' || params.format === 'hkl') {
+            if (STREAMED.has(params.format)) {
                 let report = null;
                 const sections = params.datSections && params.datSections !== 'none'
                     ? Processing.laueOperations(params.datSections).sort((a, b) => identityFirst(a) - identityFirst(b)) : null;
                 const chunks = params.format === 'dat'
                     ? Converter.writeOldDatChunks(plan.model, plan.cell, 0, { frame: params.datFrame, sections })
-                    : params.format === 'vtk' ? Converter.writeVtkChunks(plan.model, plan.cell)
+                    : params.format === 'vtk' ? Converter.writeVtkChunks(plan.model, plan.cell, 0, { binary: params.vtkEncoding === 'binary' })
+                    : params.format === 'vti' ? Converter.writeVtiChunks(plan.model, plan.cell, { precision: params.precision })
                     : params.format === 'hkl' ? Converter.writeHklListChunks(plan.model, r => { report = r; })
                     : Processing.writeProfileChunks(plan.model, plan.cell, params.profileWidth);
-                const estimate = Math.max(1, Converter.estimateOutputBytes(plan.model, params.format));
+                const estimate = Math.max(1, Converter.estimateOutputBytes(plan.model, params.format, estimateOpts(params)));
                 let written = 0;
                 for (const chunk of chunks) {
                     await ctx.emit(chunk);
@@ -543,6 +572,14 @@ function converterWorker(self, h5wasm, Converter, Processing, wgpuFftWeb) {
                 const snippet = params.format === 'hkl' && params.hklTarget !== 'plain'
                     ? Converter.hklConfigSnippet(plan.model, params.hklTarget) : null;
                 return { result: { kind: 'text', report, snippet } };
+            }
+            if (params.format === 'npz' || params.format === 'mrc') {
+                progress(0);
+                const blob = params.format === 'npz'
+                    ? Converter.writeNpz(plan.model, plan.cell, { precision: params.precision })
+                    : Converter.writeMrc(plan.model, plan.cell);
+                progress(1);
+                return { result: { kind: 'blob', blob } };
             }
             const path = `/out_${outSeq++}.h5`;
             let f = null;

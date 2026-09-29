@@ -132,3 +132,141 @@ test('old-format .dat in hkl coordinates, and with symmetry sections', async () 
 });
 
 const maxAbs = (a, b) => Math.max(...a.map((x, i) => Math.abs(x - b[i])));
+
+// ------------------------------------------- NumPy, VTK XML, CCP4/MRC, binary VTK
+
+const cubic = { lengths: [4, 4, 4], angles: [90, 90, 90] };
+const blobBytes = async blob => new Uint8Array(await blob.arrayBuffer());
+
+test('crc32 gives the standard check value', () => {
+    assert.equal(Converter.crc32(new TextEncoder().encode('123456789')), 0xcbf43926);
+});
+
+test('.npz: values, sigma, grid, cell and NaN survive a round trip; crop on read', async () => {
+    const m = sample(true);
+    m.values[5] = NaN;
+    m.radiation = 'xray';
+    const bytes = await blobBytes(Converter.writeNpz(m, cubic, {}));
+    // a ZIP of .npy members, each header padded so the data start 64-byte aligned
+    assert.deepEqual(Array.from(bytes.subarray(0, 4)), [0x50, 0x4b, 3, 4]);
+    const npy = bytes.subarray(30 + (bytes[26] | (bytes[27] << 8)));
+    assert.equal(String.fromCharCode(...npy.subarray(1, 6)), 'NUMPY');
+    const hl = npy[8] | (npy[9] << 8);
+    assert.equal((10 + hl) % 64, 0);
+    assert.match(String.fromCharCode(...npy.subarray(10, 10 + hl)), /'descr': '<f8', 'fortran_order': False, 'shape': \(2, 3, 4\)/);
+    const back = Converter.readNpz(bytes);
+    assert.deepEqual(back.dims, m.dims);
+    assert.deepEqual(back.corner, m.corner);
+    assert.deepEqual(back.vectors, m.vectors);
+    assert.deepEqual(back.cellLengths, cubic.lengths);
+    assert.equal(back.radiation, 'xray');
+    assert.equal(back.axesType, 'hkl');
+    assert.ok(Number.isNaN(back.values[5]));
+    for (let i = 0; i < 24; i++) if (i !== 5) assert.equal(back.values[i], m.values[i]);
+    assert.deepEqual(Array.from(back.sigma), Array.from(m.sigma));
+    // a Node Buffer (from a pool, where slice() shares memory) reads the same
+    assert.deepEqual(Array.from(Converter.readNpz(Buffer.from(bytes)).sigma), Array.from(m.sigma));
+    const single =Converter.readNpz(await blobBytes(Converter.writeNpz(m, cubic, { precision: 'float32' })));
+    assert.ok(single.values instanceof Float32Array && single.sigma instanceof Float32Array);
+    const cut = Converter.readNpz(bytes, { crop: { h: [-0.5, 0.5] } });
+    assert.deepEqual(cut.dims, [3, 3, 2]);
+    assert.deepEqual(cut.corner, [-0.5, 0, 0.5]);
+    assert.equal(cut.values[0], m.values[1]);
+    assert.equal(cut.sigma[3], m.sigma[5]);
+    assert.match(cut.notes.join('\n'), /cropped on read to 3 x 3 x 2/);
+    // a direct-space grid keeps its axes and content
+    const uvw = Object.assign(sample(false), { axesType: 'uvw', content: '3d-delta-pdf' });
+    const d = Converter.readNpz(await blobBytes(Converter.writeNpz(uvw, cubic)));
+    assert.equal(d.axesType, 'uvw');
+    assert.equal(d.content, '3d-delta-pdf');
+});
+
+// The attributes and decoded arrays of a .vti written by writeVtiChunks.
+function parseVti(text) {
+    const attr = name => new RegExp(`<ImageData[^>]*\\s${name}="([^"]*)"`).exec(text)[1].trim().split(/\s+/).map(Number);
+    const arrays = {};
+    for (const m of text.matchAll(/<DataArray type="(\w+)" Name="(\w+)" format="binary">([^<]*)<\/DataArray>/g)) {
+        const raw = Buffer.from(m[3], 'base64');
+        const size = Number(raw.readBigUInt64LE(0));
+        assert.equal(raw.length, 8 + size);
+        const body = new Uint8Array(raw.subarray(8));
+        arrays[m[2]] = m[1] === 'Float32' ? new Float32Array(body.buffer) : new Float64Array(body.buffer);
+    }
+    return { extent: attr('WholeExtent'), origin: attr('Origin'), spacing: attr('Spacing'), direction: attr('Direction'), arrays };
+}
+
+test('.vti: the grid in Q with a Direction matrix, base64 arrays behind a UInt64 size', () => {
+    const m = sample(true);
+    m.values[5] = NaN;
+    const v = parseVti(Array.from(Converter.writeVtiChunks(m, cubic)).join(''));
+    const t = 2 * Math.PI / 4;
+    assert.deepEqual(v.extent, [0, 3, 0, 2, 0, 1]);
+    assert.ok(maxAbs(v.origin, [-t, 0, 0.5 * t]) < 1e-9);
+    assert.ok(maxAbs(v.spacing, [0.5 * t, 0.25 * t, t]) < 1e-9);
+    assert.deepEqual(v.direction, [1, 0, 0, 0, 1, 0, 0, 0, 1]);
+    assert.ok(Number.isNaN(v.arrays.values[5]));
+    assert.equal(v.arrays.values[23], m.values[23]);
+    assert.deepEqual(Array.from(v.arrays.sigma), Array.from(m.sigma));
+    // a sheared grid: the second axis along [1 1 0]
+    const s = sample(false);
+    s.vectors = [[0.5, 0, 0], [0.25, 0.25, 0], [0, 0, 1]];
+    const w = parseVti(Array.from(Converter.writeVtiChunks(s, cubic, { precision: 'float32' })).join(''));
+    const r = Math.SQRT1_2;
+    assert.ok(maxAbs(w.direction, [1, r, 0, 0, r, 0, 0, 0, 1]) < 1e-9);
+    assert.ok(Math.abs(w.spacing[1] - 0.25 * Math.SQRT2 * t) < 1e-9);
+    assert.ok(w.arrays.values instanceof Float32Array);
+    // direct space in Angstrom; a single-point axis gets the normal of the others
+    const d = Object.assign(sample(false), { axesType: 'uvw', dims: [4, 6, 1], vectors: [[0.5, 0, 0], [0, 0.25, 0], [0, 0, 0]] });
+    const x = parseVti(Array.from(Converter.writeVtiChunks(d, { lengths: [4, 5, 6], angles: [90, 90, 90] })).join(''));
+    assert.ok(maxAbs(x.origin, [-4, 0, 3]) < 1e-9);
+    assert.ok(maxAbs(x.spacing, [2, 1.25, 1]) < 1e-9);
+    assert.deepEqual(x.direction, [1, 0, 0, 0, 1, 0, 0, 0, 1]);
+    assert.deepEqual(x.extent, [0, 3, 0, 5, 0, 0]);
+});
+
+test('CCP4/MRC: a direct-space map with the grid in its header', async () => {
+    const d = Object.assign(sample(false), { axesType: 'uvw', corner: [-1, -0.25, -1] });
+    d.values[5] = NaN;
+    const u = await blobBytes(Converter.writeMrc(d, { lengths: [4, 5, 6], angles: [90, 90, 120] }));
+    assert.equal(u.length, 1024 + 4 * 24);
+    const dv = new DataView(u.buffer);
+    const int = w => dv.getInt32(4 * w, true), flt = w => dv.getFloat32(4 * w, true);
+    assert.deepEqual([0, 1, 2, 3].map(int), [4, 3, 2, 2]);              // NX NY NZ, mode 2 (float32)
+    assert.deepEqual([4, 5, 6].map(int), [-2, -1, -1]);                 // NXSTART... = corner / step
+    assert.deepEqual([7, 8, 9].map(int), [4, 3, 2]);                    // MX MY MZ
+    assert.ok(maxAbs([10, 11, 12].map(flt), [8, 3.75, 12]) < 1e-5);    // the cell spans N steps
+    assert.deepEqual([13, 14, 15].map(flt), [90, 90, 120]);
+    assert.deepEqual([16, 17, 18].map(int), [1, 2, 3]);
+    assert.equal(flt(20), 321);
+    assert.equal(int(27), 20140);
+    assert.equal(String.fromCharCode(...u.subarray(208, 212)), 'MAP ');
+    assert.deepEqual(Array.from(u.subarray(212, 214)), [0x44, 0x44]);
+    const data = new Float32Array(u.slice(1024).buffer);
+    assert.equal(data[5], 0);                                           // NaN written as 0
+    assert.equal(data[23], d.values[23]);
+    assert.throws(() => Converter.writeMrc(sample(false), cubic), /reciprocal space|direct-space/);
+    assert.throws(() => Converter.checkWritable(sample(false), 'mrc'), /reciprocal space/);
+    const skew = Object.assign(sample(false), { axesType: 'uvw', vectors: [[0.5, 0, 0], [0.25, 0.25, 0], [0, 0, 1]] });
+    assert.throws(() => Converter.writeMrc(skew, cubic), /along u, v and w/);
+    const off = Object.assign(sample(false), { axesType: 'uvw', corner: [-0.9, 0, 0] });
+    assert.throws(() => Converter.writeMrc(off, cubic), /whole number of steps/);
+});
+
+test('legacy VTK in binary: big-endian float32 after the header, and read back', async () => {
+    const m = sample(false);
+    m.values[5] = NaN;
+    const u = await blobBytes(new Blob(Array.from(Converter.writeVtkChunks(m, cubic, 0, { binary: true }))));
+    const head = String.fromCharCode(...u.subarray(0, 300));
+    assert.match(head, /\nBINARY\nDATASET STRUCTURED_POINTS\nDIMENSIONS 4 3 2\n/);
+    assert.ok(Converter.isBinaryVtk(head));
+    assert.equal(Converter.isBinaryVtk(Array.from(Converter.writeVtkChunks(m, cubic)).join('')), false);
+    const grid = Converter.readVtkBinary(u);
+    assert.deepEqual(grid.dims, [4, 3, 2]);
+    assert.equal(grid.values[5], 0);
+    assert.equal(grid.values[23], m.values[23]);
+    const back = Converter.toHklModel(grid, cubic);
+    assert.ok(maxAbs(back.corner, m.corner) < 1e-8);
+    const ascii = Converter.parseVtk(Array.from(Converter.writeVtkChunks(m, cubic)).join(''), cubic);
+    assert.deepEqual(Array.from(back.values), Array.from(ascii.values));
+    assert.throws(() => Converter.readVtkBinary(u.subarray(0, u.length - 9)), /truncated/);
+});

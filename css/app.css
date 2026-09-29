@@ -123,7 +123,7 @@ svg.i.s16 { width: 16px; height: 16px; }
 .field input, .field select, .text {
   height: 34px; padding: 0 10px; border: 1px solid var(--border-strong); border-radius: 8px;
   background: var(--panel); color: var(--text); min-width: 0; width: 100%; }
-.field input:disabled { background: var(--raised); color: var(--muted); }
+.field input:disabled, .field select:disabled { background: var(--raised); color: var(--muted); }
 .field input[type="file"] { height: auto; padding: 6px; font-size: 13px; }
 .row { display: flex; gap: 12px; flex-wrap: wrap; }
 .row > .field { flex: 1 1 220px; }

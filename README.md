@@ -16,16 +16,22 @@ No installation, no server, and no upload: files never leave your computer.
 | --- | --- | --- | --- |
 | Unified data format (HDF5) | yes | yes | RMCProfile, DiffuseCode/DISCUS |
 | Yell 1.0 (HDF5) | yes | yes | DISCUS, Yell, Meerkat |
-| RMCProfile old text format (`.dat`) | yes | yes | RMCProfile Diffuse3D |
-| VTK `STRUCTURED_POINTS` (`.vtk`) | yes | yes | Scatty, Spinteract, 3DSCalculator; also loads in ParaView |
+| RMCProfile old text format (`.dat`, `_hkl.dat`) | yes | yes | RMCProfile Diffuse3D |
+| RMCProfile amplitudes (`_aver_amp_calc.dat`, `_total_amp_calc.dat`) | yes | no | RMCProfile |
+| hkl list `h k l I σ` (`.txt`) | yes | yes | Spinteract (`_xtal_data_NN.txt`), Scatty (`scatty_data_01.txt`) |
+| VTK `STRUCTURED_POINTS` (`.vtk`, ASCII or binary) | yes | yes | Scatty, Spinteract, 3DSCalculator; also loads in ParaView |
+| VTK XML image data (`.vti`) | no | yes | ParaView 5.10+ (any grid, through its Direction matrix) |
+| NumPy (`.npz`) | yes | yes | `np.load` in Python scripts |
+| CCP4/MRC map (`.mrc`) | no | yes | ChimeraX, Coot, PyMOL (3D-ΔPDF maps) |
 | NeXus: Mantid MDHistoWorkspace (`.nxs`) | yes | no | Mantid `SaveMD` (CORELLI, TOPAZ, WAND², DEMAND, SXD, ...) |
 | NeXus: NXdata (`.nxs`) | yes | no | NXrefine (APS 6-ID-D, CHESS QM2), other NeXus writers |
 | \|Q\| profile (`.txt`) | no | yes | shell averages of the (processed) volume |
 
 Any readable format can be converted to any writable one. The input format
-is detected automatically from the file content. The unified and Yell
-formats also hold direct-space 3D-ΔPDF maps (u, v, w axes); these are read
-and written in those two formats only.
+is detected automatically from the file content. Direct-space 3D-ΔPDF maps
+(u, v, w axes) are read from unified, Yell and `.npz` files and written to
+those, to `.vti` and to CCP4/MRC; the Q-space text formats cannot hold them,
+and a CCP4/MRC map holds only them.
 
 ### Format notes
 
@@ -78,8 +84,44 @@ and written in those two formats only.
   pixel (1,1,1) or its neighbours are among them, the grid geometry is
   fitted to all rows. On output, NaN or infinite intensities are written as
   0.0, which RMCProfile treats as a masked point (points with I = 0 are left
-  out of the fit).
-- **VTK**: ASCII `STRUCTURED_POINTS`. In Scatty (`*_sc.vtk`) and Spinteract
+  out of the fit). The `_hkl.dat` variant (by its name) has hkl instead of
+  Q coordinates and needs no cell; it can also be written. Output can list
+  symmetry sections: for a chosen Laue group, each row then carries the
+  coordinates of every symmetry-equivalent point (the point itself first)
+  and the header gives their number as `nsec`.
+- **RMCProfile amplitudes** (`*_amp_calc.dat`, by name): rows of `i j k`, a
+  Q triplet and `Re Im` per symmetry section, without a header. The value
+  read is |A|² averaged over the sections; when the file holds several
+  `ipermutation` blocks, the first is used.
+- **hkl lists**: rows of `h k l I` and optionally `σ` (Spinteract
+  `_xtal_data`/`_xtal_fit`, Scatty `scatty_data_01.txt`/`_sc_list.txt`).
+  The grid is inferred from the rows (or taken from a Spinteract/Scatty
+  config loaded as the grid config, for rotated grids); grid points without
+  a row become NaN. On output, masked voxels are left out, σ comes from the
+  data (1 with a warning when there is none), rows with σ ≤ 1e-8 are left
+  out (Scatty stops on them), and the log shows the matching `ORIGIN`
+  (Spinteract) or `CENTRE` (Scatty) config lines. The file is named as the
+  target program expects.
+- **NumPy `.npz`**: an uncompressed archive (read it with `np.load`) of
+  `values` and, when known, `sigma`, as C-order arrays `[nl, nk, nh]`
+  (`values[l, k, h]`), `corner`, `step_vectors` (one row per grid axis),
+  `unit_cell` (a b c alpha beta gamma) and `metadata.json` (axes, content,
+  radiation, symmetrization). NaN stays NaN. The point `values[i2, i1, i0]`
+  sits at `corner + i0*step_vectors[0] + i1*step_vectors[1] +
+  i2*step_vectors[2]`. Files written with `np.savez` under these names read
+  back; `np.savez_compressed` archives are refused.
+- **VTK XML `.vti`**: `ImageData` with a `Direction` matrix, so sheared and
+  rotated grids keep their shape in ParaView 5.10 and later. Axes are
+  Cartesian Q in 1/Angstrom (a∥x, as for the text formats) for hkl data with
+  a real cell, Cartesian Angstrom for a 3D-ΔPDF, and r.l.u. (or lattice
+  units) without a cell. `values` (and `sigma`) are stored as base64 binary
+  in float32 or float64; NaN is kept.
+- **CCP4/MRC** (MRC2014, float32): for direct-space grids along u, v and w,
+  i.e. a 3D-ΔPDF. The map cell spans the grid, so a voxel is one grid step;
+  `NXSTART`... place the origin, which must be a whole number of steps from
+  the grid corner. Empty voxels are written as 0.
+- **VTK**: `STRUCTURED_POINTS`, ASCII, or binary (big-endian float32) on
+  request. In Scatty (`*_sc.vtk`) and Spinteract
   (`*_img_NN.vtk`) output, `ORIGIN` and `SPACING` are cartesian Q in
   1/Angstrom (2*pi convention, the same as the old text format); values run
   x fastest, z slowest. The format stores no axis directions: Scatty and
@@ -175,12 +217,16 @@ remembered; by default the page follows the system).
    without losing them, dragged by its icon to another place, and removed;
    Undo (or Ctrl+Z outside text fields) steps back through changes, and the
    JSON view edits the whole recipe as text. See Processing below.
-4. **Output**: pick the format card; for HDF5 output, also the precision
-   (the same as the input, float64 or float32), the unified layout (both
-   `/scattering/data` and `/entry/data`, or `/entry/data` only, which
-   halves the file), gzip compression and the radiation metadata. Formats
-   that cannot hold the result (the text formats for a 3D-ΔPDF) are
-   disabled with the reason. The *|Q| profile* output writes the mean of the
+4. **Output**: pick the format card, then its options; options a format
+   does not use are greyed out. The precision (the same as the input,
+   float64 or float32) applies to HDF5, `.npz` and `.vti`; the unified
+   layout (both `/scattering/data` and `/entry/data`, or `/entry/data` only,
+   which halves the file) and gzip compression to HDF5; the radiation to
+   HDF5 and `.npz`. The `.dat` output takes Q or hkl coordinates and
+   optional symmetry sections, VTK ASCII or binary, and the hkl list its
+   target program. Formats that cannot hold the result (the Q-space text
+   formats for a 3D-ΔPDF, CCP4/MRC for Q-space data) are disabled with the
+   reason. The *|Q| profile* output writes the mean of the
    finite voxels in |Q| shells of the chosen width, with the standard error
    of the mean and the voxel count (`Q mean_I sigma_of_mean n_voxels`).
 
@@ -195,7 +241,7 @@ arrow keys move a cursor, Enter pins it, Page Up and Page Down change the
 plane. The *|Q| profile* view plots the shell averages against |Q|, with
 their standard error, for the data as read or after the recipe.
 
-Text output (`.dat`, `.vtk`, profiles) is streamed directly to disk in
+Text output (`.dat`, `.vtk`, `.vti`, hkl lists, profiles) is streamed directly to disk in
 browsers that support the File System Access API (Chromium); elsewhere a
 chunked in-memory download is used. The log reports the expected output
 size first, and reading, processing and writing show progress and can be
@@ -222,6 +268,8 @@ bytes per voxel more.
 | Yell `.h5` with a real cell | no |
 | Yell `.h5` with unit metric | yes (for `.dat`/`.vtk` output; passed through for HDF5 output) |
 | Old text `.dat` | yes, always |
+| `_hkl.dat`, hkl list | yes (for Q-frame `.dat`, `.vtk` and CCP4/MRC output; `.vti` then stays in r.l.u.) |
+| `.npz` written by 3DSConvert | no (it stores the cell) |
 | Q-space `.vtk` (Scatty, Spinteract) | yes, always |
 | r.l.u. `.vtk` (3DSCalculator, Scatty supercell) | yes (for `.dat`/`.vtk` output; passed through for HDF5 output) |
 | Mantid `.nxs` with an oriented lattice | no |

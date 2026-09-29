@@ -272,7 +272,7 @@
   const KIND_LABEL = {
     yell: 'Yell 1.0', unified: 'Unified HDF5', 'mantid-md': 'Mantid MDHistoWorkspace', nexus: 'NeXus NXdata',
     dat: 'RMCProfile .dat', 'dat-hkl': 'RMCProfile .dat · hkl', 'dat-amp': 'RMCProfile amplitudes',
-    vtk: 'VTK · Q', 'vtk-hkl': 'VTK · r.l.u.', hkl: 'hkl list',
+    vtk: 'VTK · Q', 'vtk-hkl': 'VTK · r.l.u.', hkl: 'hkl list', npz: 'NumPy .npz',
   };
 
   // Per grid axis: the component it runs along, its range and step.
@@ -373,9 +373,10 @@
       } else {
         const label = {
           yell: 'Yell 1.0', unified: 'Unified data format', 'mantid-md': 'Mantid MDHistoWorkspace', nexus: `NeXus ${s.nexusPath}`,
+          npz: 'NumPy .npz',
         }[s.kind];
         info = label + ` | grid ${s.dims.join(' x ')}` +
-          (s.kind === 'unified' || s.kind === 'nexus' ? ` | axes ${s.axesType || 'hkl'}` : '') +
+          (s.kind === 'unified' || s.kind === 'nexus' || s.kind === 'npz' ? ` | axes ${s.axesType || 'hkl'}` : '') +
           ` | ${s.precision} | stored cell: ${fmtCell({ lengths: s.cellLengths, angles: s.cellAngles })}` +
           (Converter.isUnitMetric(s.cellLengths, s.cellAngles) ? '  (unit metric)' : '');
       }
@@ -1654,11 +1655,22 @@
   // ------------------------------------------------------------ output
   const SUFFIX = {
     unified: '_unified.h5', yell: '_yell.h5', dat: '_diffuse3d.dat', vtk: '_diffuse.vtk', profile: '_profile.txt', hkl: '_hkl.txt',
+    npz: '.npz', vti: '.vti', mrc: '.mrc',
   };
   const FORMAT_TITLE = {
-    unified: 'Unified HDF5', yell: 'Yell 1.0', dat: 'RMCProfile .dat', vtk: 'Scatty VTK', profile: '|Q| profile', hkl: 'hkl list',
+    unified: 'Unified HDF5', yell: 'Yell 1.0', dat: 'RMCProfile .dat', vtk: 'Legacy VTK', profile: '|Q| profile', hkl: 'hkl list',
+    npz: 'NumPy .npz', vti: 'VTK XML .vti', mrc: 'CCP4/MRC map',
   };
-  const TEXT_FORMATS = new Set(['dat', 'vtk', 'profile', 'hkl']);
+  // Written in pieces through a file sink (text, and binary legacy VTK).
+  const STREAMED = new Set(['dat', 'vtk', 'profile', 'hkl', 'vti']);
+  // Formats for Q-space grids only, and for direct-space (3D-ΔPDF) grids only.
+  const RECIPROCAL_FORMATS = new Set(['dat', 'vtk', 'profile', 'hkl']);
+  const DIRECT_FORMATS = new Set(['mrc']);
+  // The formats each output option applies to.
+  const USES = {
+    precision: ['unified', 'yell', 'npz', 'vti'], layout: ['unified'], compression: ['unified', 'yell'],
+    radiation: ['unified', 'yell', 'npz'],
+  };
 
   // The output file name: Spinteract and Scatty read their data by name.
   function fileNameFor(base, tag, format) {
@@ -1680,25 +1692,28 @@
   function updateOutput() {
     const select = $('outFormat');
     const direct = directOutput();
-    if (direct && TEXT_FORMATS.has(select.value)) select.value = 'unified';
+    const offFor = f => (direct ? RECIPROCAL_FORMATS.has(f) : !!state.data && DIRECT_FORMATS.has(f));
+    if (offFor(select.value)) select.value = 'unified';
     for (const card of $('formatCards').children) {
-      const f = card.dataset.format, off = direct && TEXT_FORMATS.has(f);
+      const f = card.dataset.format, off = offFor(f);
       card.disabled = off;
       card.setAttribute('aria-pressed', String(select.value === f));
       const note = card.querySelector('small');
-      note.textContent = off ? 'Q-space grids only; this output is a 3D-ΔPDF' : note.dataset.note;
+      note.textContent = !off ? note.dataset.note
+        : direct ? 'Q-space grids only; this output is a 3D-ΔPDF' : 'Direct-space maps only; add a 3D-ΔPDF step';
     }
-    const fmt = select.value, text = TEXT_FORMATS.has(fmt);
+    const fmt = select.value;
     for (const seg of document.querySelectorAll('.seg[data-for]')) {
       const target = $(seg.dataset.for);
-      const idle = text || (seg.dataset.for === 'layout' && fmt !== 'unified');
+      const idle = !USES[seg.dataset.for].includes(fmt);
       for (const b of seg.children) {
         b.setAttribute('aria-pressed', String(b.dataset.value === target.value));
         b.disabled = idle;
       }
     }
-    $('radiation').disabled = text;
+    $('radiation').disabled = !USES.radiation.includes(fmt);
     $('profileOpts').hidden = fmt !== 'profile';
+    $('vtkOpts').hidden = fmt !== 'vtk';
     $('hklOpts').hidden = fmt !== 'hkl';
     $('datOpts1').hidden = $('datOpts2').hidden = fmt !== 'dat';
     $('outCard').classList.toggle('done', !!state.data);
@@ -1712,10 +1727,10 @@
     const precision = $('precision').value;
     const single = precision === 'float32' || (precision === 'same' && s.precision === 'float32' && !direct);
     const bytes = Converter.estimateOutputBytes({ dims: s.dims, values: single ? new Float32Array(0) : new Float64Array(0) },
-      fmt, { precision, layout: $('layout').value,
+      fmt, { precision, layout: $('layout').value, binary: $('vtkEncoding').value === 'binary',
         nsec: $('datSections').value === 'none' ? 1 : Processing.laueOperations($('datSections').value).length });
-    $('outDetail').textContent = FORMAT_TITLE[fmt] +
-      (bytes ? ` · about ${fmtBytes(bytes)}` + (!text && Number($('compression').value) ? ' before compression' : '') : '');
+    $('outDetail').textContent = FORMAT_TITLE[fmt] + (fmt === 'vtk' && $('vtkEncoding').value === 'binary' ? ' · binary' : '') +
+      (bytes ? ` · about ${fmtBytes(bytes)}` + (USES.compression.includes(fmt) && Number($('compression').value) ? ' before compression' : '') : '');
   }
 
   for (const card of $('formatCards').children) {
@@ -1733,7 +1748,7 @@
       });
     }
   }
-  for (const id of ['outFormat', 'precision', 'layout', 'compression', 'radiation', 'hklTarget', 'datFrame', 'datSections']) {
+  for (const id of ['outFormat', 'precision', 'layout', 'compression', 'radiation', 'hklTarget', 'datFrame', 'datSections', 'vtkEncoding']) {
     $(id).addEventListener('change', updateOutput);
   }
   for (const g of Processing.LAUE_GROUPS) {
@@ -1751,19 +1766,20 @@
     setTimeout(() => URL.revokeObjectURL(a.href), 5000);
   }
 
-  // Where text output goes: straight to disk through the File System Access
-  // API (Chromium), else a chunked in-memory download (separate strings avoid
-  // the maximum string length, but the Blob still has to fit in memory).
-  async function openTextSink(filename, format) {
+  // Where streamed output goes: straight to disk through the File System
+  // Access API (Chromium), else a chunked in-memory download (separate pieces
+  // avoid the maximum string length, but the Blob still has to fit in memory).
+  async function openTextSink(filename, format, binary) {
+    const mime = binary ? 'application/octet-stream' : 'text/plain';
     if ('showSaveFilePicker' in window) {
       try {
         const [description, extension] = {
           dat: ['RMCProfile old diffuse text format', '.dat'], vtk: ['VTK legacy file', '.vtk'], profile: ['|Q| profile', '.txt'],
-          hkl: ['hkl list', '.txt'],
+          hkl: ['hkl list', '.txt'], vti: ['VTK XML image data', '.vti'],
         }[format];
         const handle = await window.showSaveFilePicker({
           suggestedName: filename,
-          types: [{ description, accept: { 'text/plain': [extension] } }],
+          types: [{ description, accept: { [mime]: [extension] } }],
         });
         const writable = await handle.createWritable();
         return {
@@ -1783,7 +1799,7 @@
     return {
       how: 'prepared as a chunked browser download',
       write: chunk => { parts.push(chunk); },
-      close: () => download(parts, filename, 'text/plain'),
+      close: () => download(parts, filename, mime),
       abort: () => {},
     };
   }
@@ -1799,7 +1815,7 @@
       precision: $('precision').value, layout: $('layout').value, compression: Number($('compression').value),
       recipe: steps.length ? { version: 1, steps } : null,
       profileWidth: Number($('profileWidth').value), hklTarget: $('hklTarget').value,
-      datFrame: $('datFrame').value, datSections: $('datSections').value,
+      datFrame: $('datFrame').value, datSections: $('datSections').value, vtkEncoding: $('vtkEncoding').value,
     };
     const bad = state.recipe.map((s, n) => [n + 1, s.enabled === false ? null : checkStep(s, n).error]).filter(x => x[1]);
     for (const [n, error] of bad) log(`Error: processing step ${n}: ${error}`, 'err');
@@ -1821,7 +1837,7 @@
     clearLog();
     const params = checkedParams();
     if (!params) return;
-    const format = params.format, text = TEXT_FORMATS.has(format);
+    const format = params.format, streamed = STREAMED.has(format);
     let sink = null;
     try {
       const plan = await run(params.recipe ? 'Processing…' : 'Preparing…', 'prepare', params);
@@ -1831,17 +1847,17 @@
         (direct ? ' in direct space (u, v, w)' : ''));
       log(`Cell for hkl <-> Q: ${fmtCell(plan.cell)}  [from ${plan.cellSource}]`);
       if (plan.estimate) {
-        log(`Output: about ${fmtBytes(plan.estimate)}` + (!text && params.compression ? ' before compression' : '') + '.');
+        log(`Output: about ${fmtBytes(plan.estimate)}` + (USES.compression.includes(format) && params.compression ? ' before compression' : '') + '.');
       }
       const tag = !plan.processed ? '' : direct && state.data.axesType !== 'uvw' ? '_dpdf' : '_processed';
       const outName = fileNameFor(state.data.baseName || 'converted', tag, format);
       const t0 = Date.now();
-      if (text) {
-        if (plan.nonFinite) {
-          log(`${fmtInt(plan.nonFinite)} NaN/infinite voxels written as 0` +
-            (format === 'dat' ? ' (RMCProfile leaves points with I = 0 out of the fit).' : '.'), 'warn');
-        }
-        sink = await openTextSink(outName, format);
+      if (plan.nonFinite) {
+        log(`${fmtInt(plan.nonFinite)} NaN/infinite voxels written as 0` +
+          (format === 'dat' ? ' (RMCProfile leaves points with I = 0 out of the fit).' : '.'), 'warn');
+      }
+      if (streamed) {
+        sink = await openTextSink(outName, format, format === 'vtk' && params.vtkEncoding === 'binary');
         const written = await run('Writing…', 'write', {}, { onChunk: chunk => sink.write(chunk) });
         await sink.close();
         log(`Wrote ${outName} (${sink.how})`, 'ok');
@@ -1853,11 +1869,14 @@
         if (written && written.snippet) log(`Grid for the ${params.hklTarget === 'scatty' ? 'Scatty' : 'Spinteract'} config:\n${written.snippet}`);
       } else {
         if (plan.estimate > 1.9 * 1073741824) {
-          log('Warning: HDF5 files are assembled in memory, and Chrome/Edge cannot hold one above ' +
-            'about 2 GB; float32, the /entry/data-only layout or compression reduce the size.', 'err');
+          log(USES.compression.includes(format)
+            ? 'Warning: HDF5 files are assembled in memory, and Chrome/Edge cannot hold one above ' +
+              'about 2 GB; float32, the /entry/data-only layout or compression reduce the size.'
+            : 'Warning: this file is assembled in memory, and above about 2 GB the browser may fail; float32 halves it.', 'err');
         }
         const result = await run('Writing…', 'write', {});
-        download(result.bytes, outName, 'application/x-hdf5');
+        if (result.kind === 'blob') download(result.blob, outName, 'application/octet-stream');
+        else download(result.bytes, outName, 'application/x-hdf5');
         log(`Wrote ${outName} in ${((Date.now() - t0) / 1000).toFixed(1)} s`, 'ok');
       }
       $('outDetail').textContent = `Saved ${outName}`;

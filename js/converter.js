@@ -1572,8 +1572,13 @@
     // 3D-ΔPDF go only to the HDF5 formats.
     function checkWritable(model, format) {
         if (model.axesType === 'uvw' && (format === 'dat' || format === 'vtk' || format === 'hkl')) {
-            throw new Error(`these are direct-space 3D-ΔPDF data (u, v, w axes), and ${format === 'dat'
-                ? 'the old .dat format' : 'VTK'} holds only Q-space grids; write unified HDF5 or Yell instead`);
+            const name = { dat: 'the old .dat format', vtk: 'legacy VTK', hkl: 'an hkl list' }[format];
+            throw new Error(`these are direct-space 3D-ΔPDF data (u, v, w axes), and ${name} holds only ` +
+                'Q-space grids; write unified HDF5, Yell, .npz, .vti or a CCP4/MRC map instead');
+        }
+        if (format === 'mrc' && model.axesType !== 'uvw') {
+            throw new Error('CCP4/MRC maps hold direct-space grids (a 3D-ΔPDF), and these data are in ' +
+                'reciprocal space; write .vti, .npz or HDF5 instead');
         }
     }
 
@@ -1920,8 +1925,10 @@
     // Legacy ASCII STRUCTURED_POINTS: line 1 "# vtk ...", line 2 a free-text
     // title, then keywords up to LOOKUP_TABLE and the values, x fastest (the
     // internal h-fastest order). Returns the grid in the file's own frame.
-    function vtkParser() {
-        let lineNo = 0, title = '', dims = null, origin = null, spacing = null;
+    // opts.binary: the header of a BINARY file; takeBinary reads the values.
+    function vtkParser(opts) {
+        const binary = !!(opts && opts.binary);
+        let lineNo = 0, title = '', dims = null, origin = null, spacing = null, scalarType = 'float';
         let values = null, n = 0, npoints = 0;
 
         function line(text) {
@@ -1945,7 +1952,8 @@
             }
             const tok = text.trim().split(/\s+/);
             const key = (tok[0] || '').toUpperCase();
-            if (key === 'BINARY') throw new Error('binary VTK is not supported (Scatty writes ASCII)');
+            if (key === 'BINARY' && !binary) throw new Error('binary VTK: read the whole file with readVtkBinary');
+            if (key === 'SCALARS') scalarType = (tok[2] || 'float').toLowerCase();
             if (key === 'DATASET' && (tok[1] || '').toUpperCase() !== 'STRUCTURED_POINTS') {
                 throw new Error('only STRUCTURED_POINTS VTK is supported');
             }
@@ -1971,8 +1979,38 @@
             };
         }
 
-        return { line, finish };
+        // Big-endian float or double values from byte `at` of u.
+        function takeBinary(u, at) {
+            const size = scalarType === 'double' ? 8 : 4;
+            if (scalarType !== 'float' && scalarType !== 'double') throw new Error(`binary VTK: ${scalarType} scalars are not supported`);
+            const have = Math.floor((u.length - at) / size);
+            if (have < npoints) throw new Error(`VTK data is truncated (${have} of ${npoints} values)`);
+            const dv = new DataView(u.buffer, u.byteOffset + at, npoints * size);
+            for (let i = 0; i < npoints; i++) values[i] = size === 8 ? dv.getFloat64(8 * i, false) : dv.getFloat32(4 * i, false);
+            n = npoints;
+        }
+
+        return { line, finish, takeBinary, started: () => !!values };
     }
+
+    // Legacy BINARY STRUCTURED_POINTS, as writeVtkChunks writes it with
+    // opts.binary (ParaView's legacy writer too): the whole file's bytes.
+    function readVtkBinary(bytes) {
+        const u = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+        const parser = vtkParser({ binary: true });
+        let at = 0;
+        while (!parser.started() && at < u.length) {
+            let end = u.indexOf(10, at);
+            if (end < 0) end = u.length;
+            parser.line(String.fromCharCode.apply(null, u.subarray(at, Math.min(end, at + 4096))).replace(/\r$/, ''));
+            at = end + 1;
+        }
+        if (parser.started()) parser.takeBinary(u, at);
+        return parser.finish();
+    }
+
+    // A legacy VTK header that declares BINARY data.
+    const isBinaryVtk = head => isVtk(head) && /^\s*BINARY\s*$/im.test(head.split('LOOKUP_TABLE')[0]);
 
     async function readVtkStream(stream, opts) {
         const parser = vtkParser();
@@ -2090,8 +2128,13 @@
     }
 
     // Legacy VTK readers do not parse NaN; empty points are 0 as in Scatty.
-    function* writeVtkChunks(model, cell, valuesPerChunk) {
+    // opts.binary: big-endian float32 after the header instead of ASCII.
+    function* writeVtkChunks(model, cell, valuesPerChunk, opts) {
         checkWritable(model, 'vtk');
+        if (opts && opts.binary) {
+            yield* writeVtkBinaryChunks(model, cell);
+            return;
+        }
         const { origin, spacing } = vtkGeometry(model, cell);
         const [nh, nk, nl] = model.dims;
         yield [
@@ -2117,6 +2160,27 @@
             }
         }
         if (out.length) yield out.join('\n') + '\n';
+    }
+
+    function* writeVtkBinaryChunks(model, cell) {
+        const { origin, spacing } = vtkGeometry(model, cell);
+        const [nh, nk, nl] = model.dims;
+        yield [
+            '# vtk DataFile Version 2.0', 'TITLE diffuse scattering', 'BINARY', 'DATASET STRUCTURED_POINTS',
+            `DIMENSIONS ${nh} ${nk} ${nl}`, 'ORIGIN ' + origin.map(x => x.toExponential(9)).join(' '),
+            'SPACING ' + spacing.map(x => x.toExponential(9)).join(' '), `POINT_DATA ${nh * nk * nl}`,
+            'SCALARS diffuse_scattering float', 'LOOKUP_TABLE default', '',
+        ].join('\n');
+        const n = model.values.length, per = 1 << 20;
+        for (let i = 0; i < n; i += per) {
+            const m = Math.min(per, n - i), out = new Uint8Array(4 * m), dv = new DataView(out.buffer);
+            for (let j = 0; j < m; j++) {
+                const x = model.values[i + j];
+                dv.setFloat32(4 * j, x === x && Number.isFinite(x) ? x : 0, false);
+            }
+            yield out;
+        }
+        yield '\n';
     }
 
     function writeVtk(model, cell) {
@@ -2370,6 +2434,319 @@
         await writeVolume(f, 'data', model, 'lFastest', volumeOptions(model, opts), opts.progress);
     }
 
+    // ------------------------------------------------- NumPy, VTK XML, CCP4/MRC
+
+    const CRC_TABLE = (() => {
+        const t = new Uint32Array(256);
+        for (let n = 0; n < 256; n++) {
+            let c = n;
+            for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+            t[n] = c >>> 0;
+        }
+        return t;
+    })();
+    function crc32(bytes) {
+        let c = 0xffffffff;
+        for (let i = 0; i < bytes.length; i++) c = CRC_TABLE[(c ^ bytes[i]) & 0xff] ^ (c >>> 8);
+        return (c ^ 0xffffffff) >>> 0;
+    }
+    const asBytes = a => new Uint8Array(a.buffer, a.byteOffset, a.byteLength);
+
+    // A .npy file (format 1.0): C-order array with the given shape.
+    function npyBytes(array, shape) {
+        const descr = array instanceof Float32Array ? '<f4' : array instanceof Int32Array ? '<i4' : '<f8';
+        let header = `{'descr': '${descr}', 'fortran_order': False, 'shape': (${shape.join(', ')}${shape.length === 1 ? ',' : ''}), }`;
+        const total = 10 + header.length + 1;
+        header += ' '.repeat((64 - total % 64) % 64) + '\n';
+        const out = new Uint8Array(10 + header.length + array.byteLength);
+        out.set([0x93, 0x4e, 0x55, 0x4d, 0x50, 0x59, 1, 0], 0);          // \x93NUMPY 1.0
+        new DataView(out.buffer).setUint16(8, header.length, true);
+        for (let i = 0; i < header.length; i++) out[10 + i] = header.charCodeAt(i);
+        out.set(asBytes(array), 10 + header.length);
+        return out;
+    }
+
+    // An uncompressed ZIP archive of named byte arrays (under 4 GiB).
+    function zipStore(files) {
+        const enc = new TextEncoder();
+        const parts = [], central = [];
+        let offset = 0;
+        for (const [name, data] of files) {
+            const nm = enc.encode(name), crc = crc32(data);
+            const local = new Uint8Array(30 + nm.length), lv = new DataView(local.buffer);
+            lv.setUint32(0, 0x04034b50, true);
+            lv.setUint16(4, 20, true);
+            lv.setUint32(14, crc, true);
+            lv.setUint32(18, data.length, true);
+            lv.setUint32(22, data.length, true);
+            lv.setUint16(26, nm.length, true);
+            local.set(nm, 30);
+            const dir = new Uint8Array(46 + nm.length), dv = new DataView(dir.buffer);
+            dv.setUint32(0, 0x02014b50, true);
+            dv.setUint16(4, 20, true);
+            dv.setUint16(6, 20, true);
+            dv.setUint32(16, crc, true);
+            dv.setUint32(20, data.length, true);
+            dv.setUint32(24, data.length, true);
+            dv.setUint16(28, nm.length, true);
+            dv.setUint32(42, offset, true);
+            dir.set(nm, 46);
+            parts.push(local, data);
+            central.push(dir);
+            offset += local.length + data.length;
+            if (offset > 0xfffffffe) throw new Error('the .npz archive would exceed 4 GB; use HDF5 output');
+        }
+        const size = central.reduce((a, d) => a + d.length, 0);
+        const end = new Uint8Array(22), ev = new DataView(end.buffer);
+        ev.setUint32(0, 0x06054b50, true);
+        ev.setUint16(8, files.length, true);
+        ev.setUint16(10, files.length, true);
+        ev.setUint32(12, size, true);
+        ev.setUint32(16, offset, true);
+        return new Blob(parts.concat(central, [end]));
+    }
+
+    // NumPy .npz: values (and sigma) as C-order [nl, nk, nh] arrays - the
+    // first grid axis varies fastest - with the grid and the cell beside them.
+    // np.load(f)['values'][l, k, h]; hkl = corner + h*step_vectors[0] + ...
+    function writeNpz(model, cell, opts) {
+        opts = opts || {};
+        const [nh, nk, nl] = model.dims;
+        const Arr = outputDtype(model, opts.precision) === '<f' ? Float32Array : Float64Array;
+        const cast = a => (a instanceof Arr ? a : Arr.from(a));
+        const f64 = a => Float64Array.from(a);
+        const files = [['values.npy', npyBytes(cast(model.values), [nl, nk, nh])]];
+        if (model.sigma) files.push(['sigma.npy', npyBytes(cast(model.sigma), [nl, nk, nh])]);
+        files.push(['corner.npy', npyBytes(f64(model.corner), [3])]);
+        files.push(['step_vectors.npy', npyBytes(f64(model.vectors.flat()), [3, 3])]);
+        files.push(['unit_cell.npy', npyBytes(f64(cell.lengths.concat(cell.angles)), [6])]);
+        const meta = {
+            creator: '3DSConvert', axes: model.axesType === 'uvw' ? 'uvw' : 'hkl', content: model.content || 'intensity',
+            order: 'values[i2, i1, i0]: i0 (along step_vectors[0]) varies fastest',
+            coordinate: 'corner + i0*step_vectors[0] + i1*step_vectors[1] + i2*step_vectors[2]',
+            unit_cell: 'a b c (Angstrom) alpha beta gamma (degrees)', symmetrized: model.symmetrized || 'none',
+            radiation: model.radiation || 'unknown',
+        };
+        files.push(['metadata.json', new TextEncoder().encode(JSON.stringify(meta, null, 1) + '\n')]);
+        return zipStore(files);
+    }
+
+    // Read one written by writeNpz (or np.savez with the same names).
+    // opts.crop as for the HDF5 readers.
+    function readNpz(bytes, opts) {
+        const u = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+        const dv = new DataView(u.buffer, u.byteOffset, u.byteLength);
+        let end = -1;
+        for (let i = u.length - 22; i >= Math.max(0, u.length - 65557); i--) {
+            if (dv.getUint32(i, true) === 0x06054b50) { end = i; break; }
+        }
+        if (end < 0) throw new Error('.npz: not a ZIP archive');
+        const count = dv.getUint16(end + 10, true);
+        let at = dv.getUint32(end + 16, true);
+        const members = {};
+        const dec = new TextDecoder();
+        for (let n = 0; n < count; n++) {
+            if (dv.getUint32(at, true) !== 0x02014b50) throw new Error('.npz: damaged central directory');
+            const method = dv.getUint16(at + 10, true), size = dv.getUint32(at + 20, true);
+            const nameLen = dv.getUint16(at + 28, true), extra = dv.getUint16(at + 30, true), comment = dv.getUint16(at + 32, true);
+            const local = dv.getUint32(at + 42, true);
+            const name = dec.decode(u.subarray(at + 46, at + 46 + nameLen));
+            const start = local + 30 + dv.getUint16(local + 26, true) + dv.getUint16(local + 28, true);
+            members[name] = { method, data: u.subarray(start, start + size) };
+            at += 46 + nameLen + extra + comment;
+        }
+        const npy = name => {
+            const m = members[name];
+            if (!m) return null;
+            if (m.method !== 0) throw new Error(`.npz: ${name} is compressed (np.savez_compressed); save with np.savez`);
+            const d = m.data, hl = d[8] | (d[9] << 8), header = dec.decode(d.subarray(10, 10 + hl));
+            const descr = /'descr':\s*'([<>|]?)([a-z])(\d+)'/.exec(header);
+            const shape = /'shape':\s*\(([^)]*)\)/.exec(header)[1].split(',').map(x => x.trim()).filter(Boolean).map(Number);
+            if (/'fortran_order':\s*True/.test(header)) throw new Error(`.npz: ${name} is in Fortran order`);
+            if (!descr || descr[1] === '>' || descr[2] !== 'f' || !['4', '8'].includes(descr[3])) {
+                throw new Error(`.npz: ${name} must be little-endian float32 or float64`);
+            }
+            const body = new Uint8Array(d.subarray(10 + hl));      // a copy, aligned (Buffer.slice would share memory)
+            return { values: descr[3] === '4' ? new Float32Array(body.buffer) : new Float64Array(body.buffer), shape };
+        };
+        const v = npy('values.npy');
+        if (!v) throw new Error('.npz: no "values" array');
+        const shape = v.shape.slice();
+        if (shape.length > 3) throw new Error(`.npz: "values" has ${shape.length} dimensions, expected up to 3`);
+        while (shape.length < 3) shape.unshift(1);
+        const dims = [shape[2], shape[1], shape[0]];
+        if (v.values.length !== dims[0] * dims[1] * dims[2]) throw new Error('.npz: "values" is shorter than its shape');
+        const corner = npy('corner.npy'), steps = npy('step_vectors.npy'), cellArr = npy('unit_cell.npy');
+        const notes = [];
+        if (!corner || !steps) notes.push('no corner/step_vectors in the archive: unit steps from 0 assumed');
+        const vec = steps ? Array.from(steps.values) : [1, 0, 0, 0, 1, 0, 0, 0, 1];
+        const meta = members['metadata.json'] ? JSON.parse(dec.decode(members['metadata.json'].data)) : {};
+        const sig = npy('sigma.npy');
+        if (sig && sig.values.length !== v.values.length) throw new Error('.npz: "sigma" and "values" differ in size');
+        const c = cellArr ? Array.from(cellArr.values) : [1, 1, 1, 90, 90, 90];
+        const axesType = meta.axes === 'uvw' ? 'uvw' : 'hkl';
+        let grid = {
+            dims, corner: corner ? Array.from(corner.values) : [0, 0, 0],
+            vectors: [0, 1, 2].map(a => (dims[a] > 1 ? vec.slice(3 * a, 3 * a + 3) : [0, 0, 0])),
+        };
+        let values = v.values, sigma = sig ? sig.values : undefined;
+        const box = readBox(grid.dims, grid.corner, grid.vectors, opts, notes, axesType);
+        if (box) {
+            values = cutBox(values, dims, box);
+            if (sigma) sigma = cutBox(sigma, dims, box);
+            grid = boxedGrid(box, grid.dims, grid.corner, grid.vectors);
+        }
+        return {
+            dims: grid.dims, corner: grid.corner, vectors: grid.vectors,
+            values, sigma, cellLengths: c.slice(0, 3), cellAngles: c.slice(3, 6),
+            radiation: normalizeRadiation(meta.radiation), axes: pickAxes(grid.vectors, grid.dims), axesType,
+            content: axesType === 'uvw' ? meta.content : undefined,
+            symmetrized: meta.symmetrized && meta.symmetrized !== 'none' ? meta.symmetrized : undefined, notes,
+        };
+    }
+
+    // The part of an h-fastest volume inside an index box.
+    function cutBox(values, dims, box) {
+        const d = boxDims(box), out = new values.constructor(d[0] * d[1] * d[2]);
+        let o = 0;
+        for (let k = box[2][0]; k <= box[2][1]; k++) {
+            for (let j = box[1][0]; j <= box[1][1]; j++) {
+                const base = (k * dims[1] + j) * dims[0];
+                out.set(values.subarray(base + box[0][0], base + box[0][1] + 1), o);
+                o += d[0];
+            }
+        }
+        return out;
+    }
+
+    // The grid's physical frame for VTK and maps: Q (1/Angstrom) for hkl
+    // data with a real cell, Cartesian Angstrom for direct-space (uvw) data,
+    // else plain hkl. Returns { origin, axes (3 Cartesian step vectors), unit }.
+    function physicalGrid(model, cell) {
+        const real = cell && !isUnitMetric(cell.lengths, cell.angles);
+        let map = x => x, unit = 'r.l.u.';
+        if (real && model.axesType === 'uvw') {
+            const A = cellToLattice(cell.lengths, cell.angles);
+            map = x => [0, 1, 2].map(r => A[r][0] * x[0] + A[r][1] * x[1] + A[r][2] * x[2]);
+            unit = 'Angstrom';
+        } else if (real) {
+            const B = reciprocalBasis(cellToLattice(cell.lengths, cell.angles));
+            map = x => hklToQ(B, x);
+            unit = '1/Angstrom';
+        }
+        return { origin: map(model.corner), axes: model.vectors.map(map), unit };
+    }
+
+    // VTK XML ImageData (.vti) with a Direction matrix, so sheared or rotated
+    // grids keep their geometry (ParaView 5.10 and later read Direction).
+    // Values (and sigma) as inline base64 binary; yields text chunks.
+    function* writeVtiChunks(model, cell, opts) {
+        opts = opts || {};
+        const { origin, axes, unit } = physicalGrid(model, cell);
+        const [nh, nk, nl] = model.dims;
+        const len = v => Math.hypot(v[0], v[1], v[2]);
+        const dirs = axes.map((v, a) => (model.dims[a] > 1 && len(v) > 0 ? v.map(x => x / len(v)) : null));
+        // a single-point axis gets a direction perpendicular to the others
+        for (let a = 0; a < 3; a++) {
+            if (dirs[a]) continue;
+            const others = dirs.filter(Boolean);
+            const n = others.length === 2 ? cross(others[0], others[1]) : [0, 1, 2].map(c => (c === a ? 1 : 0));
+            dirs[a] = n.map(x => x / (len(n) || 1));
+        }
+        const spacing = axes.map((v, a) => (model.dims[a] > 1 ? len(v) : 1));
+        const f = x => (Math.abs(x) < 1e-15 ? '0' : x.toPrecision(15));
+        const direction = [0, 1, 2].map(r => [0, 1, 2].map(c => f(dirs[c][r])).join(' ')).join(' ');
+        const type = outputDtype(model, opts.precision) === '<f' ? 'Float32' : 'Float64';
+        const Arr = type === 'Float32' ? Float32Array : Float64Array;
+        const extent = `0 ${nh - 1} 0 ${nk - 1} 0 ${nl - 1}`;
+        yield '<?xml version="1.0"?>\n' +
+            `<!-- 3DSConvert: ${model.axesType === 'uvw' ? '3D-ΔPDF' : 'diffuse scattering'}, axes in ${unit} -->\n` +
+            '<VTKFile type="ImageData" version="1.0" byte_order="LittleEndian" header_type="UInt64">\n' +
+            `  <ImageData WholeExtent="${extent}" Origin="${origin.map(f).join(' ')}" Spacing="${spacing.map(f).join(' ')}" Direction="${direction}">\n` +
+            `    <Piece Extent="${extent}">\n      <PointData Scalars="values">\n`;
+        const arrays = [['values', model.values]].concat(model.sigma ? [['sigma', model.sigma]] : []);
+        for (const [name, src] of arrays) {
+            yield `        <DataArray type="${type}" Name="${name}" format="binary">`;
+            const data = src instanceof Arr ? src : Arr.from(src);
+            const head = new Uint8Array(8);
+            new DataView(head.buffer).setBigUint64(0, BigInt(data.byteLength), true);
+            const bytes = asBytes(data);
+            // base64 in blocks of 3-byte multiples, the 8-byte header first
+            const block = 3 * 262144;
+            let carry = head;
+            for (let i = 0; i < bytes.length; i += block) {
+                const part = bytes.subarray(i, i + block);
+                const joined = new Uint8Array(carry.length + part.length);
+                joined.set(carry);
+                joined.set(part, carry.length);
+                const cut = i + block >= bytes.length ? joined.length : joined.length - joined.length % 3;
+                yield base64(joined.subarray(0, cut));
+                carry = joined.slice(cut);
+            }
+            if (carry.length) yield base64(carry);
+            yield '</DataArray>\n';
+        }
+        yield '      </PointData>\n    </Piece>\n  </ImageData>\n</VTKFile>\n';
+    }
+
+    function base64(bytes) {
+        let s = '';
+        for (let i = 0; i < bytes.length; i += 32768) s += String.fromCharCode.apply(null, bytes.subarray(i, i + 32768));
+        return typeof btoa === 'function' ? btoa(s) : Buffer.from(s, 'binary').toString('base64');
+    }
+
+    // CCP4/MRC map (MRC2014, mode 2 float32) of a direct-space grid along the
+    // lattice axes u, v, w - a 3D-ΔPDF for Chimera, Coot or PyMOL. The map
+    // "cell" spans the grid (N steps of a*du etc.), so the voxel size is the
+    // grid step; NXSTART etc. place the origin.
+    function writeMrc(model, cell) {
+        if (model.axesType !== 'uvw') throw new Error('CCP4/MRC maps are for direct-space data (a 3D-ΔPDF); these are in reciprocal space');
+        const [nx, ny, nz] = model.dims;
+        const step = [0, 1, 2].map(a => {
+            const v = model.vectors[a];
+            if (model.dims[a] > 1 && v.some((x, c) => c !== a && Math.abs(x) > 1e-9 * Math.max(...v.map(Math.abs)))) {
+                throw new Error('CCP4/MRC maps need grid axes along u, v and w');
+            }
+            if (model.dims[a] > 1 && !(v[a] > 0)) throw new Error('CCP4/MRC maps need ascending u, v and w axes');
+            return model.dims[a] > 1 ? v[a] : 1;
+        });
+        // the first voxel sits a whole number of steps from the origin
+        const start = model.corner.map((x, a) => {
+            const s = x / step[a], r = Math.round(s);
+            if (Math.abs(s - r) > 1e-6 * Math.max(1, Math.abs(s))) {
+                throw new Error('CCP4/MRC maps need the grid corner a whole number of steps from the origin');
+            }
+            return r === 0 ? 0 : r;
+        });
+        const values = Float32Array.from(model.values, x => (x === x ? x : 0));
+        let min = Infinity, max = -Infinity, sum = 0, sq = 0;
+        for (const x of values) {
+            if (x < min) min = x;
+            if (x > max) max = x;
+            sum += x;
+            sq += x * x;
+        }
+        const mean = sum / values.length, rms = Math.sqrt(Math.max(0, sq / values.length - mean * mean));
+        const head = new ArrayBuffer(1024), dv = new DataView(head);
+        const int = (w, v) => dv.setInt32(4 * w, v, true), flt = (w, v) => dv.setFloat32(4 * w, v, true);
+        int(0, nx); int(1, ny); int(2, nz); int(3, 2);
+        int(4, start[0]); int(5, start[1]); int(6, start[2]);
+        int(7, nx); int(8, ny); int(9, nz);
+        [0, 1, 2].forEach(a => flt(10 + a, [nx, ny, nz][a] * step[a] * cell.lengths[a]));
+        [0, 1, 2].forEach(a => flt(13 + a, cell.angles[a]));
+        int(16, 1); int(17, 2); int(18, 3);
+        flt(19, min); flt(20, max); flt(21, mean);
+        int(22, 1);                                   // ISPG
+        int(27, 20140);                               // NVERSION
+        new Uint8Array(head).set([0x4d, 0x41, 0x50, 0x20], 208);   // 'MAP '
+        new Uint8Array(head).set([0x44, 0x44, 0, 0], 212);         // little-endian machine stamp
+        flt(54, rms);
+        int(55, 1);                                   // NLABL
+        const label = '3DSConvert: 3D-ΔPDF (u, v, w grid)'.replace(/[^\x20-\x7e]/g, 'D').padEnd(80);
+        for (let i = 0; i < 80; i++) new Uint8Array(head)[224 + i] = label.charCodeAt(i);
+        return new Blob([new Uint8Array(head), asBytes(values)]);
+    }
+
     // ------------------------------------------------------------ conversions
 
     // Parent cell for a conversion: sources.prefer ('structure' | 'manual')
@@ -2451,8 +2828,11 @@
             const digits = model.dims.reduce((s, d) => s + String(d).length, 0);
             return n * (digits + (3 * (opts.nsec || 1) + 1) * 23 + 4);
         }
-        if (format === 'vtk') return n * 23 + 512;
+        if (format === 'vtk') return opts.binary ? n * 4 + 512 : n * 23 + 512;
         if (format === 'hkl') return n * 62;
+        if (format === 'npz') return n * item * (model.sigma ? 2 : 1) + 4096;
+        if (format === 'vti') return Math.ceil(n * item * (model.sigma ? 2 : 1) * 4 / 3) + 4096;
+        if (format === 'mrc') return n * 4 + 1024;
         return 0;
     }
 
@@ -2469,6 +2849,7 @@
         parseOldDat, readOldDatStream, writeOldDat, writeOldDatChunks, countNonFinite,
         isVtk, vtkFrame, parseGridConfig, parseVtk, readVtkStream, writeVtk, writeVtkChunks,
         isHklList, parseHklList, readHklListStream, hklListModel, writeHklListChunks, hklConfigSnippet,
+        writeNpz, readNpz, writeVtiChunks, writeMrc, crc32, readVtkBinary, isBinaryVtk,
         toHklModel, resolveCell, planConversion, checkWritable, estimateOutputBytes, outputDtype,
         writeUnifiedData, writeYell,
     };

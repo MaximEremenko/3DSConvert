@@ -390,6 +390,35 @@ const scenarios = [
         await setFile('#dataFile', out);
         await waitLog(/RMCProfile \.dat · hkl \| grid 5 x 5 x 5 in hkl/);
     }],
+    ['.npz and .vti out, the .npz read back; a 3D-ΔPDF as a CCP4/MRC map', async () => {
+        await setFile('#dataFile', path.join(ROOT, 'Examples/example_unified.h5'));
+        await waitLog(/Unified data format \| grid 5 x 5 x 5/);
+        if (!(await evaluate('document.querySelector("[data-format=mrc]").disabled'))) throw new Error('MRC offered for Q-space data');
+        await setValue('outFormat', 'npz');
+        const npz = await convert('example_unified.npz');
+        const ref = await H.Converter.readUnifiedData(await H.openH5('Examples/example_unified.h5'));
+        const back = H.Converter.readNpz(fs.readFileSync(npz));
+        if (H.maxAbsDiff(back.values, ref.values) !== 0 || H.maxAbsDiff(back.vectors.flat(), ref.vectors.flat()) !== 0) {
+            throw new Error('the .npz differs from the input');
+        }
+        await setValue('outFormat', 'vti');
+        const vti = fs.readFileSync(await convert('example_unified.vti'), 'utf8');
+        if (!/<ImageData WholeExtent="0 4 0 4 0 4"[^>]* Direction="1\.0+ 0 0 0 1\.0+ 0 0 0 1\.0+"/.test(vti)) {
+            throw new Error('.vti header ' + vti.slice(0, 400));
+        }
+        await setValue('stepOp', 'deltaPdf');
+        await evaluate('document.getElementById("addStep").click()');
+        if (!(await evaluate('document.querySelector("[data-format=dat]").disabled'))) throw new Error('.dat offered for a 3D-ΔPDF');
+        await setValue('outFormat', 'mrc');
+        const mrc = fs.readFileSync(await convert('example_unified_dpdf.mrc'));
+        if (mrc.readInt32LE(0) !== 5 || mrc.readInt32LE(12) !== 2 || mrc.readInt32LE(16) !== -2 ||
+            mrc.toString('latin1', 208, 212) !== 'MAP ' || mrc.length !== 1024 + 4 * 125) {
+            throw new Error('bad MRC header');
+        }
+        await fresh();
+        await setFile('#dataFile', npz);
+        await waitLog(/NumPy \.npz \| grid 5 x 5 x 5 \| axes hkl/);
+    }],
     ['crop on read: only the chosen hkl box is read', async () => {
         await evaluate(`(() => {
             for (const [axis, end, v] of [['h', 0, -0.5], ['h', 1, 1], ['l', 0, 0], ['l', 1, 0.5]]) {
