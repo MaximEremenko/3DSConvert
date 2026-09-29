@@ -300,10 +300,27 @@
         if (numberType !== 'real') {
             throw new Error(`unified data: unsupported data_type_number ${numberType}`);
         }
-        if (axesType !== 'hkl' && axesType !== 'Q') {
-            throw new Error(`unified data axes are ${axesType}; this 3-D diffuse converter supports hkl or Q axes`);
+        if (axesType !== 'hkl' && axesType !== 'Q' && axesType !== 'uvw') {
+            throw new Error(`unified data axes are ${axesType}; this 3-D converter supports hkl or Q axes ` +
+                '(reciprocal space) and uvw axes (3D-ΔPDF)');
         }
         return { axesType, numberType };
+    }
+
+    // What the file says about its values, kept so the writers can pass it
+    // on: data_type_content for direct-space data, data_type_symmetrized.
+    function dataTypeMeta(axesType, content, symmetrized) {
+        const out = {};
+        if (axesType === 'uvw') out.content = content || '3d-delta-pdf';
+        if (symmetrized && symmetrized !== 'none') out.symmetrized = symmetrized;
+        return out;
+    }
+
+    // Grid component (0-2) an axis name stands for: h/k/l, or u/v/w for
+    // direct (Patterson) space; -1 for anything else.
+    function axisComponent(name) {
+        const n = String(name).trim().toLowerCase();
+        return n.length === 1 ? Math.max('hkl'.indexOf(n), 'uvw'.indexOf(n)) : -1;
     }
 
     // ----------------------------------------------------------------- cell math
@@ -494,6 +511,11 @@
         if (model) {
             model.dictionary = identity.dictionary || UNIFIED_DATA_DICTIONARY;
             model.legacyContract = identity.legacy;
+            const steps = datasetText(f, 'entry/process/recipe/description');
+            if (steps) {
+                model.notes.push(`processed by ${datasetText(f, 'entry/process/program') || 'another program'} ` +
+                    `on ${datasetText(f, 'entry/process/date') || 'an unknown date'}:\n${steps}`);
+            }
             return model;
         }
         throw new Error('no unified diffuse data group found');
@@ -554,10 +576,10 @@
         const corner = [0, 0, 0];
         const vectors = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
         names.forEach((name, axis) => {
-            const comp = 'hkl'.indexOf(name.toLowerCase());
-            if (comp < 0 || name.length !== 1) {
-                throw new Error(`scattering/data: axis "${name}" is not h, k or l; ` +
-                    'only reciprocal-space hkl grids are supported');
+            const comp = axisComponent(name);
+            if (comp < 0) {
+                throw new Error(`scattering/data: axis "${name}" is not h, k, l or u, v, w; ` +
+                    'only hkl and 3D-ΔPDF uvw grids are supported');
             }
             const coords = numbersAt(f, g + name, 'scattering/data');
             const n = dims[axis];
@@ -613,17 +635,18 @@
             angles = [90, 90, 90];
             notes.push('no unit cell stored; treated as unit metric');
         }
+        const comps = names.map(axisComponent);
         const axes = numbersAt(f, g + 'data_axes') ||
-            (names.every(n => ['h', 'k', 'l'].includes(n)) && new Set(names).size === 3
-                ? names.map(n => 'hkl'.indexOf(n) + 1) : pickAxes(vectors, dims));
+            (comps.every(c => c >= 0) && new Set(comps).size === 3 ? comps.map(c => c + 1) : pickAxes(vectors, dims));
         const radiation = normalizeRadiation(
             attributeText(group, 'radiation') || attributeText(group, 'scattering'));
         const contract = validateDataContract(f, group, attributeText(group, 'space') || 'reciprocal');
-        return {
+        return Object.assign({
             dims, corner, vectors, values,
             cellLengths: lengths, cellAngles: angles, radiation, axes,
             axesType: contract.axesType, numberType: contract.numberType, notes,
-        };
+        }, dataTypeMeta(contract.axesType, attributeText(group, 'content'),
+            attributeText(group, 'data_type_symmetrized')));
     }
 
     function sameShape(a, b) {
@@ -671,11 +694,12 @@
         const radiation = normalizeRadiation(datasetText(f, g + 'data_radiation'));
         const reciprocal = datasetText(f, g + 'data_type_reciprocal');
         const contract = validateDataContract(f, f.get('entry/data'), reciprocal);
-        return {
+        return Object.assign({
             dims, corner, vectors, values,
             cellLengths: lengths, cellAngles: angles, radiation, axes,
             axesType: contract.axesType, numberType: contract.numberType, notes,
-        };
+        }, dataTypeMeta(contract.axesType, datasetText(f, g + 'data_type_content'),
+            datasetText(f, g + 'data_type_symmetrized')));
     }
 
     // is_direct as a number (booleans and 64-bit ints included), or null.
@@ -696,14 +720,14 @@
 
     // opts.space: 'auto' (default) trusts is_direct; 'reciprocal' overrides an
     // is_direct value that is neither 0 nor 1. Also takes the slab options.
+    // is_direct = 1 marks Yell's 3D-ΔPDF output: a direct-space grid on u, v, w.
     async function readYell(f, opts) {
         opts = opts || {};
         const notes = [];
         const flag = yellDirectFlag(f);
-        if (flag === 1) {
-            throw new Error('Yell file holds direct-space data (is_direct = 1); only reciprocal space is supported');
-        }
-        if (flag !== null && flag !== 0) {
+        const direct = flag === 1;
+        if (direct) notes.push('is_direct = 1: direct-space (3D-ΔPDF) data on u, v, w axes');
+        if (flag !== null && flag !== 0 && !direct) {
             if (opts.space !== 'reciprocal') {
                 const err = new Error(`Yell is_direct = ${flag} is neither 0 nor 1, so the flag looks ` +
                     'corrupted; if the file holds reciprocal-space intensities, set the Yell data space ' +
@@ -737,11 +761,11 @@
             vectors = [[s[0], 0, 0], [0, s[1], 0], [0, 0, s[2]]];
         }
         const cell = numbersAt(f, 'unit_cell', 'Yell file');
-        return {
+        return Object.assign({
             dims: [nh, nk, nl], corner, vectors, values,
             cellLengths: cell.slice(0, 3), cellAngles: cell.slice(3, 6),
             radiation: 'unknown', axes: [1, 2, 3], notes,
-        };
+        }, direct ? { axesType: 'uvw', content: '3d-delta-pdf' } : {});
     }
 
     // ------------------------------------------------------------------ NeXus
@@ -1393,9 +1417,19 @@
         return axes;
     }
 
+    // The text formats hold Q-space grids; direct-space (uvw) data such as a
+    // 3D-ΔPDF go only to the HDF5 formats.
+    function checkWritable(model, format) {
+        if (model.axesType === 'uvw' && (format === 'dat' || format === 'vtk')) {
+            throw new Error(`these are direct-space 3D-ΔPDF data (u, v, w axes), and ${format === 'dat'
+                ? 'the old .dat format' : 'VTK'} holds only Q-space grids; write unified HDF5 or Yell instead`);
+        }
+    }
+
     // Non-finite intensities are written as 0.0: RMCProfile treats I = 0 as a
     // masked point (excluded from chi^2), while a literal NaN would poison it.
     function* writeOldDatChunks(model, cell, linesPerChunk) {
+        checkWritable(model, 'dat');
         const A = cellToLattice(cell.lengths, cell.angles);
         const B = reciprocalBasis(A);
         const [nh, nk, nl] = model.dims;
@@ -1670,6 +1704,7 @@
 
     // Legacy VTK readers do not parse NaN; empty points are 0 as in Scatty.
     function* writeVtkChunks(model, cell, valuesPerChunk) {
+        checkWritable(model, 'vtk');
         const { origin, spacing } = vtkGeometry(model, cell);
         const [nh, nk, nl] = model.dims;
         yield [
@@ -1703,14 +1738,45 @@
 
     // ----------------------------------------------------------------- writers
 
+    // h5wasm stores 'S' strings as UTF-8, sized in bytes.
     function fixedStr(s) {
         const t = String(s);
-        return { data: [t], shape: [1], dtype: 'S' + Math.max(1, t.length) };
+        return { data: [t], shape: [1], dtype: 'S' + Math.max(1, new TextEncoder().encode(t).length) };
     }
 
     function axisNames(model) {
-        const basis = ['h', 'k', 'l'];
+        const basis = model.axesType === 'uvw' ? ['u', 'v', 'w'] : ['h', 'k', 'l'];
         return [0, 1, 2].map(a => basis[(model.axes[a] || a + 1) - 1]);
+    }
+
+    // The data_type labels of the unified contract, as DiffuseCode's
+    // unified_write_data spells them: reciprocal-space intensities, or a
+    // 3D-ΔPDF in direct (Patterson) space.
+    function dataTypeLabels(model) {
+        const direct = model.axesType === 'uvw';
+        return {
+            style: direct ? 'single_pdf' : 'single_diffraction',
+            axes: direct ? 'uvw' : 'hkl',
+            content: direct ? model.content || '3d-delta-pdf' : 'intensity',
+            space: direct ? 'patterson' : 'reciprocal',
+            symmetrized: model.symmetrized || 'none',
+        };
+    }
+
+    // /entry/process (NXprocess): what was done to the data. The recipe sits
+    // in an NXnote as JSON (to load and rerun) with a readable step list.
+    // process: { program, recipe, description }.
+    function writeProcess(entry, process) {
+        const p = entry.create_group('process');
+        p.create_attribute('NX_class', 'NXprocess');
+        const text = (g, name, s) => g.create_dataset(Object.assign({ name }, fixedStr(s)));
+        text(p, 'program', process.program || '3DSConvert');
+        text(p, 'date', new Date().toISOString());
+        const note = p.create_group('recipe');
+        note.create_attribute('NX_class', 'NXnote');
+        text(note, 'type', 'application/json');
+        text(note, 'description', process.description || 'processing recipe');
+        text(note, 'data', JSON.stringify(process.recipe));
     }
 
     const DIRECT_WRITE_BYTES = 64 * 1048576;
@@ -1785,15 +1851,17 @@
         };
     }
 
-    // opts: { precision, layout ('both' | 'entry'), compression (gzip level,
-    // 0 = none), tick, progress, directWriteBytes }.
+    // meta: { creationMethod, authorName, experiment, process (see
+    // writeProcess) }. opts: { precision, layout ('both' | 'entry'),
+    // compression (gzip level, 0 = none), tick, progress, directWriteBytes }.
     async function writeUnifiedData(f, model, cell, meta, opts) {
         meta = meta || {};
         opts = opts || {};
-        if (model.axesType && model.axesType !== 'hkl') {
-            throw new Error('unified writer requires hkl axes; convert Q axes with modelAxesToHkl first');
+        if (model.axesType && model.axesType !== 'hkl' && model.axesType !== 'uvw') {
+            throw new Error('unified writer requires hkl or uvw axes; convert Q axes with modelAxesToHkl first');
         }
         const names = axisNames(model);
+        const type = dataTypeLabels(model);
         const today = new Date().toISOString().slice(0, 10);
         const method = meta.creationMethod || 'RMCProfile web format converter';
         const author = meta.authorName || 'RMCProfile';
@@ -1822,14 +1890,14 @@
             sd.create_attribute('indices_ord', 1, [], '<i');
             sd.create_attribute('indices_top', 2, [], '<i');
             sd.create_attribute('radiation', radiation);
-            sd.create_attribute('space', 'reciprocal');
-            sd.create_attribute('content', 'intensity');
+            sd.create_attribute('space', type.space);
+            sd.create_attribute('content', type.content);
             sd.create_attribute('dimension', Math.max(1, model.dims.filter(d => d > 1).length), [], '<i');
             sd.create_attribute('data_type_experiment', meta.experiment || 'unknown');
-            sd.create_attribute('data_type_style', 'single_diffraction');
-            sd.create_attribute('data_type_axes', 'hkl');
+            sd.create_attribute('data_type_style', type.style);
+            sd.create_attribute('data_type_axes', type.axes);
             sd.create_attribute('data_type_with_bragg', 'unknown');
-            sd.create_attribute('data_type_symmetrized', 'none');
+            sd.create_attribute('data_type_symmetrized', type.symmetrized);
             sd.create_attribute('data_type_number', 'real');
             sd.create_attribute('data_rad_symbol', 'unknown');
 
@@ -1865,12 +1933,12 @@
             data: [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0], shape: [3, 4, 1], dtype: '<d',
         });
         eds('data_type_experiment', fixedStr(meta.experiment || 'unknown'));
-        eds('data_type_style', fixedStr('single_diffraction'));
-        eds('data_type_axes', fixedStr('hkl'));
-        eds('data_type_content', fixedStr('intensity'));
-        eds('data_type_reciprocal', fixedStr('reciprocal'));
+        eds('data_type_style', fixedStr(type.style));
+        eds('data_type_axes', fixedStr(type.axes));
+        eds('data_type_content', fixedStr(type.content));
+        eds('data_type_reciprocal', fixedStr(type.space));
         eds('data_type_with_bragg', fixedStr('unknown'));
-        eds('data_type_symmetrized', fixedStr('none'));
+        eds('data_type_symmetrized', fixedStr(type.symmetrized));
         eds('data_type_number', fixedStr('real'));
         eds('data_radiation', fixedStr(radiation));
         eds('data_rad_symbol', fixedStr('unknown'));
@@ -1888,13 +1956,17 @@
         eds('audit_creation_date', fixedStr(today));
         eds('audit_creation_method', fixedStr(method));
         eds('audit_author_name', fixedStr(author));
+        if (meta.process) writeProcess(entry, meta.process);
     }
 
     // opts as for writeUnifiedData (layout does not apply).
     async function writeYell(f, model, cell, opts) {
         opts = opts || {};
+        if (model.axesType && model.axesType !== 'hkl' && model.axesType !== 'uvw') {
+            throw new Error('Yell writer requires hkl or uvw axes; convert Q axes with modelAxesToHkl first');
+        }
         f.create_dataset({ name: 'format', data: ['Yell 1.0'], shape: [1], dtype: 'S8' });
-        f.create_dataset({ name: 'is_direct', data: [0], shape: [1], dtype: '<b' });
+        f.create_dataset({ name: 'is_direct', data: [model.axesType === 'uvw' ? 1 : 0], shape: [1], dtype: '<b' });
         f.create_dataset({ name: 'lower_limits', data: model.corner, shape: [3], dtype: '<d' });
         f.create_dataset({
             name: 'step_sizes',
@@ -1969,6 +2041,7 @@
             model = modelAxesToHkl(model, resolved.cell);
             logs.push('Converted unified Cartesian Q axes to hkl using the selected parent cell.');
         }
+        checkWritable(model, params.format);
         if (text && isUnitMetric(resolved.cell.lengths, resolved.cell.angles)) {
             throw new Error('cannot write ' + params.format + ' with a unit-metric cell - supply a ' +
                 'structure file or a manual parent cell');
@@ -2004,7 +2077,7 @@
         readMantidMD, readNexusData, nexusCandidates, unresolvedLinks, planLinkMounts, projectionVector,
         parseOldDat, readOldDatStream, writeOldDat, writeOldDatChunks, countNonFinite,
         isVtk, vtkFrame, parseGridConfig, parseVtk, readVtkStream, writeVtk, writeVtkChunks,
-        toHklModel, resolveCell, planConversion, estimateOutputBytes, outputDtype,
+        toHklModel, resolveCell, planConversion, checkWritable, estimateOutputBytes, outputDtype,
         writeUnifiedData, writeYell,
     };
 }));

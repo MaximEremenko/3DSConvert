@@ -98,13 +98,55 @@ test('Yell: is_direct that is neither 0 nor 1 needs an explicit override', async
     assert.match(m.notes.join('\n'), /is_direct = 6144 ignored/);
 });
 
-test('Yell: is_direct = 1 (direct space) is refused even with the override', async () => {
+test('Yell: is_direct = 1 is a direct-space 3D-ΔPDF on u, v, w axes', async () => {
     const f = await yellFile(w => {
         w.create_dataset({ name: 'data', data: new Float64Array(8), shape: [2, 2, 2], dtype: '<d' });
         w.create_dataset({ name: 'step_sizes', data: [1, 1, 1], shape: [3], dtype: '<d' });
         w.create_dataset({ name: 'is_direct', data: [1], shape: [], dtype: '<B' });
     });
-    await assert.rejects(Converter.readYell(f, { space: 'reciprocal' }), /direct-space data/);
+    const m = await Converter.readYell(f);
+    assert.equal(m.axesType, 'uvw');
+    assert.equal(m.content, '3d-delta-pdf');
+    assert.match(m.notes.join('\n'), /direct-space \(3D-ΔPDF\)/);
+});
+
+test('direct-space data round-trip through unified and Yell and refuse the text formats', async () => {
+    const cell = { lengths: [4, 5, 6], angles: [90, 90, 120] };
+    const model = {
+        dims: [nh, nk, nl], corner: [-0.5, -0.25, -1], vectors: [[0.25, 0, 0], [0, 0.125, 0], [0, 0, 0.5]],
+        values: hFastest(), axes: [1, 2, 3], axesType: 'uvw', content: '3d-delta-pdf', symmetrized: 'laue',
+        cellLengths: cell.lengths, cellAngles: cell.angles, radiation: 'neutron',
+    };
+    const process = { program: '3DSConvert', recipe: { version: 1, steps: [{ op: 'deltaPdf' }] },
+        description: '1. 3D-ΔPDF by FFT' };
+    const file = await buildH5(f => Converter.writeUnifiedData(f, model, cell, { process }));
+    const text = p => String(file.get(p).value).trim();
+    assert.equal(text('entry/data/data_type_axes'), 'uvw');
+    assert.equal(text('entry/data/data_type_reciprocal'), 'patterson');
+    assert.equal(text('entry/data/data_type_style'), 'single_pdf');
+    assert.equal(text('entry/data/data_type_content'), '3d-delta-pdf');
+    assert.equal(text('entry/data/data_type_symmetrized'), 'laue');
+    assert.deepEqual(Array.from(file.get('scattering/data').attrs.axes.value), ['u', 'v', 'w']);
+    assert.equal(file.get('scattering/data').attrs.space.value, 'patterson');
+    assert.equal(file.get('entry/process').attrs.NX_class.value, 'NXprocess');
+    assert.deepEqual(JSON.parse(text('entry/process/recipe/data')), process.recipe);
+    assert.equal(text('entry/process/recipe/description'), process.description);   // UTF-8 kept whole
+    for (const m of [await Converter.readUnifiedData(file),
+        await Converter.readUnifiedData(await buildH5(f => Converter.writeUnifiedData(f, model, cell, {}, { layout: 'entry' }))),
+        await Converter.readYell(await buildH5(f => Converter.writeYell(f, model, cell)))]) {
+        assert.equal(m.axesType, 'uvw');
+        assert.equal(m.content, '3d-delta-pdf');
+        assert.deepEqual(m.corner, model.corner);
+        assert.deepEqual(m.vectors, model.vectors);
+        assert.deepEqual(Array.from(m.values), Array.from(model.values));
+    }
+    assert.match((await Converter.readUnifiedData(file)).notes.join('\n'), /processed by 3DSConvert on .*\n1\. 3D-ΔPDF/);
+    for (const format of ['dat', 'vtk']) {
+        assert.throws(() => Converter.planConversion({ model }, { format }), /direct-space 3D-ΔPDF/);
+    }
+    assert.throws(() => Array.from(Converter.writeOldDatChunks(model, cell)), /direct-space/);
+    const plan = Converter.planConversion({ model }, { format: 'yell' });
+    assert.equal(plan.model.axesType, 'uvw');
 });
 
 test('Yell: 64-bit is_direct = 0 reads as reciprocal space', async () => {
