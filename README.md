@@ -163,15 +163,23 @@ and a CCP4/MRC map holds only them.
   normalising with zero become NaN, as do bins without events; the log
   reports how many. The cell comes from
   `experiment0/sample/oriented_lattice`, and the radiation is set to
-  neutron. Q-frame and 4-D workspaces, MDEventWorkspaces, event
-  workspaces and raw instrument files are refused with an explanation.
+  neutron. Workspaces in the Q (sample frame) are put on hkl axes through
+  their own UB (`oriented_lattice/orientation_matrix`): hkl = (2π UB)⁻¹ Q,
+  with the sign of Q from `QConvention` (−1 for Mantid's default Inelastic
+  convention) — a sheared hkl grid, exact; this is checked on synthetic
+  files only, as no real Q-frame workspace was at hand. A fourth dimension
+  (DeltaE) integrated into one bin is fine. Q (lab frame) workspaces,
+  open 4-D ones, MDEventWorkspaces, event workspaces and raw instrument
+  files are refused with an explanation.
 - **NeXus NXdata**: the group named by the `@default` attributes is read,
   or another one chosen from the list that appears when a file holds
   several. Signals and axes are found from the current (`@signal`, `@axes`,
   `@AXISNAME_indices`) and legacy (`signal=1`, `axes="Qh:Qk:Ql"`)
   attributes, in any array order. Axes named h/k/l (`Qh`, `H (r.l.u.)`,
   ...) or projections like `[H,H,0]` give an hkl grid; `Qx`/`Qy`/`Qz` in
-  1/Angstrom give Cartesian Q, converted to hkl with the parent cell. Axes
+  1/Angstrom give Cartesian Q, converted to hkl with the UB matrix when
+  the file (`sample/ub_matrix`) or the Cell card gives one, else with the
+  parent cell (a along x). Axes
   may hold points or bin edges and must be evenly spaced. A `weights`
   dataset divides the signal (zero weight becomes NaN). The cell, Laue
   group, temperature and wavelength are read from the entry's sample and
@@ -269,14 +277,35 @@ remembered; by default the page follows the system).
 
 **Preview**: the planes of the grid as read, and after the recipe
 (*After recipe* runs it once; Convert then reuses the result). A slider
-moves through the planes; the colour scale is viridis on a log or linear
-robust range, blue–orange and centred on zero for a 3D-ΔPDF, and grey marks
-voxels without data; a histogram of the slice sits under it. Pointing at the
-slice reads out its coordinates and value; a click pins that point, and the
+moves through the planes, and the box beside it takes a typed position. The
+colour scale is viridis on a log or linear range, blue–orange and centred on
+zero for a 3D-ΔPDF, and grey marks voxels without data; a histogram of the
+slice sits under it. The levels come from the whole volume and stay while
+you move through the planes; typed levels stay likewise until *auto*, and
+*per slice* scales each plane on its own.
+
+- **Custom** planes are the layers u h + v k + w l = t of a normal you type:
+  [0 0 1] gives the (h k 0) planes, [1 −1 0] the (h h l) ones (for a 3D-ΔPDF
+  the normal is in hkl and the layers are in u, v, w). They are sampled by
+  interpolation, a voxel per pixel; the slider steps through the layers and
+  a typed level may fall between them.
+- **Cartesian (UB)** redraws any plane on a square grid in Cartesian space,
+  Q = 2π UB hkl, so angles and lengths are true (a hexagonal (h k 0) plane
+  shows its 120°). Without a UB the cell sets the frame, with a along x; a
+  3D-ΔPDF is drawn in Å. The UB comes from the data file (Mantid's oriented
+  lattice, NeXus `sample/ub_matrix`, rspace3d), from a subhkl structure
+  file, or is typed under *Orientation (UB matrix)* in the Cell card.
+- **Zoom**: the wheel or + and − zoom about the pointer, dragging pans, and
+  0, a double-click or the 1:1 button shows the whole plane; the zoom stays
+  while the slider moves. The |Q| profile zooms and pans along |Q| the same
+  way.
+
+Pointing at the slice reads out the three coordinates of the point, its
+value and, in the Cartesian frame, |Q|; a click pins the point, and the
 other planes then go through it. The slice also works from the keyboard:
 arrow keys move a cursor, Enter pins it, Page Up and Page Down change the
-plane. The *|Q| profile* view plots the shell averages against |Q|, with
-their standard error, for the data as read or after the recipe.
+plane, + − 0 zoom. The *|Q| profile* view plots the shell averages against
+|Q|, with their standard error, for the data as read or after the recipe.
 
 Text output (`.dat`, `.vtk`, `.vti`, hkl lists, profiles) is streamed directly to disk in
 browsers that support the File System Access API (Chromium); elsewhere a
