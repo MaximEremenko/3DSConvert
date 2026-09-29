@@ -331,6 +331,17 @@ const scenarios = [
         const off = await evaluate('Array.from(document.querySelectorAll("#steps .step"), li => li.classList.contains("off")).join(",")');
         if (off !== 'false,true') throw new Error('switched off: ' + off);
         if (await evaluate('document.querySelector("[data-format=dat]").disabled')) throw new Error('.dat disabled by a switched-off ΔPDF');
+        // after a ΔPDF, a Bragg mask is flagged at once; symmetrize is fine in direct space
+        await evaluate('document.getElementById("jsonBtn").click()');
+        await evaluate(`(() => {
+            document.getElementById('recipeJson').value = JSON.stringify({ steps: [
+                { op: 'deltaPdf' }, { op: 'maskBragg', size: 0.1 }, { op: 'symmetrize', laue: 'm-3m' }] });
+            document.getElementById('jsonApply').click();
+        })()`);
+        const status = await evaluate('Array.from(document.querySelectorAll("#steps .step .hint"), h => h.className + ": " + h.textContent).join("\\n")');
+        if (!/hint err: needs reciprocal-space data, but step 1 \(3D-ΔPDF\)/.test(status) || /hint err: .*symmetrize/i.test(status)) {
+            throw new Error('statuses:\n' + status);
+        }
     }],
     ['NeXus entry + externally linked data file -> unified', async () => {
         await setFile('#dataFile', [path.join(work, 'wrapper.nxs'), path.join(work, 't.nxs')]);

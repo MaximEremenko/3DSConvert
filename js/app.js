@@ -382,6 +382,7 @@
       }
       showData(s);
       renderCell();
+      renderSteps();
       refreshPreview();
     } catch (e) {
       const msg = e.cancelled ? 'reading cancelled' : e.message;
@@ -729,16 +730,23 @@
     return { node, read: () => e.value };
   }
 
-  // The step as valid recipe JSON, or the reason it is not.
-  function checkStep(step) {
+  // The step as valid recipe JSON, or the reason it is not. With its index
+  // n, also whether the data still are in reciprocal space when it runs.
+  function checkStep(step, n) {
     const copy = Object.assign({}, step);
     delete copy.enabled;
+    let text;
     try {
-      const normal = Processing.normalizeRecipe({ steps: [copy] }).steps[0];
-      return { text: Processing.describeStep(normal) };
+      text = Processing.describeStep(Processing.normalizeRecipe({ steps: [copy] }).steps[0]);
     } catch (e) {
       return { error: e.message.replace(/^recipe step 1 /, '') };
     }
+    if (n !== undefined && step.enabled !== false && Processing.RECIPROCAL_ONLY.includes(step.op)) {
+      const pdf = state.recipe.slice(0, n).findIndex(s => s.op === 'deltaPdf' && s.enabled !== false);
+      if (pdf >= 0) return { error: `needs reciprocal-space data, but step ${pdf + 1} (3D-ΔPDF) turns them into a direct-space map; move this step above it` };
+      if (state.data && state.data.axesType === 'uvw') return { error: 'needs reciprocal-space data, but the loaded data are a direct-space map' };
+    }
+    return { text };
   }
 
   // The steps that run: switched-off ones stay out.
@@ -883,7 +891,7 @@
         if (!on) next.enabled = false;
         if (!quiet) rememberEdit();
         state.recipe[n] = next;
-        const c = checkStep(next);
+        const c = checkStep(next, n);
         status.textContent = c.error || c.text;
         status.className = c.error ? 'hint err' : 'hint';
         item.classList.toggle('bad', !!c.error);
@@ -1737,7 +1745,7 @@
       recipe: steps.length ? { version: 1, steps } : null,
       profileWidth: Number($('profileWidth').value),
     };
-    const bad = state.recipe.map((s, n) => [n + 1, s.enabled === false ? null : checkStep(s).error]).filter(x => x[1]);
+    const bad = state.recipe.map((s, n) => [n + 1, s.enabled === false ? null : checkStep(s, n).error]).filter(x => x[1]);
     for (const [n, error] of bad) log(`Error: processing step ${n}: ${error}`, 'err');
     if (bad.length) return null;
     if (params.format === 'profile' && !(params.profileWidth > 0)) {
