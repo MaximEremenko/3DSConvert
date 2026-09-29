@@ -107,7 +107,7 @@ function converterWorker(self, h5wasm, Converter, Processing, wgpuFftWeb) {
         return new h5wasm.File(`${MOUNT}/${relPath}`, 'r');
     }
 
-    const DATA_KINDS = new Set(['unified', 'yell', 'mantid-md', 'nexus']);
+    const DATA_KINDS = new Set(['unified', 'yell', 'mantid-md', 'nexus', 'rspace3d']);
 
     function kindOf(relPath) {
         const f = openAt(relPath);
@@ -168,6 +168,7 @@ function converterWorker(self, h5wasm, Converter, Processing, wgpuFftWeb) {
         if (kind === 'unified') return Converter.readUnifiedData(f, opts);
         if (kind === 'mantid-md') return Converter.readMantidMD(f, opts);
         if (kind === 'nexus') return Converter.readNexusData(f, opts);
+        if (kind === 'rspace3d') return Converter.readRspace3d(f, opts);
         throw new Error(Converter.unsupportedKindMessage(kind));
     }
 

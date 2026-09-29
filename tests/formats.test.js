@@ -341,3 +341,34 @@ test('3DSCalculator .dat: "# h k l intensity" rows read as an hkl list', () => {
     assert.equal(m.values[(1 * 2 + 1) * 3 + 2], 211);
     assert.ok(Number.isNaN(m.values[(0 * 2 + 1) * 3 + 1]));
 });
+
+// ------------------------------------------------------------------- rspace3d
+
+test('rspace3d: a sheared HK raster, the cell from attributes or from UB, NaN kept', async () => {
+    const { rspace3dFile } = require('./nexus-fixtures');
+    const { file, shear, H, K } = await rspace3dFile({});
+    assert.equal(Converter.detectH5Kind(file), 'rspace3d');
+    const m = await Converter.readRspace3d(file);
+    assert.deepEqual(m.dims, [4, 3, 2]);
+    assert.ok(Math.abs(shear) > 0.05);                                    // the test cell is oblique
+    // grid point (ih, ik, il) sits at h = H[ih] + shear * K[ik]
+    const at = (ih, ik, il) => [0, 1, 2].map(c => m.corner[c] + ih * m.vectors[0][c] + ik * m.vectors[1][c] + il * m.vectors[2][c]);
+    assert.ok(maxAbs(at(3, 2, 1), [H[3] + shear * K[2], K[2], 1.25]) < 1e-12);
+    assert.ok(maxAbs(at(1, 0, 0), [H[1] + shear * K[0], K[0], 1]) < 1e-12);
+    assert.equal(m.values[(1 * 3 + 2) * 4 + 3], 321);                     // h fastest inside
+    assert.ok(Number.isNaN(m.values[(1 * 3 + 2) * 4 + 0]));
+    assert.ok(maxAbs(m.cellLengths, [5, 6, 7]) < 1e-12);
+    assert.equal(m.radiation, 'xray');
+    assert.equal(m.symmetrized, 'laue');
+    assert.equal(m.laueGroup, '-1');
+    // without M_inv the shear comes from the cell; without the cell, the cell comes from UB
+    const noM = await Converter.readRspace3d((await rspace3dFile({ noMinv: true })).file);
+    assert.ok(maxAbs(noM.vectors.flat(), m.vectors.flat()) < 1e-12);
+    const noCell = await Converter.readRspace3d((await rspace3dFile({ noCell: true })).file);
+    assert.ok(maxAbs(noCell.cellLengths, [5, 6, 7]) < 1e-9 && maxAbs(noCell.cellAngles, [80, 95, 100]) < 1e-9);
+    assert.match(noCell.notes.join('\n'), /cell from the UB matrix/);
+    // crop on read needs axes along h, k and l, which a sheared raster lacks
+    const cropped = await Converter.readRspace3d(file, { crop: { l: [1, 1] } });
+    assert.deepEqual(cropped.dims, [4, 3, 2]);
+    assert.match(cropped.notes.join('\n'), /crop on read needs grid axes along h, k and l/);
+});

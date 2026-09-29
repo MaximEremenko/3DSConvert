@@ -56,6 +56,8 @@ await saveH5(H.buildH5(f => f.create_group('entry').create_group('data').create_
     name: 'v', data: NX.fastestFirst(5, 4, 3, Float32Array), shape: [3, 4, 5], dtype: '<f',
 })), 't.nxs');
 await saveH5(NX.nxrefineFile({ link: 'scan/t.nxs' }), 'wrapper.nxs');
+const rspace = await NX.rspace3dFile({});
+await saveH5(Promise.resolve(rspace.file), 'volume_rspace3d.h5');
 
 const port = 9300 + Math.floor(Math.random() * 600);
 const args = ['--headless=new', `--remote-debugging-port=${port}`, `--user-data-dir=${path.join(work, 'profile')}`,
@@ -432,6 +434,16 @@ const scenarios = [
         })()`);
         await waitLog(/3DSCalculator \.json \| grid 2 x 2 x 1 \| float64 \| stored cell: 4\.00000 4\.00000 4\.00000 \/ 90\.00 90\.00 90\.00/);
         await waitLog(/Recipe "recipe\.json": 1 step/);
+    }],
+    ['rspace3d volume of an oblique cell -> unified, the raster shear kept', async () => {
+        await setFile('#dataFile', path.join(work, 'volume_rspace3d.h5'));
+        await waitLog(/rspace3d \(CrysAlisPro\) \| grid 4 x 3 x 2/);
+        await waitLog(/HK raster of an oblique cell/);
+        await setValue('outFormat', 'unified');
+        const model = await H.Converter.readUnifiedData(await H.openH5Bytes(fs.readFileSync(await convert('volume_rspace3d_unified.h5'))));
+        if (Math.abs(model.vectors[1][0] - rspace.shear * 0.2) > 1e-12 || model.symmetrized !== 'laue') {
+            throw new Error('grid ' + JSON.stringify(model.vectors) + ' ' + model.symmetrized);
+        }
     }],
     ['crop on read: only the chosen hkl box is read', async () => {
         await evaluate(`(() => {

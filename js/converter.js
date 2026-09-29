@@ -110,6 +110,14 @@
         return attr ? textValue(attr.value) : '';
     }
 
+    // A numeric attribute (scalar or first element), or null.
+    function attributeNumber(obj, name) {
+        const attr = obj && obj.attrs && obj.attrs[name];
+        if (!attr) return null;
+        const v = Number(firstValue(attr.value));
+        return Number.isFinite(v) ? v : null;
+    }
+
     function firstValue(value) {
         if (ArrayBuffer.isView(value) || Array.isArray(value)) return value.length ? value[0] : undefined;
         return value;
@@ -537,6 +545,7 @@
         if (f.get('scattering/data/data')) return 'unified';
         if (f.get('entry/data/data_values')) return 'unified';
         if (f.get('data') && f.get('lower_limits') && f.get('unit_cell')) return 'yell';
+        if (f.get('data') && f.get('H') && f.get('K') && f.get('L')) return 'rspace3d';
         if (f.get('entry/data/atom_position') || f.get('entry/data/unit_cells')) return 'structure';
         if (f.get('MDHistoWorkspace')) return 'mantid-md';
         if (f.get('MDEventWorkspace')) return 'mantid-events';
@@ -836,6 +845,103 @@
             cellLengths: cell.slice(0, 3), cellAngles: cell.slice(3, 6),
             radiation: 'unknown', axes: [1, 2, 3], notes,
         }, direct ? { axesType: 'uvw', content: '3d-delta-pdf' } : {});
+    }
+
+    // --- rspace3d: CrysAlisPro unwarp layers stacked into a volume ---
+    // /data C [nh, nk, nl] (l fastest; NaN where unmeasured); /H, /K, /L the
+    // Miller indices along the three axes; cell_* and wavelength attributes;
+    // /UB (CrysAlisPro's, in units of 1/wavelength) and /M_inv, the 2x2
+    // pixel-to-Miller map of the native raster plane (plane_type HK, HL or
+    // KL). The raster is Cartesian, so for oblique cells its first in-plane
+    // index also moves along the second: x = X[i] + shear * Y[j], with shear
+    // = M_inv[0][1] / M_inv[1][1] = -(v1 . v2) / (v1 . v1) for the two
+    // reciprocal vectors of the plane (/H etc. hold the line Y = 0).
+    // grid_kind 'hkl_regular' (rawrecon) grids have no shear.
+    async function readRspace3d(f, opts) {
+        opts = opts || {};
+        const notes = [];
+        const ds = f.get('data');
+        const shape = Array.from(ds.shape || []).map(Number);
+        if (shape.length !== 3) throw new Error(`rspace3d: data has ${shape.length} dimensions, expected 3`);
+        const axes = ['H', 'K', 'L'].map(n => numbersAt(f, n, 'rspace3d file'));
+        const step = axes.map((a, i) => {
+            if (a.length !== shape[i]) throw new Error(`rspace3d: ${'HKL'[i]} has ${a.length} values for ${shape[i]} data points`);
+            if (a.length < 2) return 0;
+            const s = (a[a.length - 1] - a[0]) / (a.length - 1);
+            if (a.some((x, n) => Math.abs(x - (a[0] + n * s)) > 1e-6 * Math.max(1, Math.abs(s)))) {
+                throw new Error(`rspace3d: the ${'HKL'[i]} axis is not evenly spaced`);
+            }
+            return s;
+        });
+        const corner = axes.map(a => a[0]);
+        const vectors = [0, 1, 2].map(a => [0, 1, 2].map(c => (a === c ? step[a] : 0)));
+
+        // the cell: attributes, else the UB matrix over the wavelength
+        let lengths = ['cell_a', 'cell_b', 'cell_c'].map(n => attributeNumber(f, n));
+        let angles = ['cell_alpha', 'cell_beta', 'cell_gamma'].map(n => attributeNumber(f, n));
+        const wavelength = attributeNumber(f, 'wavelength');
+        const ub = numbersAt(f, 'UB');
+        let recip = null;                                     // reciprocal metric (no 2 pi)
+        if (lengths.every(x => x > 0) && angles.every(x => x > 0)) {
+            const B = reciprocalBasis(cellToLattice(lengths, angles));
+            recip = [0, 1, 2].map(i => [0, 1, 2].map(j => B[0][i] * B[0][j] + B[1][i] * B[1][j] + B[2][i] * B[2][j]));
+        } else if (ub && ub.length === 9 && wavelength > 0) {
+            const U = [0, 1, 2].map(r => [0, 1, 2].map(c => ub[3 * r + c] / wavelength));
+            recip = [0, 1, 2].map(i => [0, 1, 2].map(j => U[0][i] * U[0][j] + U[1][i] * U[1][j] + U[2][i] * U[2][j]));
+            const G = invert3x3(recip);
+            lengths = [0, 1, 2].map(i => Math.sqrt(G[i][i]));
+            const ang = (i, j) => Math.acos(Math.max(-1, Math.min(1, G[i][j] / (lengths[i] * lengths[j])))) / DEG;
+            angles = [ang(1, 2), ang(0, 2), ang(0, 1)];
+            notes.push('cell from the UB matrix and the wavelength');
+        } else {
+            lengths = [1, 1, 1];
+            angles = [90, 90, 90];
+            notes.push('no cell in the file; supply the parent cell for Q-space output');
+        }
+
+        // the shear of a sheared unwarp raster
+        const plane = attributeText(f, 'plane_type') || 'HK';
+        const gridKind = attributeText(f, 'grid_kind') || 'unwarp_raster';
+        if (gridKind === 'unwarp_raster') {
+            const pair = { HK: [0, 1], HL: [0, 2], KL: [1, 2] }[plane];
+            if (!pair) throw new Error(`rspace3d: unknown plane_type ${plane}`);
+            const [x, y] = pair;
+            const m = numbersAt(f, 'M_inv');
+            const fromCell = recip ? -recip[x][y] / recip[x][x] : null;
+            let shear = 0;
+            if (m && m.length === 4 && Math.abs(m[3]) > 1e-15) {
+                shear = m[1] / m[3];
+                if (fromCell !== null && Math.abs(shear - fromCell) > 1e-6) {
+                    notes.push(`M_inv gives a shear of ${shear.toPrecision(6)}, the cell ${fromCell.toPrecision(6)}; M_inv is used`);
+                }
+            } else if (fromCell !== null) {
+                shear = fromCell;
+            } else {
+                notes.push('no M_inv and no cell, so the raster shear is unknown (taken as 0)');
+            }
+            if (Math.abs(shear) > 1e-12 && shape[y] > 1) {
+                vectors[y][x] = shear * step[y];
+                corner[x] += shear * corner[y];
+                notes.push(`${plane} raster of an oblique cell: ${'hkl'[x]} moves by ${+shear.toFixed(6)} per unit of ${'hkl'[y]}`);
+            }
+        }
+        const box = readBox(shape, corner, vectors, opts, notes, 'hkl');
+        const values = await readLFastest(ds, 'data', shape, opts, box);
+        const grid = boxedGrid(box, shape, corner, vectors);
+
+        if (wavelength > 0) notes.push(`wavelength ${wavelength} Angstrom`);
+        notes.push('radiation set to xray (CrysAlisPro); change it under Output if needed');
+        const laue = attributeText(f, 'laue_group');
+        const applied = attributeNumber(f, 'symmetry_ops_applied');
+        const symmetrized = !!laue && applied > 0;
+        if (symmetrized) notes.push(`symmetrized by rspace3d over Laue group ${laue} (${applied} operations)`);
+        const measured = attributeNumber(f, 'measured_pct');
+        if (measured !== null) notes.push(`${+measured.toFixed(1)}% of the voxels measured`);
+        return Object.assign({
+            dims: grid.dims, corner: grid.corner, vectors: grid.vectors, values,
+            cellLengths: lengths, cellAngles: angles, radiation: 'xray', axes: pickAxes(grid.vectors, grid.dims),
+            axesType: 'hkl', notes,
+        }, symmetrized ? { symmetrized: 'laue', laueGroup: laue } : {});
     }
 
     // ------------------------------------------------------------------ NeXus
@@ -2917,7 +3023,7 @@
         parseOldDat, readOldDatStream, writeOldDat, writeOldDatChunks, countNonFinite,
         isVtk, vtkFrame, parseGridConfig, parseVtk, readVtkStream, writeVtk, writeVtkChunks,
         isHklList, parseHklList, readHklListStream, hklListModel, writeHklListChunks, hklConfigSnippet,
-        writeNpz, readNpz, writeVtiChunks, writeMrc, crc32, readVtkBinary, isBinaryVtk,
+        writeNpz, readNpz, writeVtiChunks, writeMrc, crc32, readVtkBinary, isBinaryVtk, readRspace3d,
         is3dsCalculatorDat, is3dsCalculatorJson, read3dsCalculatorJson,
         toHklModel, resolveCell, planConversion, checkWritable, estimateOutputBytes, outputDtype,
         writeUnifiedData, writeYell,

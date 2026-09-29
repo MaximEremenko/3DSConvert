@@ -23,6 +23,7 @@ No installation, no server, and no upload: files never leave your computer.
 | VTK XML image data (`.vti`) | no | yes | ParaView 5.10+ (any grid, through its Direction matrix) |
 | NumPy (`.npz`) | yes | yes | `np.load` in Python scripts |
 | 3DSCalculator export (`.dat`, `.json`) | yes | no | 3DSCalculator (calculated or loaded intensities) |
+| rspace3d volume (HDF5) | yes | no | rspace3d (CrysAlisPro unwarp layers stacked) |
 | CCP4/MRC map (`.mrc`) | no | yes | ChimeraX, Coot, PyMOL (3D-ΔPDF maps) |
 | NeXus: Mantid MDHistoWorkspace (`.nxs`) | yes | no | Mantid `SaveMD` (CORELLI, TOPAZ, WAND², DEMAND, SXD, ...) |
 | NeXus: NXdata (`.nxs`) | yes | no | NXrefine (APS 6-ID-D, CHESS QM2), other NeXus writers |
@@ -109,6 +110,13 @@ and a CCP4/MRC map holds only them.
   and the parent cell from the metric of `Bq` (`Q = [h,k,l] * Bq`), so its
   c-along-z Cartesian frame does not matter. A `.json` dropped on the page
   is taken as data when it has 3DSCalculator's keys, else as a recipe.
+- **rspace3d** (HDF5 with `/data`, `/H`, `/K`, `/L`): the volume rspace3d
+  builds from CrysAlisPro unwarp layers, NaN where unmeasured. The cell
+  comes from the `cell_*` attributes, else from `UB` over the wavelength.
+  Unwarp rasters are Cartesian, so for an oblique cell one in-plane index
+  also moves along the other; the shear (from `M_inv`, or from the cell) is
+  kept as a sheared hkl grid, and crop on read then does not apply. Data
+  rspace3d symmetrized are labelled so; the radiation is set to x-ray.
 - **NumPy `.npz`**: an uncompressed archive (read it with `np.load`) of
   `values` and, when known, `sigma`, as C-order arrays `[nl, nk, nh]`
   (`values[l, k, h]`), `corner`, `step_vectors` (one row per grid axis),

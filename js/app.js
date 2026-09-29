@@ -273,7 +273,7 @@
     yell: 'Yell 1.0', unified: 'Unified HDF5', 'mantid-md': 'Mantid MDHistoWorkspace', nexus: 'NeXus NXdata',
     dat: 'RMCProfile .dat', 'dat-hkl': 'RMCProfile .dat · hkl', 'dat-amp': 'RMCProfile amplitudes',
     vtk: 'VTK · Q', 'vtk-hkl': 'VTK · r.l.u.', hkl: 'hkl list', npz: 'NumPy .npz',
-    'calc-dat': '3DSCalculator .dat', 'calc-json': '3DSCalculator .json',
+    'calc-dat': '3DSCalculator .dat', 'calc-json': '3DSCalculator .json', rspace3d: 'rspace3d (CrysAlisPro)',
   };
 
   // Per grid axis: the component it runs along, its range and step.
@@ -374,7 +374,7 @@
       } else {
         const label = {
           yell: 'Yell 1.0', unified: 'Unified data format', 'mantid-md': 'Mantid MDHistoWorkspace', nexus: `NeXus ${s.nexusPath}`,
-          npz: 'NumPy .npz', 'calc-json': '3DSCalculator .json',
+          npz: 'NumPy .npz', 'calc-json': '3DSCalculator .json', rspace3d: 'rspace3d (CrysAlisPro)',
         }[s.kind];
         info = label + ` | grid ${s.dims.join(' x ')}` +
           (s.kind === 'unified' || s.kind === 'nexus' || s.kind === 'npz' ? ` | axes ${s.axesType || 'hkl'}` : '') +

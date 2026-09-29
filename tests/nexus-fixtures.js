@@ -1,10 +1,10 @@
 'use strict';
 /*
- * NeXus test files built with h5wasm: a Mantid SaveMD (version 2)
- * MDHistoWorkspace and an NXrefine-like NXdata entry. Shared by the Node
- * tests and the browser test.
+ * HDF5 test files built with h5wasm: a Mantid SaveMD (version 2)
+ * MDHistoWorkspace, an NXrefine-like NXdata entry and an rspace3d volume.
+ * Shared by the Node tests and the browser test.
  */
-const { buildH5 } = require('./helpers');
+const { buildH5, Converter } = require('./helpers');
 
 // Encodes the index: value(i0, i1, i2) = 100 i2 + 10 i1 + i0 (i0 fastest).
 const code = (i0, i1, i2) => 100 * i2 + 10 * i1 + i0;
@@ -93,4 +93,34 @@ function nxrefineFile(opts) {
     });
 }
 
-module.exports = { code, fastestFirst, at, linspace, mantidFile, nxrefineFile };
+// An rspace3d file as its volume builder writes one: data C [nh, nk, nl],
+// 1-D H/K/L, cell_* and wavelength attributes, UB (1/wavelength units) and
+// M_inv for an HK raster. o: { cell, noCell, noMinv, extra(f) }.
+async function rspace3dFile(o) {
+    o = Object.assign({ cell: [5, 6, 7, 80, 95, 100], wavelength: 0.7 }, o);
+    const H = [-1, -0.5, 0, 0.5], K = [-0.4, -0.2, 0], L = [1, 1.25];
+    const values = new Float32Array(24);
+    for (let ih = 0, n = 0; ih < 4; ih++) for (let ik = 0; ik < 3; ik++) for (let il = 0; il < 2; il++, n++) values[n] = 100 * ih + 10 * ik + il;
+    values[5] = NaN;                                                       // (0, 2, 1) unmeasured
+    const B = Converter.reciprocalBasis(Converter.cellToLattice(o.cell.slice(0, 3), o.cell.slice(3)));
+    const g = (i, j) => B[0][i] * B[0][j] + B[1][i] * B[1][j] + B[2][i] * B[2][j];
+    const shear = -g(0, 1) / g(0, 0);
+    return buildH5(f => {
+        f.create_dataset({ name: 'data', data: values, shape: [4, 3, 2], dtype: '<f' });
+        [['H', H], ['K', K], ['L', L]].forEach(([n, a]) => f.create_dataset({ name: n, data: a, shape: [a.length], dtype: '<d' }));
+        if (!o.noCell) {
+            ['cell_a', 'cell_b', 'cell_c', 'cell_alpha', 'cell_beta', 'cell_gamma'].forEach((n, i) => f.create_attribute(n, o.cell[i], [], '<d'));
+        }
+        f.create_attribute('wavelength', o.wavelength, [], '<d');
+        f.create_attribute('plane_type', 'HK');
+        f.create_attribute('laue_group', '-1');
+        f.create_attribute('symmetry_ops_applied', 2, [], '<i');
+        // a rotated UB: U * B * wavelength
+        const c = Math.cos(0.3), s = Math.sin(0.3), U = [[c, -s, 0], [s, c, 0], [0, 0, 1]];
+        const UB = [0, 1, 2].map(r => [0, 1, 2].map(k => o.wavelength * (U[r][0] * B[0][k] + U[r][1] * B[1][k] + U[r][2] * B[2][k])));
+        f.create_dataset({ name: 'UB', data: UB.flat(), shape: [3, 3], dtype: '<d' });
+        if (!o.noMinv) f.create_dataset({ name: 'M_inv', data: [3, 3 * shear, 0, 3], shape: [2, 2], dtype: '<d' });
+    }).then(file => ({ file, shear, H, K, L }));
+}
+
+module.exports = { code, fastestFirst, at, linspace, mantidFile, nxrefineFile, rspace3dFile };
