@@ -3,928 +3,266 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>3DSConvert — Diffuse Scattering Format Converter</title>
-<style>
-  :root {
-    --bg: #f6f7f9; --panel: #ffffff; --text: #1a2333;
-    --muted2: #5b6577; --line: #dde2ea; --accent: #2456a6; --accent2: #1a4080;
-    --ok: #1a7f42; --err: #b3261e;
-  }
-  @media (prefers-color-scheme: dark) {
-    :root {
-      --bg: #14181f; --panel: #1d232d; --text: #e8ecf3; --muted2: #9aa5b5;
-      --line: #313a48; --accent: #7aa7e8; --accent2: #a8c4f0; --ok: #6fce96; --err: #f0908a;
-    }
-  }
-  * { box-sizing: border-box; }
-  [hidden] { display: none !important; }
-  body {
-    margin: 0; padding: 2rem 1rem; background: var(--bg); color: var(--text);
-    font: 15px/1.5 system-ui, "Segoe UI", Roboto, sans-serif;
-  }
-  main { max-width: 60rem; margin: 0 auto; }
-  h1 { font-size: 1.4rem; margin: 0 0 .25rem; }
-  .sub { color: var(--muted2); margin: 0 0 1.5rem; }
-  .panel {
-    background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
-    padding: 1rem 1.25rem; margin-bottom: 1rem;
-  }
-  .panel h2 { font-size: 1rem; margin: 0 0 .75rem; }
-  label { display: block; font-weight: 600; margin: .5rem 0 .2rem; }
-  .hint { font-weight: 400; color: var(--muted2); font-size: .85rem; }
-  input[type=file], select {
-    display: block; width: 100%; padding: .4rem; border: 1px solid var(--line);
-    border-radius: 6px; background: var(--bg); color: var(--text);
-  }
-  .cellgrid { display: grid; grid-template-columns: repeat(6, 1fr); gap: .4rem; max-width: 34rem; }
-  .cellgrid input {
-    width: 100%; padding: .35rem; border: 1px solid var(--line); border-radius: 6px;
-    background: var(--bg); color: var(--text); font: inherit;
-  }
-  .row { display: flex; gap: 1rem; flex-wrap: wrap; }
-  .row > div { flex: 1 1 16rem; }
-  button {
-    margin-top: 1rem; padding: .55rem 1.6rem; font: inherit; font-weight: 600;
-    color: #fff; background: var(--accent); border: 0; border-radius: 8px; cursor: pointer;
-  }
-  button:hover { background: var(--accent2); }
-  button:disabled { opacity: .45; cursor: default; }
-  button.secondary {
-    margin-top: 0; padding: .3rem 1rem; color: var(--text); background: transparent;
-    border: 1px solid var(--line);
-  }
-  button.secondary:hover { background: var(--bg); }
-  .busy { display: flex; align-items: center; gap: .75rem; margin-top: .75rem; }
-  .busy[hidden] { display: none; }
-  .busy progress { flex: 1 1 auto; height: .9rem; }
-  #log {
-    white-space: pre-wrap; font-family: ui-monospace, Consolas, monospace; font-size: .85rem;
-    background: var(--bg); border: 1px solid var(--line); border-radius: 6px;
-    padding: .75rem; min-height: 3rem; max-height: 18rem; overflow-y: auto;
-  }
-  .ok { color: var(--ok); } .err { color: var(--err); }
-  code { font-family: ui-monospace, Consolas, monospace; font-size: .85em; }
-  .inline { display: flex; gap: .5rem; align-items: center; flex-wrap: wrap; }
-  .inline select { width: auto; flex: 1 1 12rem; }
-  .steps { list-style: none; margin: 0; padding: 0; }
-  .steps:empty::before { content: 'No steps: the data are written as read.'; color: var(--muted2); font-size: .9rem; }
-  .step { border: 1px solid var(--line); border-radius: 8px; padding: .5rem .75rem; margin-bottom: .5rem; }
-  .stephead { display: flex; align-items: center; gap: .5rem; }
-  .stephead b { flex: 1 1 auto; }
-  .stephead button { padding: .1rem .55rem; }
-  .fields { display: flex; flex-wrap: wrap; gap: .3rem 1rem; margin: .35rem 0 .2rem; }
-  .fields label { display: inline; font-weight: 400; margin: 0 .3rem 0 0; color: var(--muted2); font-size: .85rem; }
-  .fields input:not([type=checkbox]), .fields select, #profileWidth {
-    width: 6.5em; padding: .25rem .35rem; border: 1px solid var(--line); border-radius: 6px;
-    background: var(--bg); color: var(--text); font: inherit; display: inline-block;
-  }
-  .fields input.wide { width: 14em; }
-  .fields select { width: auto; }
-</style>
+<title>3DSConvert — diffuse scattering converter</title>
+<link rel="stylesheet" href="css/fonts.css">
+<link rel="stylesheet" href="css/app.css">
+<script>
+  // The saved theme, before the first paint (else the system's).
+  try {
+    const theme = localStorage.getItem('3dsconvert-theme');
+    if (theme === 'light' || theme === 'dark') document.documentElement.dataset.theme = theme;
+  } catch (_) { /* storage unavailable */ }
+</script>
 </head>
 <body>
-<main>
-  <h1>3DSConvert</h1>
-  <p class="sub">
-    Converts 3-D diffuse scattering data between the <b>unified HDF5</b> format
-    (<code>/scattering/data</code> and <code>/entry/data</code> layouts, RMCProfile / DiffuseCode),
-    <b>Yell&nbsp;1.0</b> HDF5 (DISCUS / Yell / Meerkat), the
-    <b>RMCProfile old text</b> format, and <b>VTK</b> (Scatty / Spinteract / 3DSCalculator),
-    and reads <b>NeXus</b> volumes (Mantid MDHistoWorkspace, NXdata such as NXrefine).
-    On the way it can crop, rebin, mask, subtract backgrounds, symmetrize and compute the
-    <b>3D-&Delta;PDF</b>. Everything runs locally in your browser &mdash; no upload.
-  </p>
+<svg width="0" height="0" style="position: absolute" aria-hidden="true">
+  <symbol id="i-logo" viewBox="0 0 24 24"><path d="M12 2.5 3.5 7.2v9.6l8.5 4.7 8.5-4.7V7.2zM3.5 7.2 12 12l8.5-4.8M12 12v9.5"/></symbol>
+  <symbol id="i-lock" viewBox="0 0 24 24"><path d="M7 11h10a2 2 0 0 1 2 2v6a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2v-6a2 2 0 0 1 2-2zM8 11V8a4 4 0 0 1 8 0v3"/></symbol>
+  <symbol id="i-help" viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 18 0a9 9 0 1 0-18 0M9.5 9.5a2.5 2.5 0 1 1 3.5 2.3c-.6.3-1 .9-1 1.6v.6M12 17v.3"/></symbol>
+  <symbol id="i-sun" viewBox="0 0 24 24"><path d="M8 12a4 4 0 1 0 8 0a4 4 0 1 0-8 0M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></symbol>
+  <symbol id="i-moon" viewBox="0 0 24 24"><path d="M20 14.5A8 8 0 0 1 9.5 4a8 8 0 1 0 10.5 10.5z"/></symbol>
+  <symbol id="i-folder" viewBox="0 0 24 24"><path d="M3 8V6a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v2M3 10h18l-2 9H5z"/></symbol>
+  <symbol id="i-upload" viewBox="0 0 24 24"><path d="M12 15V4M7.5 8.5 12 4l4.5 4.5M4 15v3.5A1.5 1.5 0 0 0 5.5 20h13a1.5 1.5 0 0 0 1.5-1.5V15"/></symbol>
+  <symbol id="i-alert" viewBox="0 0 24 24"><path d="M12 3.5 2.5 20h19zM12 10v4.5M12 17.2v.3"/></symbol>
+  <symbol id="i-info" viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 18 0a9 9 0 1 0-18 0M12 11v5.5M12 7.8v.4"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><path d="m5 12.5 4.5 4.5L19 7.5"/></symbol>
+  <symbol id="i-x" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></symbol>
+  <symbol id="i-down" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></symbol>
+  <symbol id="i-up" viewBox="0 0 24 24"><path d="m6 15 6-6 6 6"/></symbol>
+  <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+  <symbol id="i-layers" viewBox="0 0 24 24"><path d="M12 3 2 8l10 5 10-5zM2 12.5l10 5 10-5M2 17l10 5 10-5"/></symbol>
+  <symbol id="i-sym" viewBox="0 0 24 24"><path d="M12 3v18M4 7l5 5-5 5M20 7l-5 5 5 5"/></symbol>
+  <symbol id="i-mask" viewBox="0 0 24 24"><path d="M6 4h12a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2zM9 12a3 3 0 1 0 6 0a3 3 0 1 0-6 0"/></symbol>
+  <symbol id="i-wave" viewBox="0 0 24 24"><path d="M2 12c2.5-7 5-7 7.5 0s5 7 7.5 0c1.2-3.3 3-4.5 5-3"/></symbol>
+  <symbol id="i-grid" viewBox="0 0 24 24"><path d="M5 3h14a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2zM3 9h18M3 15h18M9 3v18M15 3v18"/></symbol>
+  <symbol id="i-rings" viewBox="0 0 24 24"><path d="M9 12a3 3 0 1 0 6 0a3 3 0 1 0-6 0M5 12a7 7 0 1 0 14 0a7 7 0 1 0-14 0"/></symbol>
+  <symbol id="i-curve" viewBox="0 0 24 24"><path d="M3 20h18M3 20C6 9 10 6 21 5"/></symbol>
+  <symbol id="i-crop" viewBox="0 0 24 24"><path d="M6 2v14a2 2 0 0 0 2 2h14M18 22V8a2 2 0 0 0-2-2H2"/></symbol>
+  <symbol id="i-sliders" viewBox="0 0 24 24"><path d="M4 6h9M17 6h3M4 12h3M11 12h9M4 18h11M19 18h1M15 4v4M9 10v4M17 16v4"/></symbol>
+  <symbol id="i-wand" viewBox="0 0 24 24"><path d="M4 20 15 9M13 5l1.5-1.5M19 11l1.5-1.5M17 3v3M21 7h-3"/></symbol>
+  <symbol id="i-save" viewBox="0 0 24 24"><path d="M7 3h9l3 3v13a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2zM8 3v5h7M8 21v-7h8v7"/></symbol>
+  <symbol id="i-trash" viewBox="0 0 24 24"><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13"/></symbol>
+  <symbol id="i-file" viewBox="0 0 24 24"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8zM14 3v5h5"/></symbol>
+  <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 4v11M7.5 10.5 12 15l4.5-4.5M4 20h16"/></symbol>
+  <symbol id="i-copy" viewBox="0 0 24 24"><path d="M10 8h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2h-8a2 2 0 0 1-2-2v-8a2 2 0 0 1 2-2zM4 16V6a2 2 0 0 1 2-2h10"/></symbol>
+</svg>
 
-  <div class="panel">
-    <h2>1 &middot; Data file</h2>
-    <label>Diffuse data
-      <span class="hint">(unified .h5 / Yell .h5 / NeXus .nxs (Mantid MDHistoWorkspace, NXdata) /
-      old-format .dat / .vtk &mdash; auto-detected; for NeXus data kept in linked files, select
-      those files too)</span></label>
-    <input type="file" id="dataFile" multiple>
-    <div id="dataInfo" class="hint"></div>
-    <div id="nexusPick" hidden>
-      <label>NeXus data <span class="hint">(the file holds several NXdata groups)</span></label>
-      <select id="nexusPath"></select>
-    </div>
-    <div class="row">
-      <div>
-        <label>Grid config for Q-space VTK
-          <span class="hint">(optional Scatty or Spinteract config; needed when the grid axes are not
-          along a*, b*, c*, e.g. <code>X_AXIS 6 6 0</code>)</span></label>
-        <input type="file" id="gridConfigFile">
-        <div id="gridConfigInfo" class="hint"></div>
-      </div>
-      <div>
-        <label>Yell data space
-          <span class="hint">(for Yell files whose <code>is_direct</code> is neither 0 nor 1)</span></label>
-        <select id="yellSpace">
-          <option value="auto">from the file (is_direct)</option>
-          <option value="reciprocal">reciprocal space (override the flag)</option>
-        </select>
-      </div>
-    </div>
+<div class="app">
+<header class="topbar">
+  <div class="brand">
+    <div class="logo"><svg class="i"><use href="#i-logo"/></svg></div>
+    <div><b>3DSConvert</b><small>Read, process and convert 3-D diffuse scattering</small></div>
   </div>
+  <div class="spacer"></div>
+  <span class="pill ok"><svg class="i s15"><use href="#i-lock"/></svg>Runs locally · files never leave this computer</span>
+  <a class="toplink" href="https://github.com/MaximEremenko/3DSConvert#readme" target="_blank" rel="noopener">
+    <svg class="i s16"><use href="#i-help"/></svg><span>Guide</span></a>
+  <button type="button" id="themeBtn" class="btn theme-btn" aria-label="Switch to the dark theme">
+    <svg class="i"><use href="#i-moon"/></svg></button>
+</header>
 
-  <div class="panel">
-    <h2>2 &middot; Unit cell
-      <span class="hint">&mdash; needed when the data file has no real cell (old .dat, or Yell files
-      with unit metric <code>1 1 1 90 90 90</code>)</span></h2>
-    <div class="row">
-      <div>
-        <label>Structure file
-          <span class="hint">(.rmc6f: parent cell = supercell / dimensions; unified .h5 stores the parent cell directly)</span></label>
-        <input type="file" id="structFile">
-        <div id="structInfo" class="hint"></div>
-      </div>
-      <div>
-        <label>&hellip;or enter the parent cell directly
-          <span class="hint">(a, b, c in &Aring;; &alpha;, &beta;, &gamma; in &deg;)</span></label>
-        <div class="cellgrid">
-          <input id="ca" placeholder="a"><input id="cb" placeholder="b"><input id="cc" placeholder="c">
-          <input id="cal" placeholder="&#945;"><input id="cbe" placeholder="&#946;"><input id="cga" placeholder="&#947;">
-        </div>
+<main class="workspace">
+<div class="flow">
+
+  <section class="card" id="dataCard">
+    <div class="card-head">
+      <span class="num">1</span><h2>Data</h2><span class="sub">format detected from the file content</span>
+      <div class="spacer"></div>
+      <button type="button" class="btn" id="replaceBtn" hidden><svg class="i s16"><use href="#i-folder"/></svg>Replace</button>
+      <input type="file" id="dataFile" multiple class="sr-only" tabindex="-1" aria-label="Data files">
+    </div>
+    <div class="dropzone" id="dropzone">
+      <div class="badge"><svg class="i"><use href="#i-upload"/></svg></div>
+      <b>Drop data files here</b>
+      <p>Structure files, grid configs, recipes and extra volumes are recognised too. Nothing is uploaded.</p>
+      <button type="button" class="btn primary tall" id="browseBtn">Choose files…</button>
+      <div class="chips">
+        <span class="chip">Unified .h5</span><span class="chip">Yell .h5</span><span class="chip">Mantid .nxs</span>
+        <span class="chip">NeXus NXdata</span><span class="chip">RMCProfile .dat</span><span class="chip">Scatty / Spinteract .vtk</span>
       </div>
     </div>
-  </div>
+    <div class="filecard" id="fileCard" hidden>
+      <div class="kind"><svg class="i"><use href="#i-logo"/></svg></div>
+      <div class="body">
+        <div class="title"><b id="fileName"></b><span class="pill accent" id="fileKind"></span><div class="spacer"></div><span class="mono muted" id="fileSize"></span></div>
+        <div class="stats" id="fileStats"></div>
+        <div class="meter" id="fileMeter" hidden><span>Measured voxels</span><div class="bar"><i id="fileMeterBar"></i></div><b id="fileMeterText"></b></div>
+      </div>
+    </div>
+    <div id="dataInfo" class="sub"></div>
+    <button type="button" class="notes-btn" id="notesBtn" aria-expanded="false" hidden>
+      <svg class="i s15"><use href="#i-alert"/></svg><span id="notesCount"></span><svg class="i s15"><use href="#i-down"/></svg></button>
+    <ul class="notes" id="notesList" hidden></ul>
+    <label class="field" id="nexusPick" hidden><span>NeXus data group (the file holds several)</span><select id="nexusPath"></select></label>
+    <details class="more">
+      <summary>More input options</summary>
+      <div class="row">
+        <label class="field"><span>Grid config for Q-space VTK (Scatty or Spinteract; for grid axes not along a*, b*, c*)</span>
+          <input type="file" id="gridConfigFile"></label>
+        <label class="field"><span>Yell data space (for is_direct values other than 0 or 1)</span>
+          <select id="yellSpace">
+            <option value="auto">from the file (is_direct)</option>
+            <option value="reciprocal">reciprocal space (override the flag)</option>
+          </select></label>
+      </div>
+      <div id="gridConfigInfo" class="sub"></div>
+    </details>
+  </section>
 
-  <div class="panel">
-    <h2>3 &middot; Processing
-      <span class="hint">&mdash; optional steps, applied in order before the data are written</span></h2>
+  <div class="waiting-group" id="afterData">
+  <section class="card" id="cellCard">
+    <div class="card-head">
+      <span class="num">2</span><h2>Unit cell</h2><span class="sub" id="cellNote">used for |Q|, Q axes and text output</span>
+      <div class="spacer"></div>
+      <div class="seg" role="group" aria-label="Cell source" id="cellSource">
+        <button type="button" data-src="data" aria-pressed="true">Data file</button>
+        <button type="button" data-src="structure" aria-pressed="false">Structure file</button>
+        <button type="button" data-src="manual" aria-pressed="false">Manual</button>
+      </div>
+    </div>
+    <div class="row" id="structRow" hidden>
+      <label class="field"><span>Structure file (.rmc6f: supercell / dimensions; unified structure .h5)</span>
+        <input type="file" id="structFile"></label>
+    </div>
+    <div id="structInfo" class="sub"></div>
+    <div class="cellgrid">
+      <label class="field"><span>a (Å)</span><input id="ca" inputmode="decimal" autocomplete="off"></label>
+      <label class="field"><span>b (Å)</span><input id="cb" inputmode="decimal" autocomplete="off"></label>
+      <label class="field"><span>c (Å)</span><input id="cc" inputmode="decimal" autocomplete="off"></label>
+      <label class="field"><span>α (°)</span><input id="cal" inputmode="decimal" autocomplete="off"></label>
+      <label class="field"><span>β (°)</span><input id="cbe" inputmode="decimal" autocomplete="off"></label>
+      <label class="field"><span>γ (°)</span><input id="cga" inputmode="decimal" autocomplete="off"></label>
+    </div>
+    <div class="cell-warn" id="cellWarn" hidden></div>
+  </section>
+
+  <section class="card" id="procCard">
+    <div class="card-head">
+      <span class="num">3</span><h2>Processing</h2><span class="sub" id="stepSummary">optional; the steps run in order</span>
+      <div class="spacer"></div>
+      <div class="anchor">
+        <button type="button" class="btn" id="presetBtn" aria-haspopup="true" aria-expanded="false">
+          <svg class="i s16"><use href="#i-wand"/></svg>Presets</button>
+        <div class="menu" id="presetMenu" hidden></div>
+      </div>
+      <button type="button" class="btn icon" id="loadRecipe" aria-label="Load a recipe" title="Load a recipe"><svg class="i s16"><use href="#i-folder"/></svg></button>
+      <button type="button" class="btn icon" id="saveRecipe" aria-label="Save the recipe" title="Save the recipe"><svg class="i s16"><use href="#i-save"/></svg></button>
+      <button type="button" class="btn icon" id="clearRecipe" aria-label="Remove all steps" title="Remove all steps"><svg class="i s16"><use href="#i-trash"/></svg></button>
+      <input type="file" id="recipeFile" accept=".json,application/json" hidden>
+    </div>
     <ol id="steps" class="steps"></ol>
-    <div class="row">
-      <div>
-        <label>Add a step</label>
-        <div class="inline">
-          <select id="stepOp"></select>
-          <button id="addStep" type="button" class="secondary">Add</button>
-        </div>
-      </div>
-      <div>
-        <label>Recipe <span class="hint">(the steps as JSON; processed unified output records it)</span></label>
-        <div class="inline">
-          <button id="saveRecipe" type="button" class="secondary">Save&hellip;</button>
-          <button id="loadRecipe" type="button" class="secondary">Load&hellip;</button>
-          <button id="clearRecipe" type="button" class="secondary">Clear</button>
-          <input type="file" id="recipeFile" accept=".json,application/json" hidden>
-        </div>
-      </div>
+    <div class="addrow">
+      <select id="stepOp" class="text" aria-label="Step to add"></select>
+      <button type="button" class="btn dashed" id="addStep"><svg class="i s16"><use href="#i-plus"/></svg>Add step</button>
     </div>
-    <label>Other volumes
-      <span class="hint">(for &ldquo;combine&rdquo; steps, e.g. an empty-can measurement or a calculated
-      pattern; any readable format)</span></label>
-    <input type="file" id="extraFiles" multiple>
-    <div id="extraInfo" class="hint"></div>
-  </div>
+    <div class="addrow">
+      <span class="sub">Other volumes</span>
+      <span class="chips" id="extraChips"></span>
+      <button type="button" class="btn" id="extraBtn"><svg class="i s16"><use href="#i-layers"/></svg>Add volumes…</button>
+      <input type="file" id="extraFiles" multiple class="sr-only" tabindex="-1" aria-label="Other volumes">
+    </div>
+    <div id="extraInfo" class="sub"></div>
+  </section>
 
-  <div class="panel">
-    <h2>4 &middot; Output</h2>
-    <div class="row">
-      <div>
-        <label>Output format</label>
-        <select id="outFormat">
-          <option value="unified">Unified data format (.h5)</option>
-          <option value="yell">Yell 1.0 (.h5)</option>
-          <option value="dat">RMCProfile old format (.dat)</option>
-          <option value="vtk">Scatty VTK (.vtk)</option>
-          <option value="profile">|Q| profile: shell averages (.txt)</option>
-        </select>
-        <div id="profileOpts" class="inline" hidden>
-          <label for="profileWidth">shell width <span class="hint">(1/&Aring;)</span></label>
-          <input id="profileWidth" value="0.05">
-        </div>
-      </div>
-      <div>
-        <label>Radiation <span class="hint">(metadata for HDF5 output)</span></label>
-        <select id="radiation">
-          <option value="">keep from input / unknown</option>
-          <option value="neutron">neutron</option>
-          <option value="xray">xray</option>
-          <option value="electron">electron</option>
-        </select>
-      </div>
+  <section class="card" id="outCard">
+    <div class="card-head">
+      <span class="num">4</span><h2>Output</h2><span class="sub">pick a format; the options apply to HDF5</span>
     </div>
-    <div class="row">
-      <div>
-        <label>HDF5 precision <span class="hint">(data array)</span></label>
-        <select id="precision">
-          <option value="same">same as the input</option>
-          <option value="float64">float64</option>
-          <option value="float32">float32 (half the size)</option>
-        </select>
-      </div>
-      <div>
-        <label>Unified layout</label>
-        <select id="layout">
-          <option value="both">/scattering/data and /entry/data</option>
-          <option value="entry">/entry/data only (half the size)</option>
-        </select>
-      </div>
-      <div>
-        <label>HDF5 compression</label>
-        <select id="compression">
-          <option value="0">none</option>
-          <option value="4">gzip (smaller, slower to write)</option>
-        </select>
-      </div>
+    <div class="formats" id="formatCards">
+      <button type="button" class="format" data-format="unified" aria-pressed="true"><b><svg class="i s16"><use href="#i-logo"/></svg>Unified HDF5</b><small data-note="RMCProfile · DISCUS · keeps cell, metadata and recipe">RMCProfile · DISCUS · keeps cell, metadata and recipe</small></button>
+      <button type="button" class="format" data-format="yell" aria-pressed="false"><b><svg class="i s16"><use href="#i-layers"/></svg>Yell 1.0</b><small data-note="DISCUS · Yell · Meerkat">DISCUS · Yell · Meerkat</small></button>
+      <button type="button" class="format" data-format="dat" aria-pressed="false"><b><svg class="i s16"><use href="#i-file"/></svg>RMCProfile .dat</b><small data-note="Text · Q in Å⁻¹ · masked voxels as I = 0">Text · Q in Å⁻¹ · masked voxels as I = 0</small></button>
+      <button type="button" class="format" data-format="vtk" aria-pressed="false"><b><svg class="i s16"><use href="#i-grid"/></svg>Scatty VTK</b><small data-note="Text · ParaView · axis-aligned grids">Text · ParaView · axis-aligned grids</small></button>
+      <button type="button" class="format" data-format="profile" aria-pressed="false"><b><svg class="i s16"><use href="#i-rings"/></svg>|Q| profile</b><small data-note="Shell averages as text">Shell averages as text</small></button>
     </div>
-    <button id="convertBtn" disabled>Convert &amp; download</button>
-    <div id="busy" class="busy" hidden>
-      <progress id="progressBar" max="1" value="0"></progress>
-      <span id="progressText" class="hint"></span>
-      <button id="cancelBtn" type="button" class="secondary">Cancel</button>
+    <select id="outFormat" hidden>
+      <option value="unified">Unified</option><option value="yell">Yell</option><option value="dat">dat</option>
+      <option value="vtk">VTK</option><option value="profile">profile</option>
+    </select>
+    <div class="options">
+      <div class="field"><span>Precision</span><div class="seg" role="group" aria-label="Precision" data-for="precision">
+        <button type="button" data-value="same">Same as input</button><button type="button" data-value="float64">float64</button><button type="button" data-value="float32">float32</button></div></div>
+      <div class="field"><span>Unified layout</span><div class="seg" role="group" aria-label="Unified layout" data-for="layout">
+        <button type="button" data-value="both">Both groups</button><button type="button" data-value="entry">/entry only</button></div></div>
+      <div class="field"><span>Compression</span><div class="seg" role="group" aria-label="Compression" data-for="compression">
+        <button type="button" data-value="0">None</button><button type="button" data-value="4">gzip</button></div></div>
+      <label class="field"><span>Radiation</span><select id="radiation" class="text">
+        <option value="">keep / unknown</option><option value="neutron">neutron</option><option value="xray">xray</option><option value="electron">electron</option></select></label>
+      <label class="field" id="profileOpts" hidden><span>Shell width (Å⁻¹)</span><input id="profileWidth" value="0.05" class="text" inputmode="decimal"></label>
+      <select id="precision" hidden><option value="same">same</option><option value="float64">float64</option><option value="float32">float32</option></select>
+      <select id="layout" hidden><option value="both">both</option><option value="entry">entry</option></select>
+      <select id="compression" hidden><option value="0">none</option><option value="4">gzip</option></select>
     </div>
+  </section>
   </div>
+</div>
 
-  <div class="panel">
-    <h2>Log</h2>
-    <div id="log">Loading HDF5 engine&hellip;</div>
-  </div>
+<aside class="side">
+  <section class="card" id="previewCard">
+    <div class="card-head">
+      <h2>Preview</h2><span class="sub" id="previewSub"></span>
+      <div class="spacer"></div>
+      <div class="seg" role="group" aria-label="Stage" id="stageSeg">
+        <button type="button" data-stage="input" aria-pressed="true">As read</button>
+        <button type="button" data-stage="processed" aria-pressed="false">After recipe</button>
+      </div>
+      <div class="seg" role="group" aria-label="Plane" id="planeSeg">
+        <button type="button" data-normal="2" aria-pressed="true">(h k 0)</button>
+        <button type="button" data-normal="1" aria-pressed="false">(h 0 l)</button>
+        <button type="button" data-normal="0" aria-pressed="false">(0 k l)</button>
+      </div>
+    </div>
+    <div class="empty-preview" id="previewEmpty">
+      <svg class="i"><use href="#i-grid"/></svg>
+      <b>Slices appear here</b>
+      <span>Load data to browse its planes, before and after processing.</span>
+    </div>
+    <div id="previewView" hidden>
+      <div class="previewbody">
+        <div class="plot">
+          <span class="ax y" id="axisY"></span>
+          <canvas id="sliceCanvas" width="1" height="1" role="img" aria-label="Slice of the data"></canvas>
+          <span class="ax x" id="axisX"></span>
+        </div>
+        <div class="colorbar"><i id="colorbar"></i><div id="colorTicks"></div></div>
+        <div class="slicestats" id="sliceStats"></div>
+      </div>
+      <div class="slicer">
+        <span id="sliceName"></span>
+        <input type="range" id="sliceIndex" min="0" max="0" value="0" aria-label="Slice position">
+        <b id="sliceValue"></b>
+        <label class="check"><input type="checkbox" id="logScale" checked>log scale</label>
+      </div>
+      <div class="readout" id="readout">Point at the slice to read values</div>
+    </div>
+  </section>
+  <section class="card logcard">
+    <div class="card-head">
+      <h2>Log</h2><div class="spacer"></div>
+      <button type="button" class="btn ghost icon" id="copyLog" aria-label="Copy the log" title="Copy the log"><svg class="i s16"><use href="#i-copy"/></svg></button>
+      <button type="button" class="btn ghost icon" id="saveLog" aria-label="Download the log" title="Download the log"><svg class="i s16"><use href="#i-download"/></svg></button>
+    </div>
+    <div id="log" aria-live="polite">Loading HDF5 engine…</div>
+  </section>
+</aside>
 </main>
+
+<footer class="actionbar">
+  <div class="fileicon"><svg class="i"><use href="#i-file"/></svg></div>
+  <div class="out"><b id="outName">No data loaded yet</b><span id="outDetail">Load a data file to choose an output</span></div>
+  <div class="spacer"></div>
+  <div class="busy" id="busy" hidden><span id="progressText"></span><progress id="progressBar" max="1" value="0"></progress></div>
+  <button type="button" class="btn big" id="cancelBtn" hidden>Cancel</button>
+  <button type="button" class="btn primary big" id="convertBtn" disabled><svg class="i"><use href="#i-download"/></svg>Convert &amp; download</button>
+</footer>
+<div class="dropveil" id="dropVeil" hidden><div><svg class="i"><use href="#i-upload"/></svg>Drop to load</div></div>
+</div>
 
 <script src="js/h5wasm.js"></script>
 <script src="js/converter.js"></script>
 <script src="js/processing.js"></script>
 <script src="js/wgpu_fft_web.js"></script>
 <script src="js/worker.js"></script>
-<script>
-'use strict';
-(async function () {
-  const $ = id => document.getElementById(id);
-  const logEl = $('log');
-
-  function log(msg, cls) {
-    const line = document.createElement('div');
-    if (cls) line.className = cls;
-    line.textContent = msg;
-    logEl.appendChild(line);
-    logEl.scrollTop = logEl.scrollHeight;
-  }
-  function clearLog() { logEl.textContent = ''; }
-
-  function fmtCell(c) {
-    return c.lengths.map(x => x.toPrecision(6)).join(' ') + ' / ' +
-           c.angles.map(x => x.toPrecision(4)).join(' ');
-  }
-
-  function fmtBytes(n) {
-    return n >= 1073741824 ? (n / 1073741824).toFixed(2) + ' GB'
-         : n >= 1048576 ? (n / 1048576).toFixed(1) + ' MB' : Math.max(1, Math.round(n / 1024)) + ' kB';
-  }
-
-  // ------------------------------------------------------------ worker
-  // All reading, conversion and HDF5 writing run in a Web Worker built from
-  // the source of h5wasmModule, ConverterFactory and converterWorker, so the
-  // page stays responsive and works from file:// without fetching anything.
-  function createClient() {
-    const source = [
-      'var h5wasm = (' + h5wasmModule.toString() + ')();',
-      'var Converter = (' + ConverterFactory.toString() + ')();',
-      'var Processing = (' + ProcessingFactory.toString() + ')(Converter);',
-      'var wgpuFftWeb = (' + wgpuFftWebModule.toString() + ')();',
-      '(' + converterWorker.toString() + ')(self, h5wasm, Converter, Processing, wgpuFftWeb);',
-    ].join('\n');
-    const url = URL.createObjectURL(new Blob([source], { type: 'text/javascript' }));
-    const worker = new Worker(url);
-    const pending = new Map();
-    let seq = 0;
-    const fail = err => {
-      for (const call of pending.values()) call.reject(err);
-      pending.clear();
-    };
-    worker.onmessage = async ev => {
-      const msg = ev.data;
-      const call = pending.get(msg.id);
-      if (!call) return;
-      if (msg.type === 'progress') {
-        if (call.onProgress) call.onProgress(msg.phase, msg.fraction);
-      } else if (msg.type === 'log') {
-        if (call.onLog) call.onLog(msg.text);
-      } else if (msg.type === 'chunk') {
-        try {
-          await call.onChunk(msg.chunk);
-          worker.postMessage({ type: 'ack', id: msg.id });
-        } catch (e) {
-          call.sinkError = e;
-          worker.postMessage({ type: 'cancel', id: msg.id });
-        }
-      } else if (msg.type === 'result') {
-        pending.delete(msg.id);
-        call.resolve(msg.result);
-      } else if (msg.type === 'error') {
-        pending.delete(msg.id);
-        call.reject(call.sinkError || Object.assign(new Error(msg.message), { cancelled: msg.cancelled }));
-      }
-    };
-    worker.onerror = ev => {
-      ev.preventDefault();
-      fail(new Error(ev.message || 'the conversion worker failed'));
-    };
-    return {
-      call(method, args, hooks) {
-        const id = ++seq;
-        const promise = new Promise((resolve, reject) =>
-          pending.set(id, Object.assign({ resolve, reject }, hooks)));
-        worker.postMessage({ type: 'call', id, method, args });
-        return { id, promise };
-      },
-      cancel(id) { worker.postMessage({ type: 'cancel', id }); },
-      terminate() {
-        worker.terminate();
-        URL.revokeObjectURL(url);
-        fail(Object.assign(new Error('cancelled'), { cancelled: true }));
-      },
-    };
-  }
-
-  const state = { data: null, struct: null, dataFiles: [], gridConfig: null, recipe: [], extraNames: [] };
-  let client, current = null, hardCancelTimer = null;
-
-  try {
-    client = createClient();
-    await client.call('ping').promise;
-    logEl.textContent = 'Ready.';
-  } catch (e) {
-    logEl.textContent = '';
-    log('Could not start the conversion worker: ' + e.message, 'err');
-    return;
-  }
-
-  function updateButton() {
-    $('convertBtn').disabled = !state.data || !!current;
-  }
-
-  function setBusy(label) {
-    const on = !!label;
-    $('busy').hidden = !on;
-    $('progressBar').removeAttribute('value');   // indeterminate until the first report
-    $('progressText').textContent = label || '';
-    for (const id of ['dataFile', 'structFile', 'gridConfigFile', 'yellSpace', 'nexusPath', 'extraFiles',
-      'addStep', 'loadRecipe', 'clearRecipe']) $(id).disabled = on;
-    updateButton();
-  }
-
-  function showProgress(phase, fraction) {
-    $('progressBar').value = fraction;
-    $('progressText').textContent = `${phase} ${Math.round(100 * fraction)}%`;
-  }
-
-  // Run one worker call with the progress bar and Cancel button.
-  async function run(label, method, args, hooks) {
-    const call = client.call(method, args, Object.assign({ onProgress: showProgress, onLog: text => log(text) }, hooks));
-    current = call;
-    setBusy(label);
-    try {
-      return await call.promise;
-    } finally {
-      current = null;
-      clearTimeout(hardCancelTimer);
-      setBusy(null);
-    }
-  }
-
-  $('cancelBtn').addEventListener('click', () => {
-    if (!current) return;
-    client.cancel(current.id);
-    $('progressText').textContent = 'Cancelling…';
-    // A single long HDF5 call cannot yield; restart the worker if it does not stop.
-    hardCancelTimer = setTimeout(() => {
-      if (!current) return;
-      client.terminate();
-      client = createClient();
-      state.data = null;
-      state.struct = null;
-      state.dataFiles = [];
-      state.extraNames = [];
-      for (const id of ['dataFile', 'structFile', 'extraFiles']) $(id).value = '';
-      $('nexusPick').hidden = true;
-      for (const id of ['dataInfo', 'structInfo', 'extraInfo']) $(id).textContent = '';
-      renderSteps();
-      log('The worker did not stop in time and was restarted; select the files again.', 'err');
-    }, 5000);
-  });
-
-  function logNotes(notes) {
-    for (const note of notes || []) log('Note: ' + note);
-  }
-
-  // ------------------------------------------------------------ inputs
-  // nexusPath: keep the chosen NXdata group when reloading the same files.
-  async function loadDataFile(nexusPath) {
-    const files = state.dataFiles;
-    $('dataInfo').textContent = '';
-    state.data = null;
-    updateButton();
-    if (!nexusPath) $('nexusPick').hidden = true;
-    try {
-      const s = await run('Reading…', 'loadData', {
-        files, paths: files.map(f => f.webkitRelativePath || ''),
-        yellSpace: $('yellSpace').value, nexusPath: nexusPath || null,
-      });
-      if (!s) return;
-      s.baseName = s.main.replace(/\.(h5|hdf5|hdf|he5|nx|nxs|nx5|dat|txt|vtk)$/i, '');
-      state.data = s;
-      if (files.length > 1) {
-        log(`Data file: ${s.main}` + (s.companions && s.companions.length
-          ? `; linked files: ${s.companions.join(', ')}` : '; the other selected files are not used'));
-      }
-      if (s.candidates && s.candidates.length > 1) {
-        const pick = $('nexusPath');
-        pick.textContent = '';
-        for (const c of s.candidates) {
-          const opt = document.createElement('option');
-          opt.value = c.path;
-          opt.textContent = `${c.path} (${c.shape ? c.shape.join(' x ') : 'linked'})` + (c.isDefault ? ' - default' : '');
-          pick.appendChild(opt);
-        }
-        pick.value = s.nexusPath;
-        $('nexusPick').hidden = false;
-      }
-      let info;
-      if (s.kind === 'dat') {
-        info = `RMCProfile old text format | grid ${s.dims.join(' x ')} in Q`;
-      } else if (s.kind === 'vtk') {
-        info = `VTK STRUCTURED_POINTS in Q | grid ${s.dims.join(' x ')}`;
-      } else if (s.kind === 'vtk-hkl') {
-        info = `VTK STRUCTURED_POINTS in r.l.u. ("${s.title}") | grid ${s.dims.join(' x ')}`;
-      } else {
-        const label = {
-          yell: 'Yell 1.0', unified: 'Unified data format', 'mantid-md': 'Mantid MDHistoWorkspace',
-          nexus: `NeXus ${s.nexusPath}`,
-        }[s.kind];
-        info = label + ` | grid ${s.dims.join(' x ')}` +
-               (s.kind === 'unified' || s.kind === 'nexus' ? ` | axes ${s.axesType || 'hkl'}` : '') +
-               ` | ${s.precision}` +
-               ` | stored cell: ${s.cellLengths.map(x => x.toPrecision(6)).join(' ')} / ` +
-               s.cellAngles.map(x => x.toPrecision(4)).join(' ') +
-               (Converter.isUnitMetric(s.cellLengths, s.cellAngles) ? '  (unit metric)' : '');
-      }
-      $('dataInfo').textContent = info;
-      log(`Data file "${s.main}": ${info}`);
-      logNotes(s.notes);
-      if (s.legacyContract) {
-        log('Legacy unified metadata accepted; new unified output will write the mandatory current contract.');
-      }
-    } catch (e) {
-      const msg = e.cancelled ? 'reading cancelled' : e.message;
-      $('dataInfo').textContent = 'Error: ' + msg;
-      log('Error reading data file: ' + msg, 'err');
-    }
-    updateButton();
-  }
-
-  $('dataFile').addEventListener('change', ev => {
-    state.dataFiles = Array.from(ev.target.files);
-    loadDataFile();
-  });
-
-  $('yellSpace').addEventListener('change', () => {
-    if (state.dataFiles.length) loadDataFile(state.data && state.data.nexusPath);
-  });
-
-  $('nexusPath').addEventListener('change', () => {
-    if (state.dataFiles.length) loadDataFile($('nexusPath').value);
-  });
-
-  $('gridConfigFile').addEventListener('change', async ev => {
-    const fileObj = ev.target.files[0];
-    $('gridConfigInfo').textContent = '';
-    state.gridConfig = null;
-    if (!fileObj) return;
-    try {
-      const cfg = Converter.parseGridConfig(await fileObj.text());
-      state.gridConfig = cfg;
-      const g = cfg.grids[0];
-      const info = (cfg.program === 'scatty' ? 'Scatty' : 'Spinteract') + ' config | ' +
-        (cfg.grids.length > 1 ? `${cfg.grids.length} grids, first ` : 'grid ') +
-        `${g.dims.join(' x ')} from hkl ${g.corner.map(x => +x.toFixed(6)).join(' ')}` +
-        (cfg.customFrame ? ' | custom HKL_TO_X/Y/Z frame' : '');
-      $('gridConfigInfo').textContent = info;
-      log(`Grid config "${fileObj.name}": ${info}`);
-    } catch (e) {
-      $('gridConfigInfo').textContent = 'Error: ' + e.message;
-      log('Error reading grid config: ' + e.message, 'err');
-    }
-  });
-
-  // Spinteract writes one image per data set (..._img_NN.vtk) and one grid
-  // per data set in its config; match them by number.
-  function pickGrid(cfg, dataName) {
-    const m = /_(\d+)\.vtk$/i.exec(dataName || '');
-    const index = cfg.grids.length > 1 && m ? Number(m[1]) - 1 : 0;
-    return index >= 0 && index < cfg.grids.length ? index : 0;
-  }
-
-  $('structFile').addEventListener('change', async ev => {
-    const file = ev.target.files[0] || null;
-    $('structInfo').textContent = '';
-    state.struct = null;
-    try {
-      const parent = await run('Reading structure…', 'loadStructure', { file });
-      if (parent) {
-        state.struct = parent;
-        const info = `parent cell ${fmtCell(parent)}` +
-          (parent.supercell ? ` (supercell ${parent.supercell.join(' x ')})` : '');
-        $('structInfo').textContent = info;
-        log(`Structure "${file.name}": ${info}`);
-      }
-    } catch (e) {
-      $('structInfo').textContent = 'Error: ' + e.message;
-      log('Error reading structure file: ' + e.message, 'err');
-    }
-    updateButton();
-  });
-
-  function manualCell() {
-    const raw = ['ca', 'cb', 'cc', 'cal', 'cbe', 'cga'].map(id => $(id).value.trim());
-    if (raw.some(v => v === '')) return null;
-    const vals = raw.map(Number);
-    if (vals.some(v => !isFinite(v) || v <= 0)) return null;
-    return { lengths: vals.slice(0, 3), angles: vals.slice(3, 6) };
-  }
-
-  // ------------------------------------------------------------ processing
-  // Form fields per step op: [key, type, label]. A type is a list of
-  // choices, or 'num', 'num?' (blank = none), 'nums' (a list), 'range'
-  // (min max, blank = all), 'axis' (min max step), 'ints3', 'json', 'bool',
-  // 'clipTo' (a number or nan) or 'extra' (a loaded volume).
-  const STEP_FORMS = {
-    crop: ['Crop to hkl ranges', [['h', 'range', 'h'], ['k', 'range', 'k'], ['l', 'range', 'l']]],
-    resample: ['Resample onto an hkl grid', [['h', 'axis', 'h min max step'], ['k', 'axis', 'k'], ['l', 'axis', 'l']]],
-    rebin: ['Rebin (average blocks of voxels)', [['factors', 'ints3', 'factors along the grid axes']]],
-    maskBragg: ['Mask Bragg positions', [['shape', ['box', 'sphere'], 'shape'],
-      ['size', 'num', 'half-width (box, r.l.u.) or radius (sphere, 1/Å)'],
-      ['centring', ['P', 'I', 'F', 'C', 'A', 'B', 'R'], 'lattice centring']]],
-    maskRings: ['Mask powder rings', [['q', 'nums', '|Q| of the rings (1/Å)'], ['width', 'num', 'half-width (1/Å)']]],
-    maskRange: ['Mask values outside a range', [['min', 'num?', 'min'], ['max', 'num?', 'max']]],
-    scale: ['Scale and offset: I × factor + offset', [['factor', 'num', 'factor'], ['offset', 'num', 'offset']]],
-    backgroundFunction: ['Subtract a background B(|Q|)', [
-      ['kind', ['constant', 'linear', 'exponential', 'table'], 'kind'],
-      ['params', 'json', 'parameters: [c], [a, b] for a + bQ, [a, b, c] for a − b c^Q, or [[Q, B], …]']]],
-    backgroundShells: ['Subtract a background estimated in |Q| shells', [['width', 'num', 'shell width (1/Å)'],
-      ['percentile', 'num', 'percentile per shell (0 = minimum)'], ['smooth', 'num', 'smooth over ± shells']]],
-    combine: ['Combine with another volume', [['operation', ['subtract', 'add', 'multiply', 'divide'], 'operation'],
-      ['file', 'extra', 'volume'], ['scale', 'num', 'times']]],
-    clip: ['Replace low values', [['below', 'num', 'below'], ['to', 'clipTo', 'with (a number or nan)']]],
-    symmetrize: ['Symmetrize with a Laue group', [['laue', Processing.LAUE_GROUPS, 'Laue group'],
-      ['mode', ['average', 'fill'], 'average all, or fill empty voxels only'], ['expand', 'bool', 'extend the grid']]],
-    deltaPdf: ['3D-ΔPDF (inverse Fourier transform)', [['taper', 'num', 'Tukey taper (0–1)'],
-      ['engine', ['cpu', 'gpu'], 'FFT on']]],
-  };
-  // Starting values of a new step.
-  const STEP_START = {
-    crop: {}, resample: { h: [-2, 2, 0.05], k: [-2, 2, 0.05], l: [0, 0, 0] }, rebin: { factors: [2, 2, 2] },
-    maskBragg: { shape: 'box', size: 0.1, centring: 'P' }, maskRings: { q: [], width: 0.05 }, maskRange: { min: 0 },
-    scale: { factor: 1, offset: 0 }, backgroundFunction: { kind: 'constant', params: [0] },
-    backgroundShells: { width: 0.05, percentile: 5, smooth: 1 }, combine: { operation: 'subtract', scale: 1 },
-    clip: { below: 0, to: 0 }, symmetrize: { laue: 'm-3m', mode: 'average', expand: false },
-    deltaPdf: { taper: 0, engine: 'cpu' },
-  };
-
-  for (const [op, [title]] of Object.entries(STEP_FORMS)) {
-    const opt = document.createElement('option');
-    opt.value = op;
-    opt.textContent = title;
-    $('stepOp').appendChild(opt);
-  }
-
-  const blankOr = (x, text) => (x === undefined || x === null || Number.isNaN(x) ? '' : text);
-  const numberIn = text => (text.trim() === '' ? NaN : Number(text));
-
-  // One form field; returns { node, read } where read() gives the value.
-  function makeField(type, value, changed) {
-    const node = document.createElement('span');
-    const input = (text, wide, hint) => {
-      const e = document.createElement('input');
-      e.value = text;
-      if (wide) e.className = 'wide';
-      if (hint) e.placeholder = hint;
-      e.addEventListener('input', changed);
-      node.appendChild(e);
-      return e;
-    };
-    const select = (choices, current, labels) => {
-      const e = document.createElement('select');
-      choices.forEach((c, i) => {
-        const opt = document.createElement('option');
-        opt.value = c;
-        opt.textContent = labels ? labels[i] : c;
-        e.appendChild(opt);
-      });
-      e.value = current;
-      e.addEventListener('change', changed);
-      node.appendChild(e);
-      return e;
-    };
-    if (Array.isArray(type)) {
-      const e = select(type, value);
-      return { node, read: () => e.value };
-    }
-    if (type === 'num') {
-      const e = input(blankOr(value, String(value)));
-      return { node, read: () => numberIn(e.value) };
-    }
-    if (type === 'num?') {
-      const e = input(blankOr(value, String(value)));
-      return { node, read: () => (e.value.trim() === '' ? undefined : Number(e.value)) };
-    }
-    if (type === 'nums') {
-      const e = input((value || []).join(', '), true);
-      return { node, read: () => e.value.split(/[\s,;]+/).filter(Boolean).map(Number) };
-    }
-    if (type === 'range') {
-      const [a, b] = ['min', 'max'].map((hint, i) => input(value ? String(value[i]) : '', false, hint));
-      return { node, read: () => (a.value.trim() === '' && b.value.trim() === '' ? undefined : [numberIn(a.value), numberIn(b.value)]) };
-    }
-    if (type === 'axis' || type === 'ints3') {
-      const hints = type === 'axis' ? ['min', 'max', 'step'] : ['', '', ''];
-      const es = hints.map((hint, i) => input(value ? String(value[i]) : '', false, hint));
-      return { node, read: () => es.map(e => numberIn(e.value)) };
-    }
-    if (type === 'json') {
-      const e = input(value === undefined ? '' : JSON.stringify(value), true);
-      return {
-        node, read: () => {
-          try {
-            return JSON.parse(e.value);
-          } catch (_) {
-            return undefined;
-          }
-        },
-      };
-    }
-    if (type === 'bool') {
-      const e = document.createElement('input');
-      e.type = 'checkbox';
-      e.checked = !!value;
-      e.addEventListener('change', changed);
-      node.appendChild(e);
-      return { node, read: () => e.checked };
-    }
-    if (type === 'clipTo') {
-      const e = input(value === undefined ? '' : String(value));
-      return { node, read: () => (e.value.trim().toLowerCase() === 'nan' ? 'nan' : numberIn(e.value)) };
-    }
-    // 'extra': the loaded volumes, and a recipe's name that is not loaded
-    const names = state.extraNames.slice();
-    const labels = names.slice();
-    if (value && !names.includes(value)) {
-      names.push(value);
-      labels.push(value + ' (not loaded)');
-    }
-    if (!names.length) {
-      names.push('');
-      labels.push('(load a volume below)');
-    }
-    const e = select(names, value || names[0], labels);
-    return { node, read: () => e.value };
-  }
-
-  // The step as valid recipe JSON, or the reason it is not.
-  function checkStep(step) {
-    try {
-      const normal = Processing.normalizeRecipe({ steps: [step] }).steps[0];
-      return { text: Processing.describeStep(normal) };
-    } catch (e) {
-      return { error: e.message.replace(/^recipe step 1 /, '') };
-    }
-  }
-
-  function renderSteps() {
-    const list = $('steps');
-    list.textContent = '';
-    state.recipe.forEach((step, n) => {
-      const [title, fields] = STEP_FORMS[step.op];
-      const item = document.createElement('li');
-      item.className = 'step';
-      const head = document.createElement('div');
-      head.className = 'stephead';
-      const name = document.createElement('b');
-      name.textContent = `${n + 1}. ${title}`;
-      head.appendChild(name);
-      for (const [text, tip, act] of [['↑', 'move up', -1], ['↓', 'move down', 1], ['✕', 'remove', 0]]) {
-        const b = document.createElement('button');
-        b.type = 'button';
-        b.className = 'secondary';
-        b.textContent = text;
-        b.title = tip;
-        b.disabled = act === -1 ? n === 0 : act === 1 ? n === state.recipe.length - 1 : false;
-        b.addEventListener('click', () => {
-          const [moved] = state.recipe.splice(n, 1);
-          if (act) state.recipe.splice(n + act, 0, moved);
-          renderSteps();
-        });
-        head.appendChild(b);
-      }
-      item.appendChild(head);
-      const box = document.createElement('div');
-      box.className = 'fields';
-      const status = document.createElement('div');
-      status.className = 'hint';
-      const readers = [];
-      const update = () => {
-        const next = { op: step.op };
-        for (const [key, read] of readers) {
-          const v = read();
-          if (v !== undefined) next[key] = v;
-        }
-        state.recipe[n] = next;
-        const c = checkStep(next);
-        status.textContent = c.error || c.text;
-        status.className = c.error ? 'hint err' : 'hint';
-      };
-      for (const [key, type, label] of fields) {
-        const wrap = document.createElement('span');
-        const l = document.createElement('label');
-        l.textContent = label;
-        wrap.appendChild(l);
-        const field = makeField(type, step[key], update);
-        wrap.appendChild(field.node);
-        readers.push([key, field.read]);
-        box.appendChild(wrap);
-      }
-      item.appendChild(box);
-      item.appendChild(status);
-      list.appendChild(item);
-      update();
-    });
-  }
-
-  $('addStep').addEventListener('click', () => {
-    const op = $('stepOp').value;
-    const step = Object.assign({ op }, JSON.parse(JSON.stringify(STEP_START[op] || {})));
-    if (op === 'combine' && state.extraNames.length) step.file = state.extraNames[0];
-    state.recipe.push(step);
-    renderSteps();
-  });
-
-  $('clearRecipe').addEventListener('click', () => {
-    state.recipe = [];
-    renderSteps();
-  });
-
-  $('saveRecipe').addEventListener('click', () => {
-    const text = JSON.stringify({ version: 1, steps: state.recipe }, null, 2) + '\n';
-    download([text], ((state.data && state.data.baseName) || 'processing') + '_recipe.json', 'application/json');
-  });
-
-  $('loadRecipe').addEventListener('click', () => $('recipeFile').click());
-  $('recipeFile').addEventListener('change', async ev => {
-    const file = ev.target.files[0];
-    if (!file) return;
-    try {
-      state.recipe = Processing.normalizeRecipe(JSON.parse(await file.text())).steps;
-      renderSteps();
-      log(`Recipe "${file.name}": ${state.recipe.length} step(s)`);
-    } catch (e) {
-      log(`Error reading recipe "${file.name}": ${e.message}`, 'err');
-    }
-    ev.target.value = '';
-  });
-
-  $('extraFiles').addEventListener('change', async ev => {
-    const files = Array.from(ev.target.files);
-    $('extraInfo').textContent = '';
-    state.extraNames = [];
-    try {
-      const list = await run('Reading volumes…', 'loadExtras', { files });
-      state.extraNames = list.map(x => x.name);
-      $('extraInfo').textContent = list.map(x => `${x.name}: grid ${x.dims.join(' x ')}`).join('; ');
-      for (const x of list) {
-        log(`Volume "${x.name}": grid ${x.dims.join(' x ')}` + (x.frame === 'q' ? ' in Q' : ''));
-        logNotes(x.notes);
-      }
-    } catch (e) {
-      $('extraInfo').textContent = 'Error: ' + (e.cancelled ? 'reading cancelled' : e.message);
-      log('Error reading volumes: ' + e.message, 'err');
-    }
-    renderSteps();
-  });
-
-  $('outFormat').addEventListener('change', () => {
-    $('profileOpts').hidden = $('outFormat').value !== 'profile';
-  });
-
-  // ------------------------------------------------------------ output
-  function download(bytes, filename, mime) {
-    const blob = new Blob(Array.isArray(bytes) ? bytes : [bytes], { type: mime });
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = filename;
-    a.click();
-    setTimeout(() => URL.revokeObjectURL(a.href), 5000);
-  }
-
-  // Where text output goes: straight to disk through the File System Access
-  // API (Chromium), else a chunked in-memory download (separate strings avoid
-  // the maximum string length, but the Blob still has to fit in memory).
-  async function openTextSink(filename, format) {
-    if ('showSaveFilePicker' in window) {
-      try {
-        const [description, extension] = {
-          dat: ['RMCProfile old diffuse text format', '.dat'], vtk: ['VTK legacy file', '.vtk'],
-          profile: ['|Q| profile', '.txt'],
-        }[format];
-        const handle = await window.showSaveFilePicker({
-          suggestedName: filename,
-          types: [{ description, accept: { 'text/plain': [extension] } }],
-        });
-        const writable = await handle.createWritable();
-        return {
-          how: 'streamed directly to disk',
-          write: chunk => writable.write(chunk),
-          close: () => writable.close(),
-          abort: () => writable.abort().catch(() => {}),
-        };
-      } catch (e) {
-        if (e.name === 'AbortError') throw Object.assign(new Error('cancelled'), { cancelled: true });
-        log(`No save dialog (${e.message}); building the download in memory instead.`);
-      }
-    } else {
-      log('Direct file streaming is unavailable in this browser; building a chunked download in memory.');
-    }
-    const parts = [];
-    return {
-      how: 'prepared as a chunked browser download',
-      write: chunk => { parts.push(chunk); },
-      close: () => download(parts, filename, 'text/plain'),
-      abort: () => {},
-    };
-  }
-
-  $('convertBtn').addEventListener('click', async () => {
-    clearLog();
-    const format = $('outFormat').value;
-    const text = format === 'dat' || format === 'vtk' || format === 'profile';
-    const params = {
-      format,
-      radiation: $('radiation').value,
-      manual: manualCell(),
-      precision: $('precision').value,
-      layout: $('layout').value,
-      compression: Number($('compression').value),
-      recipe: state.recipe.length ? { version: 1, steps: state.recipe } : null,
-      profileWidth: Number($('profileWidth').value),
-    };
-    const bad = state.recipe.map((s, n) => [n + 1, checkStep(s).error]).filter(x => x[1]);
-    if (bad.length) {
-      for (const [n, error] of bad) log(`Error: processing step ${n}: ${error}`, 'err');
-      return;
-    }
-    if (format === 'profile' && !(params.profileWidth > 0)) {
-      log('Error: the |Q| shell width must be a positive number', 'err');
-      return;
-    }
-    if (state.gridConfig && state.data.kind === 'vtk') {
-      const index = pickGrid(state.gridConfig, state.data.main);
-      params.grid = state.gridConfig.grids[index];
-      params.customFrame = state.gridConfig.customFrame;
-      if (state.gridConfig.grids.length > 1) {
-        log(`Using grid ${index + 1} of ${state.gridConfig.grids.length} from the config.`);
-      }
-    }
-    const suffix = {
-      unified: '_unified.h5', yell: '_yell.h5', dat: '_diffuse3d.dat', vtk: '_diffuse.vtk', profile: '_profile.txt',
-    }[format];
-    let sink = null;
-    try {
-      const plan = await run(params.recipe ? 'Processing…' : 'Preparing…', 'prepare', params);
-      logNotes(plan.notes);
-      const direct = plan.axesType === 'uvw';
-      log(`Grid ${plan.dims.join(' x ')} (${plan.dims[0] * plan.dims[1] * plan.dims[2]} points)` +
-          (direct ? ' in direct space (u, v, w)' : ''));
-      log(`Cell for hkl <-> Q: ${fmtCell(plan.cell)}  [from ${plan.cellSource}]`);
-      if (plan.estimate) {
-        log(`Output: about ${fmtBytes(plan.estimate)}` +
-            (!text && params.compression ? ' before compression' : '') + '.');
-      }
-      const tag = !plan.processed ? '' : direct && state.data.axesType !== 'uvw' ? '_dpdf' : '_processed';
-      const outName = (state.data.baseName || 'converted') + tag + suffix;
-      if (text) {
-        if (plan.nonFinite) {
-          log(`${plan.nonFinite} NaN/infinite voxels written as 0` +
-              (format === 'dat' ? ' (RMCProfile leaves points with I = 0 out of the fit).' : '.'));
-        }
-        sink = await openTextSink(outName, format);
-        await run('Writing…', 'write', {}, { onChunk: chunk => sink.write(chunk) });
-        await sink.close();
-        log(`Wrote ${outName} (${sink.how})`, 'ok');
-      } else {
-        if (plan.estimate > 1.9 * 1073741824) {
-          log('Warning: HDF5 files are assembled in memory, and Chrome/Edge cannot hold one above ' +
-              'about 2 GB; float32, the /entry/data-only layout or compression reduce the size.', 'err');
-        }
-        const result = await run('Writing…', 'write', {});
-        download(result.bytes, outName, 'application/x-hdf5');
-        log(`Wrote ${outName}`, 'ok');
-      }
-    } catch (e) {
-      if (sink) await sink.abort();
-      if (e.cancelled) log('Cancelled.');
-      else log('Error: ' + e.message, 'err');
-    }
-  });
-})();
-</script>
+<script src="js/app.js"></script>
 </body>
 </html>
