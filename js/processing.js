@@ -292,6 +292,7 @@
         symmetrize: { mode: 'average', expand: true, k: 3 },
         removeRings: { width: 0.005, cutoff: 0.05, sectors: 1, coverage: 0.25, positive: true, powder: 'none', near: 0 },
         backgroundDebyeWaller: { radiation: 'auto', uiso: '0.01', fit: true, scale: 1, offset: false, percentile: 5, width: 0.05 },
+        correctUB: { mode: 'refine', centring: 'P', radius: 0.25, snr: 10, peaks: 300, shift: false },
         deltaPdf: { taper: 0, engine: 'cpu', fill: 0 },
         normalize: { background: '', backgroundNorm: '', scale: 1, fitScale: false, laue: 'none' },
     };
@@ -1080,6 +1081,163 @@ D|0.413048 0.294953 0.187491 0.080701 0.023736 15.56995 32.39847 5.711404 61.889
         return subtractCurve(model, ctx.cell, q => scale * curve(q)[0] + offset);
     }
 
+    // ---------------------------------------------------------- UB correction
+
+    // Solve the n x n system M x = y (Gaussian elimination with pivoting).
+    function solveSmall(M, y) {
+        const n = y.length, A = M.map((row, i) => row.concat([y[i]]));
+        for (let c = 0; c < n; c++) {
+            let p = c;
+            for (let r = c + 1; r < n; r++) if (Math.abs(A[r][c]) > Math.abs(A[p][c])) p = r;
+            if (!(Math.abs(A[p][c]) > 1e-300)) return null;
+            [A[c], A[p]] = [A[p], A[c]];
+            for (let r = 0; r < n; r++) {
+                if (r === c) continue;
+                const f = A[r][c] / A[c][c];
+                for (let k = c; k <= n; k++) A[r][k] -= f * A[c][k];
+            }
+        }
+        return A.map((row, i) => row[n] / row[i]);
+    }
+
+    // Bragg peaks near the integer hkl the centring allows: in a box of
+    // half-width `radius` (r.l.u.) around each, the voxels above half the
+    // height over the box median give an intensity-weighted centroid. Peaks
+    // stand out by `snr` robust sigma of the box (1.4826 x its median
+    // absolute deviation). Returns the strongest `count`: { at, hkl, height }.
+    function findBraggPeaks(model, step) {
+        const allowed = CENTRING[step.centring];
+        if (!allowed) throw new Error(`unknown centring ${step.centring}`);
+        const M = gridMatrix(model), Minv = invert3(M), [nh, nk, nl] = model.dims, v = model.values;
+        const lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
+        for (const i of [0, nh - 1]) for (const j of [0, nk - 1]) for (const k of [0, nl - 1]) {
+            const p = mulMV(M, [i, j, k]).map((x, c) => x + model.corner[c]);
+            p.forEach((x, c) => { lo[c] = Math.min(lo[c], x); hi[c] = Math.max(hi[c], x); });
+        }
+        const r = step.radius, peaks = [];
+        const box = [], idx = [];
+        for (let H = Math.ceil(lo[0]); H <= Math.floor(hi[0]); H++)
+            for (let K = Math.ceil(lo[1]); K <= Math.floor(hi[1]); K++)
+                for (let L = Math.ceil(lo[2]); L <= Math.floor(hi[2]); L++) {
+                    if ((!H && !K && !L) || !allowed(H, K, L)) continue;
+                    // the index box of the hkl box
+                    const ilo = [Infinity, Infinity, Infinity], ihi = [-Infinity, -Infinity, -Infinity];
+                    for (const dh of [-r, r]) for (const dk of [-r, r]) for (const dl of [-r, r]) {
+                        mulMV(Minv, [H + dh - model.corner[0], K + dk - model.corner[1], L + dl - model.corner[2]]).forEach((f, a) => {
+                            ilo[a] = Math.min(ilo[a], f);
+                            ihi[a] = Math.max(ihi[a], f);
+                        });
+                    }
+                    const a0 = [0, 1, 2].map(a => Math.max(0, Math.ceil(ilo[a] - 1e-9))), a1 = [0, 1, 2].map(a => Math.min(model.dims[a] - 1, Math.floor(ihi[a] + 1e-9)));
+                    if (a0.some((x, a) => x > a1[a])) continue;
+                    box.length = 0;
+                    idx.length = 0;
+                    for (let k = a0[2]; k <= a1[2]; k++)
+                        for (let j = a0[1]; j <= a1[1]; j++)
+                            for (let i = a0[0]; i <= a1[0]; i++) {
+                                const at = (k * nk + j) * nh + i, x = v[at];
+                                if (x !== x) continue;
+                                const p = [0, 1, 2].map(c => model.corner[c] + M[c][0] * i + M[c][1] * j + M[c][2] * k);
+                                if (Math.abs(p[0] - H) > r || Math.abs(p[1] - K) > r || Math.abs(p[2] - L) > r) continue;
+                                box.push(x);
+                                idx.push(i, j, k);
+                            }
+                    if (box.length < 27) continue;
+                    const vals = Float64Array.from(box), med = medianOf(Float64Array.from(vals), vals.length);
+                    const spread = 1.4826 * medianOf(Float64Array.from(vals, x => Math.abs(x - med)), vals.length);
+                    let top = -Infinity;
+                    for (const x of vals) top = Math.max(top, x);
+                    const height = top - med;
+                    if (!(height > step.snr * Math.max(spread, 1e-12 * Math.abs(med)))) continue;
+                    let sw = 0;
+                    const c = [0, 0, 0];
+                    for (let n = 0; n < vals.length; n++) {
+                        const w = vals[n] - med - 0.5 * height;
+                        if (w <= 0) continue;
+                        const [i, j, k] = [idx[3 * n], idx[3 * n + 1], idx[3 * n + 2]];
+                        for (let a = 0; a < 3; a++) c[a] += w * (model.corner[a] + M[a][0] * i + M[a][1] * j + M[a][2] * k);
+                        sw += w;
+                    }
+                    if (sw > 0) peaks.push({ at: c.map(x => x / sw), hkl: [H, K, L], height });
+                }
+        return peaks.sort((a, b) => b.height - a.height).slice(0, step.peaks);
+    }
+
+    // hkl_true = A hkl_found (+ t): least squares over the peaks, then once
+    // more without those off by more than 3 x the median miss.
+    function fitPeakMap(peaks, shift) {
+        const solve = list => {
+            const m = shift ? 4 : 3, rows = list.map(p => (shift ? p.at.concat([1]) : p.at));
+            const N = Array.from({ length: m }, () => new Array(m).fill(0));
+            const A = [], t = [0, 0, 0];
+            for (let c = 0; c < 3; c++) {
+                const y = new Array(m).fill(0);
+                for (let n = 0; n < rows.length; n++) {
+                    for (let a = 0; a < m; a++) {
+                        y[a] += rows[n][a] * list[n].hkl[c];
+                        if (c === 0) for (let b = 0; b < m; b++) N[a][b] += rows[n][a] * rows[n][b];
+                    }
+                }
+                const x = solveSmall(N, y);
+                if (!x) return null;
+                A.push(x.slice(0, 3));
+                if (shift) t[c] = x[3];
+            }
+            return { A, t };
+        };
+        const miss = (fit, p) => Math.hypot(...mulMV(fit.A, p.at).map((x, c) => x + fit.t[c] - p.hkl[c]));
+        let fit = solve(peaks);
+        if (!fit) return null;
+        const d = peaks.map(p => miss(fit, p)), lim = 3 * medianOf(Float64Array.from(d), d.length);
+        const kept = peaks.filter((p, n) => d[n] <= lim || lim === 0);
+        if (kept.length >= (shift ? 6 : 5) && kept.length < peaks.length) fit = solve(kept) || fit;
+        return Object.assign(fit, { used: kept.length, rms: Math.sqrt(kept.reduce((s, p) => s + miss(fit, p) ** 2, 0) / kept.length) });
+    }
+
+    // Put the Bragg peaks back on integer hkl: mode 'refine' fits the map
+    // from where the peaks are to where they belong (linear, as a wrong UB
+    // gives; with `shift`, affine); mode 'matrix' takes the UB the grid was
+    // made with (`ub`, else the data's) and the right one (`ubNew`). The
+    // volume is then resampled on its own grid, value(hkl) = old value at
+    // A^-1 (hkl - t); the model's UB is corrected with it.
+    function stepCorrectUB(model, step, ctx) {
+        let A, t = [0, 0, 0];
+        if (step.mode === 'matrix') {
+            const old = step.ub && step.ub.length === 9 ? [step.ub.slice(0, 3), step.ub.slice(3, 6), step.ub.slice(6, 9)] : model.ub;
+            if (!old) throw new Error('matrix mode needs the UB the grid was made with (the data have none)');
+            if (!(step.ubNew && step.ubNew.length === 9)) throw new Error('matrix mode needs the corrected UB (9 numbers, row by row)');
+            const neu = [step.ubNew.slice(0, 3), step.ubNew.slice(3, 6), step.ubNew.slice(6, 9)];
+            A = mulMM(invert3(neu), old);
+        } else {
+            const peaks = findBraggPeaks(model, step);
+            if (peaks.length < (step.shift ? 6 : 5)) {
+                throw new Error(`${peaks.length} Bragg peaks found; the fit needs more (a larger search radius, a lower signal-to-noise, or no Bragg mask before this step)`);
+            }
+            const before = Math.sqrt(peaks.reduce((s, p) => s + p.at.reduce((x, y, c) => x + (y - p.hkl[c]) ** 2, 0), 0) / peaks.length);
+            const fit = fitPeakMap(peaks, step.shift);
+            if (!fit) throw new Error('the peaks do not fix the map (they lie in one plane)');
+            ({ A, t } = fit);
+            ctx.log(`${peaks.length} Bragg peaks, ${fit.used} used: rms miss of integer hkl ${before.toFixed(4)} -> ${fit.rms.toFixed(4)} r.l.u.`);
+        }
+        const fmt = x => (Math.abs(x) < 5e-7 ? '0' : x.toFixed(6));
+        ctx.log(`hkl = A hkl_grid${step.shift ? ' + t' : ''}, A = [${A.map(r => r.map(fmt).join(' ')).join('; ')}]` +
+            (step.shift ? `, t = [${t.map(fmt).join(' ')}]` : ''));
+        const Ai = invert3(A);
+        const sample = sampler(model), sampleSigma = model.sigma ? sampler(Object.assign({}, model, { values: model.sigma })) : null;
+        const values = newValues(model, model.values.length), sigma = sampleSigma ? newValues(model, values.length) : undefined;
+        forEachHkl(model, (i, h, k, l) => {
+            const p = mulMV(Ai, [h - t[0], k - t[1], l - t[2]]);
+            values[i] = sample(p[0], p[1], p[2]);
+            if (sigma) sigma[i] = sampleSigma(p[0], p[1], p[2]);
+        });
+        const changes = { sigma };
+        if (model.ub) {
+            changes.ub = mulMM(model.ub, Ai);
+            ctx.log(`corrected UB = [${changes.ub.map(r => r.map(x => x.toPrecision(6)).join(' ')).join('; ')}]`);
+        }
+        return withValues(model, values, changes);
+    }
+
     // Combine with another volume, sampled onto this grid.
     function stepCombine(model, step, ctx) {
         const other = ctx.extras && ctx.extras[step.file];
@@ -1794,12 +1952,19 @@ D|0.413048 0.294953 0.187491 0.080701 0.023736 15.56995 32.39847 5.711404 61.889
 
     // Steps that act on hkl / |Q| and so need reciprocal-space data.
     const RECIPROCAL_ONLY = new Set(['maskBragg', 'maskRings', 'backgroundFunction', 'backgroundShells', 'deltaPdf', 'removeRings',
-        'backgroundDebyeWaller']);
+        'backgroundDebyeWaller', 'correctUB']);
 
     const STEPS = {
         crop: { run: stepCrop, fields: { h: 'range?', k: 'range?', l: 'range?' } },
         resample: { run: stepResample, fields: { h: 'axis', k: 'axis', l: 'axis' } },
         rebin: { run: stepRebin, fields: { factors: 'ints3' } },
+        correctUB: {
+            run: stepCorrectUB,
+            fields: {
+                mode: 'ubMode', centring: 'centring', radius: 'positive', snr: 'positive', peaks: 'peakCount', shift: 'boolean',
+                ub: 'matrix?', ubNew: 'matrix?',
+            },
+        },
         maskBragg: { run: stepMaskBragg, fields: { shape: 'string', size: 'positive', centring: 'string' } },
         maskRings: { run: stepMaskRings, fields: { q: 'numbers?', width: 'positive', powder: 'powder', a: 'number?' } },
         maskRange: { run: stepMaskRange, fields: { min: 'number?', max: 'number?' } },
@@ -1855,6 +2020,10 @@ D|0.413048 0.294953 0.187491 0.080701 0.023736 15.56995 32.39847 5.711404 61.889
             sectors: v => Number.isInteger(v) && v >= 1 && v <= 256,
             fraction: v => finite(v) && v >= 0 && v <= 1,
             radiation: v => ['auto', 'xray', 'neutron', 'electron'].includes(v),
+            ubMode: v => v === 'refine' || v === 'matrix',
+            centring: v => Object.prototype.hasOwnProperty.call(CENTRING, v),
+            peakCount: v => Number.isInteger(v) && v >= 5 && v <= 100000,
+            'matrix?': v => v === undefined || v === null || (Array.isArray(v) && (v.length === 0 || (v.length === 9 && v.every(finite)))),
             any: v => v !== undefined,
         }[kind];
         if (!ok(value)) throw new Error(`${where}: invalid value ${JSON.stringify(value)}`);
@@ -1893,6 +2062,10 @@ D|0.413048 0.294953 0.187491 0.080701 0.023736 15.56995 32.39847 5.711404 61.889
             case 'crop': return 'crop' + (r('h', step.h) + r('k', step.k) + r('l', step.l) || ' (no ranges set: keeps the grid)');
             case 'resample': return 'resample onto' + ['h', 'k', 'l'].map(n => ` ${n} ${step[n][0]}..${step[n][1]} step ${step[n][2]}`).join(',');
             case 'rebin': return `rebin by ${step.factors.join(' x ')}`;
+            case 'correctUB': return step.mode === 'matrix'
+                ? 'correct the orientation: resample from the UB the grid was made with to the new one'
+                : `put the Bragg peaks on integer hkl: fit a ${step.shift ? 'linear map and shift' : 'linear map (a UB correction)'} ` +
+                  `to up to ${step.peaks} peaks (centring ${step.centring}, within ${step.radius} r.l.u., ${step.snr} sigma)`;
             case 'maskBragg': return `mask Bragg positions (${step.shape} ${step.size}${step.shape === 'sphere' ? ' 1/A' : ' r.l.u.'}, centring ${step.centring})`;
             case 'maskRings': return 'mask powder rings' + ((step.q || []).length > 6
                 ? ` at ${step.q.length} |Q| from ${+Math.min(...step.q).toFixed(4)} to ${+Math.max(...step.q).toFixed(4)}`

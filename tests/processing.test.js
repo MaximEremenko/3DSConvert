@@ -513,3 +513,48 @@ test('backgroundDebyeWaller: Laue and thermal diffuse of a composition, scaled t
         /does not change with \|Q\|/);
     await assert.rejects(run(m, [{ op: 'backgroundDebyeWaller', composition: 'Pb' }]), /radiation of the data is not known/);
 });
+
+test('correctUB: Bragg peaks of a slightly wrong UB go back onto integer hkl (refined, or from the right UB)', async () => {
+    // peaks drawn where a wrong UB puts them: found = A^-1 H, A a small rotation and strain
+    const t = 0.8 * Math.PI / 180, A = [[Math.cos(t) * 1.005, -Math.sin(t), 0], [Math.sin(t), Math.cos(t), 0.004], [0, 0, 0.995]];
+    const det = A[0][0] * (A[1][1] * A[2][2] - A[1][2] * A[2][1]) - A[0][1] * (A[1][0] * A[2][2] - A[1][2] * A[2][0]) + A[0][2] * (A[1][0] * A[2][1] - A[1][1] * A[2][0]);
+    const inv = [0, 1, 2].map(r => [0, 1, 2].map(c => {
+        const m = (i, j) => A[(j + 1) % 3][(i + 1) % 3] * A[(j + 2) % 3][(i + 2) % 3] - A[(j + 1) % 3][(i + 2) % 3] * A[(j + 2) % 3][(i + 1) % 3];
+        return m(r, c) / det;
+    }));
+    const peakAt = H => [0, 1, 2].map(r => inv[r][0] * H[0] + inv[r][1] * H[1] + inv[r][2] * H[2]);
+    const centres = [];
+    for (let H = -3; H <= 3; H++) for (let K = -3; K <= 3; K++) for (let L = -3; L <= 3; L++) if (H || K || L) centres.push([[H, K, L], peakAt([H, K, L])]);
+    const m = grid(3.5, 0.05, (h, k, l) => {
+        let v = 1;
+        for (const [, c] of centres) {
+            const d2 = (h - c[0]) ** 2 + (k - c[1]) ** 2 + (l - c[2]) ** 2;
+            if (d2 < 0.09) v += 1000 * Math.exp(-d2 / (2 * 0.06 * 0.06));
+        }
+        return v;
+    });
+    // where the strongest voxel near a Bragg position is
+    const maxNear = (model, H) => {
+        let best = -Infinity, at = null;
+        forHkl(model, (i, h, k, l) => {
+            if (Math.abs(h - H[0]) < 0.2 && Math.abs(k - H[1]) < 0.2 && Math.abs(l - H[2]) < 0.2 && model.values[i] > best) {
+                best = model.values[i];
+                at = [h, k, l];
+            }
+        });
+        return at;
+    };
+    const off = (model, H) => Math.hypot(...maxNear(model, H).map((x, c) => x - H[c]));
+    assert.ok(off(m, [3, 3, 3]) > 0.05, 'the peaks start off their places');
+    const logs = [];
+    const fixed = await run(m, [{ op: 'correctUB', mode: 'refine', radius: 0.2 }], { log: x => logs.push(x) });
+    assert.match(logs.join('\n'), /Bragg peaks, \d+ used: rms miss of integer hkl 0\.0\d+ -> 0\.00\d/);
+    for (const H of [[3, 3, 3], [-3, 2, 1], [0, 0, 3], [3, -3, -3]]) assert.ok(off(fixed, H) < 0.026, `${H}: ${off(fixed, H)}`);
+    // the same from the UB the grid was made with and the right one: UB_old A^-1
+    const ubOld = [[0.2, 0, 0], [0, 0.2, 0], [0, 0, 0.25]];
+    const ubNew = [0, 1, 2].map(r => [0, 1, 2].map(c => ubOld[r][0] * inv[0][c] + ubOld[r][1] * inv[1][c] + ubOld[r][2] * inv[2][c]));
+    const byUB = await run(Object.assign({}, m, { ub: ubOld }), [{ op: 'correctUB', mode: 'matrix', ubNew: ubNew.flat() }]);
+    for (const H of [[3, 3, 3], [-3, 2, 1]]) assert.ok(off(byUB, H) < 0.026, `${H}: ${off(byUB, H)}`);
+    assert.ok(maxAbsDiff(byUB.ub.flat(), ubNew.flat()) < 1e-12);
+    await assert.rejects(run(m, [{ op: 'correctUB', mode: 'matrix', ubNew: ubNew.flat() }]), /made with/);
+});
