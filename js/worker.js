@@ -451,6 +451,21 @@ function converterWorker(self, h5wasm, Converter, Processing, wgpuFftWeb) {
             return { result: plane, transfer: [plane.values.buffer] };
         },
 
+        // Shell averages over |Q| for the preview: the data as read (on hkl
+        // axes with the chosen cell) or the processed result.
+        async profile({ stage, width, params }) {
+            let plan;
+            if (stage === 'processed') {
+                if (!state.processed) throw new Error('no processed preview yet');
+                plan = state.processed.plan;
+            } else {
+                if (!state.data) throw new Error('no data file loaded');
+                const input = state.data.grid ? { grid: state.data.grid } : { model: state.data.model };
+                plan = Converter.planConversion(input, Object.assign({}, params, { format: 'unified', structure: state.struct }));
+            }
+            return { result: Processing.profileShells(plan.model, plan.cell, width) };
+        },
+
         // Runs the recipe for the preview and keeps the result, which the
         // next prepare() with the same data, cell and recipe reuses.
         async previewRecipe(params, ctx) {

@@ -93,6 +93,8 @@
     return t.replace(/^-/, '−');
   }
   const fmtInt = n => String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ' ');
+  // n significant digits, a true minus sign.
+  const sig = (x, n) => (Number.isFinite(x) ? String(+x.toPrecision(n || 3)).replace(/^-/, '−') : String(x));
 
   // ------------------------------------------------------------ theme
   const darkQuery = window.matchMedia('(prefers-color-scheme: dark)');
@@ -111,11 +113,11 @@
       // the choice is not kept
     }
     showTheme();
-    drawSlice();
+    redrawPreview();
   });
   darkQuery.addEventListener('change', () => {
     showTheme();
-    drawSlice();
+    redrawPreview();
   });
   showTheme();
 
@@ -380,7 +382,7 @@
       }
       showData(s);
       renderCell();
-      loadSlice();
+      refreshPreview();
     } catch (e) {
       const msg = e.cancelled ? 'reading cancelled' : e.message;
       $('dataInfo').textContent = 'Error: ' + msg;
@@ -847,6 +849,10 @@
   function stepsChanged() {
     updateOutput();
     markPreviewStale();
+    if (preview.view === 'profile' && preview.stage === 'input') {
+      clearTimeout(preview.ptimer);
+      preview.ptimer = setTimeout(loadProfile, 300);
+    }
   }
 
   function addSteps(steps) {
@@ -974,7 +980,10 @@
   const VIRIDIS = [[68, 1, 84], [72, 40, 120], [62, 74, 137], [49, 104, 142], [38, 130, 142], [31, 158, 137],
     [53, 183, 121], [109, 205, 89], [180, 222, 44], [253, 231, 37]];
   const DIVERGING = [[33, 64, 154], [67, 118, 190], [140, 180, 222], [246, 246, 244], [243, 179, 104], [218, 123, 34], [160, 72, 6]];
-  const preview = { stage: 'input', normal: 2, index: null, plane: null, ready: false, stale: false, seq: 0, timer: 0 };
+  const preview = {
+    view: 'slice', stage: 'input', normal: 2, index: null, plane: null, profile: null, hover: -1,
+    ready: false, stale: false, seq: 0, timer: 0, ptimer: 0,
+  };
 
   function colorAt(stops, f) {
     const x = Math.min(1, Math.max(0, f)) * (stops.length - 1), i = Math.min(stops.length - 2, Math.floor(x)), u = x - i;
@@ -990,14 +999,16 @@
     preview.stale = false;
     preview.index = null;
     preview.normal = s ? (s.dims.indexOf(1) >= 0 ? s.dims.indexOf(1) : 2) : 2;
+    preview.profile = null;
     $('previewEmpty').hidden = !!s;
-    $('previewView').hidden = !s;
+    showView();
     $('previewSub').textContent = '';
     $('readout').textContent = 'Point at the slice to read values';
     setPreviewButtons();
   }
 
   function setPreviewButtons(names) {
+    for (const b of $('viewSeg').children) b.disabled = !state.data || !!current;
     for (const b of $('stageSeg').children) {
       b.setAttribute('aria-pressed', String(b.dataset.stage === preview.stage));
       b.disabled = !state.data || !!current || (b.dataset.stage === 'processed' && !activeRecipe().length);
@@ -1178,14 +1189,14 @@
         preview.stage = 'input';
         preview.index = null;
         setPreviewButtons();
-        loadSlice();
+        refreshPreview();
         return;
       }
       if (preview.ready && !preview.stale) {
         preview.stage = 'processed';
         preview.index = null;
         setPreviewButtons();
-        loadSlice();
+        refreshPreview();
         return;
       }
       const params = checkedParams();
@@ -1198,10 +1209,213 @@
         preview.index = null;
         log(`Preview of the processed data: grid ${r.dims.join(' x ')}` + (r.axesType === 'uvw' ? ' in direct space (u, v, w)' : ''), 'ok');
         setPreviewButtons();
-        await loadSlice();
+        await refreshPreview();
       } catch (e) {
         log(e.cancelled ? 'Cancelled.' : 'Error: ' + e.message, e.cancelled ? 'warn' : 'err');
       }
+    });
+  }
+
+  // ------------------------------------------------------------ |Q| profile
+  function showView() {
+    const profile = preview.view === 'profile';
+    for (const b of $('viewSeg').children) {
+      b.setAttribute('aria-pressed', String(b.dataset.view === preview.view));
+      b.disabled = !state.data;
+    }
+    $('previewView').hidden = !state.data || profile;
+    $('profileView').hidden = !state.data || !profile;
+    $('planeSeg').hidden = profile;
+  }
+
+  function refreshPreview() {
+    return preview.view === 'profile' ? loadProfile() : loadSlice();
+  }
+
+  function redrawPreview() {
+    if (preview.view === 'profile') drawProfile();
+    else drawSlice();
+  }
+
+  // The cell choice for the worker (the grid config too, for Q-space VTK).
+  function cellParams() {
+    const src = cellSource();
+    const params = { manual: src === 'manual' ? manualCell() : null, cellPrefer: src };
+    if (state.gridConfig && state.data && state.data.kind === 'vtk') {
+      const index = pickGrid(state.gridConfig, state.data.main);
+      params.grid = state.gridConfig.grids[index];
+      params.customFrame = state.gridConfig.customFrame;
+    }
+    return params;
+  }
+
+  async function loadProfile() {
+    if (!state.data || current) return;
+    const width = Number($('profileShell').value);
+    if (!(width > 0)) {
+      $('profileNote').textContent = 'the shell width must be a positive number';
+      return;
+    }
+    const token = ++preview.seq;
+    $('profileNote').textContent = 'computing…';
+    try {
+      const p = await client.call('profile', { stage: preview.stage, width, params: cellParams() }).promise;
+      if (token !== preview.seq) return;
+      preview.profile = p;
+      preview.hover = -1;
+      $('profileNote').textContent = `${p.q.length} shells with data`;
+      if (!preview.stale) $('previewSub').textContent = preview.stage === 'processed' ? 'after the recipe' : 'as read';
+    } catch (e) {
+      if (token !== preview.seq) return;
+      preview.profile = null;
+      $('profileNote').textContent = e.message;
+    }
+    drawProfile();
+  }
+
+  // 1, 2 or 5 times a power of ten, near x.
+  function niceStep(x) {
+    const e = 10 ** Math.floor(Math.log10(x)), f = x / e;
+    return (f < 1.5 ? 1 : f < 3.5 ? 2 : f < 7.5 ? 5 : 10) * e;
+  }
+
+  function drawProfile() {
+    const canvas = $('profileCanvas'), p = preview.profile, dpr = window.devicePixelRatio || 1;
+    const W = Math.max(200, Math.round(canvas.clientWidth * dpr)), H = Math.round(380 * dpr);
+    canvas.width = W;
+    canvas.height = H;
+    const ctx = canvas.getContext('2d');
+    const css = getComputedStyle(document.documentElement), col = name => css.getPropertyValue(name).trim();
+    ctx.clearRect(0, 0, W, H);
+    if (!p || !p.q.length) return;
+    const logY = $('profileLog').checked && p.mean.some(v => v > 0);
+    const ty = v => (logY ? (v > 0 ? Math.log10(v) : NaN) : v);
+    const lo = p.mean.map((v, i) => ty(v - p.sigma[i])), hi = p.mean.map((v, i) => ty(v + p.sigma[i])), mid = p.mean.map(ty);
+    let ylo = Infinity, yhi = -Infinity;
+    for (const y of mid.concat(hi, lo)) {
+      if (Number.isFinite(y)) {
+        ylo = Math.min(ylo, y);
+        yhi = Math.max(yhi, y);
+      }
+    }
+    if (!logY) ylo = Math.min(ylo, 0);
+    if (!(yhi > ylo)) yhi = ylo + 1;
+    const pad = 0.05 * (yhi - ylo);
+    ylo -= pad;
+    yhi += pad;
+    const half = p.q.length > 1 ? (p.q[1] - p.q[0]) / 2 : 0.05, qmax = p.q[p.q.length - 1] + half;
+    const m = { l: 62 * dpr, r: 14 * dpr, t: 12 * dpr, b: 32 * dpr };
+    const X = q => m.l + (W - m.l - m.r) * q / qmax;
+    const Y = y => H - m.b - (H - m.t - m.b) * (y - ylo) / (yhi - ylo);
+    ctx.font = `${11 * dpr}px ${col('--mono')}`;
+    ctx.lineWidth = dpr;
+    ctx.strokeStyle = col('--border');
+    ctx.fillStyle = col('--muted');
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'top';
+    const xs = niceStep(qmax / 6);
+    for (let q = 0; q <= qmax + 1e-9; q += xs) {
+      ctx.beginPath();
+      ctx.moveTo(X(q), m.t);
+      ctx.lineTo(X(q), H - m.b);
+      ctx.stroke();
+      ctx.fillText(fmtNum(q, 2), X(q), H - m.b + 6 * dpr);
+    }
+    ctx.textAlign = 'right';
+    ctx.textBaseline = 'middle';
+    // Linear: 1-2-5 steps. Log: decades, or 1, 2, 5 per decade over a short range.
+    const yticks = [];
+    if (!logY) {
+      const ystep = niceStep((yhi - ylo) / 5);
+      for (let y = Math.ceil(ylo / ystep) * ystep; y <= yhi; y += ystep) yticks.push(y);
+    } else {
+      const every = Math.max(1, Math.round((yhi - ylo) / 5));
+      for (let k = Math.floor(ylo); k <= Math.ceil(yhi); k++) {
+        for (const f of yhi - ylo < 2.5 ? [1, 2, 5] : [1]) {
+          const y = k + Math.log10(f);
+          if (y >= ylo && y <= yhi && (f > 1 || k % every === 0)) yticks.push(y);
+        }
+      }
+    }
+    for (const y of yticks) {
+      ctx.beginPath();
+      ctx.moveTo(m.l, Y(y));
+      ctx.lineTo(W - m.r, Y(y));
+      ctx.stroke();
+      ctx.fillText(logY ? sig(10 ** y) : fmtNum(y, 3), m.l - 8 * dpr, Y(y));
+    }
+    ctx.textAlign = 'right';
+    ctx.textBaseline = 'bottom';
+    ctx.fillText('|Q| (Å⁻¹)', W - m.r, H - m.b - 4 * dpr);
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'top';
+    ctx.fillText(logY ? 'mean I (log scale)' : 'mean I', m.l + 6 * dpr, m.t + 2 * dpr);
+    // ±sigma band, then the mean
+    ctx.fillStyle = col('--accent-soft');
+    ctx.beginPath();
+    let open = false;
+    const band = [];
+    for (let i = 0; i < p.q.length; i++) if (Number.isFinite(hi[i]) && Number.isFinite(lo[i])) band.push(i);
+    band.forEach((i, k) => (k ? ctx.lineTo(X(p.q[i]), Y(hi[i])) : ctx.moveTo(X(p.q[i]), Y(hi[i]))));
+    for (let k = band.length - 1; k >= 0; k--) ctx.lineTo(X(p.q[band[k]]), Y(lo[band[k]]));
+    ctx.closePath();
+    ctx.fill();
+    ctx.strokeStyle = col('--accent');
+    ctx.lineWidth = 1.8 * dpr;
+    ctx.beginPath();
+    for (let i = 0; i < p.q.length; i++) {
+      if (!Number.isFinite(mid[i])) {
+        open = false;
+        continue;
+      }
+      if (open) ctx.lineTo(X(p.q[i]), Y(mid[i]));
+      else ctx.moveTo(X(p.q[i]), Y(mid[i]));
+      open = true;
+    }
+    ctx.stroke();
+    if (preview.hover >= 0 && preview.hover < p.q.length && Number.isFinite(mid[preview.hover])) {
+      const x = X(p.q[preview.hover]), y = Y(mid[preview.hover]);
+      ctx.strokeStyle = col('--muted');
+      ctx.lineWidth = dpr;
+      ctx.setLineDash([4 * dpr, 4 * dpr]);
+      ctx.beginPath();
+      ctx.moveTo(x, m.t);
+      ctx.lineTo(x, H - m.b);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = col('--accent');
+      ctx.beginPath();
+      ctx.arc(x, y, 4 * dpr, 0, 2 * Math.PI);
+      ctx.fill();
+    }
+  }
+
+  $('profileCanvas').addEventListener('mousemove', ev => {
+    const p = preview.profile;
+    if (!p || !p.q.length) return;
+    const r = ev.currentTarget.getBoundingClientRect(), dpr = window.devicePixelRatio || 1;
+    const W = r.width * dpr, left = 62 * dpr, right = 14 * dpr;
+    const half = p.q.length > 1 ? (p.q[1] - p.q[0]) / 2 : 0.05, qmax = p.q[p.q.length - 1] + half;
+    const q = ((ev.clientX - r.left) * dpr - left) / (W - left - right) * qmax;
+    let best = 0;
+    for (let i = 1; i < p.q.length; i++) if (Math.abs(p.q[i] - q) < Math.abs(p.q[best] - q)) best = i;
+    preview.hover = best;
+    $('profileReadout').textContent = `|Q| ${fmtNum(p.q[best], 3)} Å⁻¹   mean I = ${sig(p.mean[best], 4)} ± ${sig(p.sigma[best], 2)}   ` +
+      `${fmtInt(p.n[best])} voxels`;
+    drawProfile();
+  });
+  $('profileCanvas').addEventListener('mouseleave', () => {
+    preview.hover = -1;
+    $('profileReadout').textContent = 'Point at the curve to read values';
+    drawProfile();
+  });
+  $('profileLog').addEventListener('change', drawProfile);
+  $('profileShell').addEventListener('change', loadProfile);
+  for (const b of $('viewSeg').children) {
+    b.addEventListener('click', () => {
+      preview.view = b.dataset.view;
+      showView();
+      refreshPreview();
     });
   }
 

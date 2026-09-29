@@ -864,8 +864,10 @@
 
     // ------------------------------------------------------------- |Q| profile
 
-    // Shell averages of the finite values: "# Q(1/A) mean sigma_mean n".
-    function* writeProfileChunks(model, cell, width) {
+    // Shell averages of the finite values over |Q| shells of `width`: arrays
+    // q (shell centres), mean, sigma (standard error of the mean) and n, for
+    // the shells that hold data.
+    function profileShells(model, cell, width) {
         if (model.axesType === 'uvw') throw new Error('a |Q| profile needs reciprocal-space data');
         needCell(cell, 'a |Q| profile');
         if (!(width > 0)) throw new Error('|Q| profile: the shell width must be positive');
@@ -878,13 +880,26 @@
             sq[s] = (sq[s] || 0) + x * x;
             cnt[s] = (cnt[s] || 0) + 1;
         });
-        let out = '# |Q| profile written by 3DSConvert: shell averages of the finite voxels\n' +
-            `# shell width ${width} 1/A\n# Q(1/A) mean_I sigma_of_mean n_voxels\n`;
+        const out = { q: [], mean: [], sigma: [], n: [] };
         for (let s = 0; s < cnt.length; s++) {
             if (!cnt[s]) continue;
             const n = cnt[s], mean = sums[s] / n;
             const variance = n > 1 ? Math.max(0, (sq[s] - n * mean * mean) / (n - 1)) : 0;
-            out += `${((s + 0.5) * width).toPrecision(8)} ${mean.toPrecision(10)} ${Math.sqrt(variance / n).toPrecision(6)} ${n}\n`;
+            out.q.push((s + 0.5) * width);
+            out.mean.push(mean);
+            out.sigma.push(Math.sqrt(variance / n));
+            out.n.push(n);
+        }
+        return out;
+    }
+
+    // The profile as text: "# Q(1/A) mean sigma_mean n".
+    function* writeProfileChunks(model, cell, width) {
+        const p = profileShells(model, cell, width);
+        let out = '# |Q| profile written by 3DSConvert: shell averages of the finite voxels\n' +
+            `# shell width ${width} 1/A\n# Q(1/A) mean_I sigma_of_mean n_voxels\n`;
+        for (let k = 0; k < p.q.length; k++) {
+            out += `${p.q[k].toPrecision(8)} ${p.mean[k].toPrecision(10)} ${p.sigma[k].toPrecision(6)} ${p.n[k]}\n`;
             if (out.length > 1 << 20) {
                 yield out;
                 out = '';
@@ -894,7 +909,7 @@
     }
 
     return {
-        LAUE_GROUPS, laueOperations, normalizeRecipe, describeStep, applyRecipe, writeProfileChunks,
+        LAUE_GROUPS, laueOperations, normalizeRecipe, describeStep, applyRecipe, writeProfileChunks, profileShells,
         sampler, gridMatrix,
     };
 }));

@@ -202,6 +202,10 @@
     <div class="card-head">
       <h2>Preview</h2><span class="sub" id="previewSub"></span>
       <div class="spacer"></div>
+      <div class="seg" role="group" aria-label="View" id="viewSeg">
+        <button type="button" data-view="slice" aria-pressed="true">Slice</button>
+        <button type="button" data-view="profile" aria-pressed="false">|Q| profile</button>
+      </div>
       <div class="seg" role="group" aria-label="Stage" id="stageSeg">
         <button type="button" data-stage="input" aria-pressed="true">As read</button>
         <button type="button" data-stage="processed" aria-pressed="false">After recipe</button>
@@ -238,6 +242,17 @@
         <canvas id="histogram" width="600" height="56" role="img" aria-label="Histogram of the slice values"></canvas>
         <div class="histo-axis"><span id="histoLo"></span><span>histogram of the slice, on the colour scale</span><span id="histoHi"></span></div>
       </div>
+    </div>
+    <div id="profileView" hidden>
+      <canvas id="profileCanvas" width="600" height="380" role="img" aria-label="Mean intensity against |Q|"></canvas>
+      <div class="slicer">
+        <label for="profileShell">shell width (Å⁻¹)</label>
+        <input id="profileShell" class="text" value="0.05" inputmode="decimal" style="width: 7em">
+        <span id="profileNote"></span>
+        <div class="spacer"></div>
+        <label class="check"><input type="checkbox" id="profileLog" checked>log scale</label>
+      </div>
+      <div class="readout" id="profileReadout">Point at the curve to read values</div>
     </div>
   </section>
   <section class="card logcard">
