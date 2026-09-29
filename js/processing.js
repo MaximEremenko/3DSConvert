@@ -297,7 +297,7 @@
         },
         filterRings: {
             materials: 'aluminium', temperature: 0, radiation: 'auto', window: 3, highPass: 4, smooth: 0.4, axis: 'auto', angleStep: 1,
-            azimuth: 2, bragg: 0.3, passes: 3,
+            azimuth: 4, bragg: 0.3, passes: 3,
         },
         backgroundDebyeWaller: { radiation: 'auto', uiso: '0.01', fit: true, scale: 1, offset: false, percentile: 5, width: 0.05 },
         correctUB: { mode: 'refine', centring: 'P', radius: 0.25, snr: 10, peaks: 300, shift: false },

@@ -1001,7 +1001,7 @@
     removeRings: { materials: 'aluminium', temperature: 0, radiation: 'auto', intensities: 'free', refine: 0.01, fitWidth: true, sigma0: 0.005,
       resolution: 0.004, voxelWidth: true, shift: 0.002, maskSpots: false, highPass: 6, sectors: 8, coverage: 0.25, cutoff: 0.05, width: 0.005,
       positive: true },
-    filterRings: { materials: 'aluminium', temperature: 0, radiation: 'auto', axis: 'auto', angleStep: 1, azimuth: 2, window: 3, highPass: 4, smooth: 0.4,
+    filterRings: { materials: 'aluminium', temperature: 0, radiation: 'auto', axis: 'auto', angleStep: 1, azimuth: 4, window: 3, highPass: 4, smooth: 0.4,
       bragg: 0.3, passes: 3 },
     backgroundDebyeWaller: { composition: '', uiso: '0.01', radiation: 'auto', fit: true, percentile: 5, width: 0.05, offset: false, scale: 1 },
     correctUB: { mode: 'refine', centring: 'P', radius: 0.25, snr: 10, peaks: 300, shift: false, ub: [], ubNew: [] },
@@ -1015,7 +1015,7 @@
       { op: 'despike', size: 1, k: 5 }, { op: 'removeRings', materials: 'aluminium, copper', temperature: 0, radiation: 'auto', intensities: 'free', refine: 0.01,
         fitWidth: true, sigma0: 0.005, resolution: 0.004, voxelWidth: true, shift: 0.002, maskSpots: false, highPass: 6, sectors: 8,
         coverage: 0.25, cutoff: 0.05, width: 0.005, positive: true },
-      { op: 'filterRings', materials: 'aluminium, copper', temperature: 0, radiation: 'auto', axis: 'auto', angleStep: 1, azimuth: 2,
+      { op: 'filterRings', materials: 'aluminium, copper', temperature: 0, radiation: 'auto', axis: 'auto', angleStep: 1, azimuth: 4,
         window: 3, highPass: 4, smooth: 0.4, bragg: 0.3, passes: 3 },
       { op: 'symmetrize', laue: 'm-3m', mode: 'clip', k: 3, expand: true }] },
     { name: 'Subtract a background volume', note: 'load it under Other volumes', steps: [
@@ -1026,7 +1026,7 @@
       { op: 'removeRings', materials: 'aluminium, copper', temperature: 0, radiation: 'auto', intensities: 'free', refine: 0.01,
         fitWidth: true, sigma0: 0.005, resolution: 0.004, voxelWidth: true, shift: 0.002, maskSpots: false, highPass: 6, sectors: 8,
         coverage: 0.25, cutoff: 0.05, width: 0.005, positive: true },
-      { op: 'filterRings', materials: 'aluminium, copper', temperature: 0, radiation: 'auto', axis: 'auto', angleStep: 1, azimuth: 2,
+      { op: 'filterRings', materials: 'aluminium, copper', temperature: 0, radiation: 'auto', axis: 'auto', angleStep: 1, azimuth: 4,
         window: 3, highPass: 4, smooth: 0.4, bragg: 0.3, passes: 3 }] },
   ];
 

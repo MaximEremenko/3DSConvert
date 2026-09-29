@@ -494,7 +494,7 @@ axis (1° by default) and of the fit's coordinate u, band-passed along u by
 FFT (what is broader than four line widths, and the noise finer than 0.4
 of a width, come off), smoothed over the angle (more widely where the bins
 hold few voxels, near the axis), then the same over coarse cells of angle
-and azimuth for the Fourier orders up to 2 about the axis; three passes.
+and azimuth for the Fourier orders up to 4 about the axis; three passes.
 The axis is found from the rings - a Legendre fit of the line excess over
 300 direction cells gives a first axis, refined to where the excess binned
 by a degree of angle is sharpest (on CORELLI data 0.26° from the vertical
@@ -512,12 +512,15 @@ filter's own (alone it leaves the broad foot of a strong ring, about a
 third of it: run it after the removal). On the CORELLI volume of PMN-PT in
 aluminium the scatter of the ring excess over 300 directions, in units of
 its errors (χ²/n; 1–2 where there are no rings), goes from 78, 25 and 20 at
-Al (111), (200) and (220) after the fit to 19, 9 and 6 after the filter,
-and what remains follows the crystal's fourfold axes - the sample's own
-scattering; in the half-integer planes the (111) ring, 0.12 high, leaves
-less than 0.006. On a synthetic volume with bands and asymmetric lines the
-(111) residual falls from 0.036 after the fit to 0.008, against noise of
-0.02, with the sample near its Bragg peaks unchanged.
+Al (111), (200) and (220) after the fit to 17, 6 and 4 after the filter; in
+the half-integer planes the (111) ring, 0.12 high, leaves less than 0.005.
+What remains has none of the crystal's symmetry: ring structure that
+changes with the azimuth faster than the fourth order, and the broad part
+of lines in the narrow bands at the detector edges, which a high-pass of
+four line widths cannot tell from the sample's scattering. On a synthetic
+volume with bands and asymmetric lines the (111) residual falls from 0.036
+after the fit to 0.009, against noise of 0.02, with the sample near its
+Bragg peaks unchanged.
 
 Recommended order: subtract an empty-can measurement if there is one, then
 remove the remaining rings, then treat the Bragg peaks (mask, punch and
