@@ -213,7 +213,8 @@ remembered; by default the page follows the system).
 1. **Data**: drop files anywhere on the page, or choose them. The format is
    detected from the content; the card then shows the grid, its hkl range
    and step, the precision and the share of measured voxels, and the
-   reader's notes. Dropped `.json` files load as recipes, `.rmc6f` files as
+   reader's notes. Dropped `.json` files load as recipes (3DSCalculator exports as data),
+   `.rmc6f` files, unified structure files and subhkl `indexer.h5` files as
    structures, and Scatty or Spinteract configs as the grid config. For
    NeXus data kept in linked files, select or drop all of them at once;
    when a NeXus file holds several NXdata groups, pick one from the list.
@@ -222,7 +223,7 @@ remembered; by default the page follows the system).
 2. **Unit cell**: choose where the parent (crystallographic) cell comes
    from: the data file, a structure file (`.rmc6f`: the supercell divided by
    its dimensions; a unified structure `.h5` stores the parent cell
-   directly) or manual entry (a, b, c in Angstrom; alpha, beta, gamma in
+   directly; a subhkl `indexer.h5` gives its refined cell) or manual entry (a, b, c in Angstrom; alpha, beta, gamma in
    degrees). The card picks the data file's own cell when it has a real
    one, and warns when a structure file's cell differs from it. The text
    and VTK formats store no cell, and some Yell files store only the unit

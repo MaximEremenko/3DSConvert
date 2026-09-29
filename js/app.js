@@ -345,7 +345,17 @@
         grid: state.gridConfig ? state.gridConfig.grids[pickGrid(state.gridConfig, files[0] && files[0].name)] : null,
       });
       if (!s) return;
-      s.baseName = s.main.replace(/\.(h5|hdf5|hdf|he5|nx|nxs|nx5|dat|txt|vtk)$/i, '');
+      if (s.cellFiles && s.cellFiles.length) {
+        const cellFile = files.find(f => f.name === s.cellFiles[0]);
+        log(`"${cellFile.name}" holds a unit cell, not a volume: it is used as the structure file.`);
+        state.cellPrefer = 'structure';
+        await loadStructureFile(cellFile);
+        if (!s.main) {
+          state.dataFiles = [];
+          return;
+        }
+      }
+      s.baseName = s.main.replace(/\.(h5|hdf5|hdf|he5|nx|nxs|nx5|dat|txt|vtk|npz|json)$/i, '');
       s.size = (files.find(f => f.name === s.main) || {}).size || 0;
       state.data = s;
       if (files.length > 1) {
@@ -584,7 +594,8 @@
       const parent = await run('Reading structure…', 'loadStructure', { file });
       if (parent) {
         state.struct = parent;
-        const info = `parent cell ${fmtCell(parent)}` + (parent.supercell ? ` (supercell ${parent.supercell.join(' x ')})` : '');
+        const info = `parent cell ${fmtCell(parent)}` + (parent.supercell ? ` (supercell ${parent.supercell.join(' x ')})` : '') +
+          (parent.source === 'subhkl' ? ` from subhkl${parent.spaceGroup ? `, space group ${parent.spaceGroup}` : ''}` : '');
         $('structInfo').textContent = `${file.name}: ${info}`;
         log(`Structure "${file.name}": ${info}`, 'ok');
       }

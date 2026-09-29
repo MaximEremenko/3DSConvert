@@ -58,6 +58,7 @@ await saveH5(H.buildH5(f => f.create_group('entry').create_group('data').create_
 await saveH5(NX.nxrefineFile({ link: 'scan/t.nxs' }), 'wrapper.nxs');
 const rspace = await NX.rspace3dFile({});
 await saveH5(Promise.resolve(rspace.file), 'volume_rspace3d.h5');
+await saveH5(NX.subhklFile(), 'indexer.h5');
 
 const port = 9300 + Math.floor(Math.random() * 600);
 const args = ['--headless=new', `--remote-debugging-port=${port}`, `--user-data-dir=${path.join(work, 'profile')}`,
@@ -444,6 +445,16 @@ const scenarios = [
         if (Math.abs(model.vectors[1][0] - rspace.shear * 0.2) > 1e-12 || model.symmetrized !== 'laue') {
             throw new Error('grid ' + JSON.stringify(model.vectors) + ' ' + model.symmetrized);
         }
+    }],
+    ['a subhkl indexer file chosen as data becomes the cell source', async () => {
+        await setFile('#dataFile', path.join(work, 'indexer.h5'));
+        await waitLog(/"indexer\.h5" holds a unit cell, not a volume/);
+        await waitLog(/Structure "indexer\.h5": parent cell 8\.10000 8\.10000 8\.10000 \/ 90\.00 90\.00 90\.00 from subhkl, space group F d -3 m/);
+        await setFile('#dataFile', path.join(ROOT, 'Examples/example_diffuse3d.dat'));
+        await waitLog(/RMCProfile \.dat \| grid/);
+        await setValue('outFormat', 'unified');
+        const m = await H.Converter.readUnifiedData(await H.openH5Bytes(fs.readFileSync(await convert('example_diffuse3d_unified.h5'))));
+        if (Math.abs(m.cellLengths[0] - 8.1) > 1e-9) throw new Error('cell ' + m.cellLengths);
     }],
     ['crop on read: only the chosen hkl box is read', async () => {
         await evaluate(`(() => {

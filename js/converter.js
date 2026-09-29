@@ -536,6 +536,22 @@
         };
     }
 
+    // subhkl's indexer output: the refined cell (sample/a ... sample/gamma,
+    // degrees) with its U and B matrices and the indexed peaks - a cell
+    // source, not a volume.
+    const isSubhklIndexer = f => !!(f.get('sample/a') && f.get('sample/alpha') && (f.get('sample/B') || f.get('peaks/h')));
+
+    function readSubhklCell(f) {
+        const need = name => {
+            const v = firstNumber(f, 'sample/' + name);
+            if (!(v > 0)) throw new Error(`subhkl indexer file: no valid sample/${name}`);
+            return v;
+        };
+        const sg = datasetText(f, 'sample/space_group');
+        return Object.assign({ lengths: ['a', 'b', 'c'].map(need), angles: ['alpha', 'beta', 'gamma'].map(need), source: 'subhkl' },
+            sg ? { spaceGroup: sg } : {});
+    }
+
     // ----------------------------------------------------------------- readers
 
     function detectH5Kind(f) {
@@ -547,6 +563,7 @@
         if (f.get('data') && f.get('lower_limits') && f.get('unit_cell')) return 'yell';
         if (f.get('data') && f.get('H') && f.get('K') && f.get('L')) return 'rspace3d';
         if (f.get('entry/data/atom_position') || f.get('entry/data/unit_cells')) return 'structure';
+        if (isSubhklIndexer(f)) return 'subhkl';
         if (f.get('MDHistoWorkspace')) return 'mantid-md';
         if (f.get('MDEventWorkspace')) return 'mantid-events';
         const top = f.keys();
@@ -569,6 +586,7 @@
             'nexus-events': 'this is a raw event NeXus file from the instrument; it needs data reduction ' +
                 '(e.g. in Mantid) into an HKL volume first',
             structure: 'this is a structure file - load it in section 2',
+            subhkl: 'this is a subhkl indexer file (a cell and UB, no volume) - load it as the structure file in section 2',
             unknown: 'unrecognized HDF5 layout',
         }[kind] || null;
     }
@@ -3023,7 +3041,7 @@
         parseOldDat, readOldDatStream, writeOldDat, writeOldDatChunks, countNonFinite,
         isVtk, vtkFrame, parseGridConfig, parseVtk, readVtkStream, writeVtk, writeVtkChunks,
         isHklList, parseHklList, readHklListStream, hklListModel, writeHklListChunks, hklConfigSnippet,
-        writeNpz, readNpz, writeVtiChunks, writeMrc, crc32, readVtkBinary, isBinaryVtk, readRspace3d,
+        writeNpz, readNpz, writeVtiChunks, writeMrc, crc32, readVtkBinary, isBinaryVtk, readRspace3d, readSubhklCell,
         is3dsCalculatorDat, is3dsCalculatorJson, read3dsCalculatorJson,
         toHklModel, resolveCell, planConversion, checkWritable, estimateOutputBytes, outputDtype,
         writeUnifiedData, writeYell,

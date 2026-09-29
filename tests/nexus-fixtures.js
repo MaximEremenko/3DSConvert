@@ -123,4 +123,17 @@ async function rspace3dFile(o) {
     }).then(file => ({ file, shear, H, K, L }));
 }
 
-module.exports = { code, fastestFirst, at, linspace, mantidFile, nxrefineFile, rspace3dFile };
+// subhkl's indexer output: the cell as scalars under sample/, U, B and the peaks.
+function subhklFile() {
+    return buildH5(f => {
+        const s = f.create_group('sample');
+        [['a', 8.1], ['b', 8.1], ['c', 8.1], ['alpha', 90], ['beta', 90], ['gamma', 90]].forEach(([n, v]) => s.create_dataset({ name: n, data: v }));
+        s.create_dataset({ name: 'space_group', data: 'F d -3 m' });
+        s.create_dataset({ name: 'B', data: [1 / 8.1, 0, 0, 0, 1 / 8.1, 0, 0, 0, 1 / 8.1], shape: [3, 3], dtype: '<d' });
+        s.create_dataset({ name: 'U', data: [1, 0, 0, 0, 1, 0, 0, 0, 1], shape: [3, 3], dtype: '<d' });
+        const p = f.create_group('peaks');
+        for (const n of ['h', 'k', 'l']) p.create_dataset({ name: n, data: [1, 1, 1, 2], shape: [4], dtype: '<d' });
+    });
+}
+
+module.exports = { code, fastestFirst, at, linspace, mantidFile, nxrefineFile, rspace3dFile, subhklFile };

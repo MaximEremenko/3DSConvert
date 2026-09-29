@@ -372,3 +372,11 @@ test('rspace3d: a sheared HK raster, the cell from attributes or from UB, NaN ke
     assert.deepEqual(cropped.dims, [4, 3, 2]);
     assert.match(cropped.notes.join('\n'), /crop on read needs grid axes along h, k and l/);
 });
+
+test('subhkl indexer file: a cell source; as data it points to the structure slot', async () => {
+    const { subhklFile } = require('./nexus-fixtures');
+    const f = await subhklFile();
+    assert.equal(Converter.detectH5Kind(f), 'subhkl');
+    assert.deepEqual(Converter.readSubhklCell(f), { lengths: [8.1, 8.1, 8.1], angles: [90, 90, 90], source: 'subhkl', spaceGroup: 'F d -3 m' });
+    assert.match(Converter.unsupportedKindMessage('subhkl'), /structure file in section 2/);
+});

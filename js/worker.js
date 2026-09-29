@@ -376,15 +376,22 @@ function converterWorker(self, h5wasm, Converter, Processing, wgpuFftWeb) {
             if (!files.length) return { result: null };
             const hdf5 = [];
             for (const file of files) hdf5.push(await isHdf5(file));
-            let main = 0;
+            // Structure and subhkl indexer files hold a cell, not a volume: the
+            // page takes them as the structure file.
+            const CELL_KINDS = new Set(['structure', 'subhkl']);
+            let main = 0, cellFiles = [];
             if (files.length > 1) {
                 if (hdf5.some(x => !x)) {
                     throw new Error('several files can be selected only for NeXus data whose external ' +
                         'links point to the others; select a single text data file');
                 }
                 const kinds = files.map((file, i) => kindOf(`data/${i}/${file.name}`));
+                cellFiles = files.filter((_, i) => CELL_KINDS.has(kinds[i])).map(x => x.name);
                 main = kinds.findIndex(k => DATA_KINDS.has(k));
-                if (main < 0) throw new Error(Converter.unsupportedKindMessage(kinds[0]) || 'no data file among the selection');
+                if (main < 0) {
+                    if (cellFiles.length) return { result: { cellFiles } };
+                    throw new Error(Converter.unsupportedKindMessage(kinds[0]) || 'no data file among the selection');
+                }
             }
             const file = files[main];
             const opts = { size: file.size, tick: ctx.tick, progress: f => ctx.progress('Reading', f), crop, sigma: !!readSigma, grid };
@@ -396,9 +403,10 @@ function converterWorker(self, h5wasm, Converter, Processing, wgpuFftWeb) {
             state.files.data = [{ at: file.name, file }];
             mountFiles();
             let f = openAt('data/' + file.name);
-            const extra = { main: file.name, companions: [] };
+            const extra = { main: file.name, companions: [], cellFiles };
             try {
                 const kind = Converter.detectH5Kind(f);
+                if (CELL_KINDS.has(kind)) return { result: { cellFiles: [file.name] } };
                 let model;
                 if (kind !== 'nexus') {
                     model = await readModel(f, kind, Object.assign({ space: yellSpace }, opts));
@@ -444,7 +452,7 @@ function converterWorker(self, h5wasm, Converter, Processing, wgpuFftWeb) {
             if (await isHdf5(file)) {
                 const f = openAt('struct/' + file.name);
                 try {
-                    parent = Converter.readUnifiedStructure(f);
+                    parent = Converter.detectH5Kind(f) === 'subhkl' ? Converter.readSubhklCell(f) : Converter.readUnifiedStructure(f);
                 } finally {
                     f.close();
                 }
