@@ -63,16 +63,34 @@
   <p class="sub">
     Converts 3-D diffuse scattering data between the <b>unified HDF5</b> format
     (<code>/scattering/data</code> and <code>/entry/data</code> layouts, RMCProfile / DiffuseCode),
-    <b>Yell&nbsp;1.0</b> HDF5 (DISCUS / Yell / Meerkat), and the
-    <b>RMCProfile old text</b> format. Everything runs locally in your browser &mdash; no upload.
+    <b>Yell&nbsp;1.0</b> HDF5 (DISCUS / Yell / Meerkat), the
+    <b>RMCProfile old text</b> format, and <b>VTK</b> (Scatty / Spinteract / 3DSCalculator).
+    Everything runs locally in your browser &mdash; no upload.
   </p>
 
   <div class="panel">
     <h2>1 &middot; Data file</h2>
     <label>Diffuse data
-      <span class="hint">(unified .h5 / Yell .h5 / old-format .dat / Scatty .vtk &mdash; auto-detected)</span></label>
+      <span class="hint">(unified .h5 / Yell .h5 / old-format .dat / .vtk &mdash; auto-detected)</span></label>
     <input type="file" id="dataFile">
     <div id="dataInfo" class="hint"></div>
+    <div class="row">
+      <div>
+        <label>Grid config for Q-space VTK
+          <span class="hint">(optional Scatty or Spinteract config; needed when the grid axes are not
+          along a*, b*, c*, e.g. <code>X_AXIS 6 6 0</code>)</span></label>
+        <input type="file" id="gridConfigFile">
+        <div id="gridConfigInfo" class="hint"></div>
+      </div>
+      <div>
+        <label>Yell data space
+          <span class="hint">(for Yell files whose <code>is_direct</code> is neither 0 nor 1)</span></label>
+        <select id="yellSpace">
+          <option value="auto">from the file (is_direct)</option>
+          <option value="reciprocal">reciprocal space (override the flag)</option>
+        </select>
+      </div>
+    </div>
   </div>
 
   <div class="panel">
@@ -148,9 +166,14 @@
 
   await h5wasm.ready;
   const FS = h5wasm.FS;
+  // Raise HDF5 read errors (e.g. a missing filter plugin) instead of letting
+  // h5wasm return undecoded bytes.
+  if (h5wasm.Module && typeof h5wasm.Module.activate_throwing_error_handler === 'function') {
+    h5wasm.Module.activate_throwing_error_handler();
+  }
   logEl.textContent = 'Ready.';
 
-  const state = { data: null, struct: null };
+  const state = { data: null, struct: null, dataFile: null, gridConfig: null };
 
   function fmtCell(c) {
     return c.lengths.map(x => x.toPrecision(6)).join(' ') + ' / ' +
@@ -168,8 +191,21 @@
     return u[0] === 0x89 && u[1] === 0x48 && u[2] === 0x44 && u[3] === 0x46;
   }
 
-  $('dataFile').addEventListener('change', async ev => {
-    const fileObj = ev.target.files[0];
+  function decodeText(bytes) {
+    try {
+      return new TextDecoder().decode(bytes);
+    } catch (e) {
+      throw new Error(`the file (${(bytes.byteLength / 1048576).toFixed(0)} MB) is larger than this ` +
+        'browser can hold as one text string (about 512 MB in Chrome/Edge, 1 GB in Firefox)');
+    }
+  }
+
+  function logNotes(model) {
+    for (const note of (model && model.notes) || []) log('Note: ' + note);
+  }
+
+  async function loadDataFile() {
+    const fileObj = state.dataFile;
     if (!fileObj) return;
     $('dataInfo').textContent = '';
     state.data = null;
@@ -177,31 +213,41 @@
       const bytes = await fileObj.arrayBuffer();
       if (isHdf5(bytes)) {
         const { file, name } = openH5(bytes);
-        const kind = Converter.detectH5Kind(file);
-        if (kind === 'yell') {
-          state.data = { kind, model: Converter.readYell(file) };
-        } else if (kind === 'unified') {
-          state.data = { kind, model: Converter.readUnifiedData(file) };
-        } else if (kind === 'structure') {
-          throw new Error('this is a structure file - load it in section 2');
-        } else {
-          throw new Error('unrecognized HDF5 layout');
+        try {
+          const kind = Converter.detectH5Kind(file);
+          if (kind === 'yell') {
+            state.data = { kind, model: Converter.readYell(file, { space: $('yellSpace').value }) };
+          } else if (kind === 'unified') {
+            state.data = { kind, model: Converter.readUnifiedData(file) };
+          } else if (kind === 'structure') {
+            throw new Error('this is a structure file - load it in section 2');
+          } else {
+            throw new Error('unrecognized HDF5 layout');
+          }
+        } finally {
+          file.close(); FS.unlink(name);
         }
-        file.close(); FS.unlink(name);
       } else {
-        const text = new TextDecoder().decode(bytes);
-        state.data = Converter.isVtk(text) ? { kind: 'vtk', text } : { kind: 'dat', text };
+        const text = decodeText(bytes);
+        if (!Converter.isVtk(text)) {
+          state.data = { kind: 'dat', text };
+        } else if (Converter.vtkFrame(text) === 'hkl') {
+          state.data = { kind: 'vtk-hkl', model: Converter.parseVtk(text, null, { frame: 'hkl' }) };
+        } else {
+          state.data = { kind: 'vtk', text };
+        }
       }
-      state.data.baseName = fileObj.name.replace(/\.(h5|hdf5|nx|dat|txt|vtk)$/i, '');
+      state.data.baseName = fileObj.name.replace(/\.(h5|hdf5|hdf|he5|nx|nxs|nx5|dat|txt|vtk)$/i, '');
       let info;
       if (state.data.kind === 'dat') {
         info = 'RMCProfile old text format (grid parsed on convert)';
       } else if (state.data.kind === 'vtk') {
-        info = 'Scatty VTK, STRUCTURED_POINTS (grid parsed on convert)';
+        info = 'VTK STRUCTURED_POINTS in Q (grid parsed on convert)';
       } else {
         const m = state.data.model;
-        info = (state.data.kind === 'yell' ? 'Yell 1.0' : 'Unified data format') +
-               ` | grid ${m.dims.join(' x ')}` +
+        const label = { yell: 'Yell 1.0', unified: 'Unified data format',
+                        'vtk-hkl': 'VTK STRUCTURED_POINTS in r.l.u.' }[state.data.kind];
+        info = label + ` | grid ${m.dims.join(' x ')}` +
                (state.data.kind === 'unified' ? ` | axes ${m.axesType || 'hkl'}` : '') +
                ` | stored cell: ${m.cellLengths.map(x => x.toPrecision(6)).join(' ')} / ` +
                m.cellAngles.map(x => x.toPrecision(4)).join(' ') +
@@ -209,6 +255,7 @@
       }
       $('dataInfo').textContent = info;
       log(`Data file "${fileObj.name}": ${info}`);
+      logNotes(state.data.model);
       if(state.data.model && state.data.model.legacyContract) {
         log('Legacy unified metadata accepted; new unified output will write the mandatory current contract.');
       }
@@ -217,7 +264,45 @@
       log('Error reading data file: ' + e.message, 'err');
     }
     updateButton();
+  }
+
+  $('dataFile').addEventListener('change', ev => {
+    state.dataFile = ev.target.files[0] || null;
+    loadDataFile();
   });
+
+  $('yellSpace').addEventListener('change', () => {
+    if (state.dataFile) loadDataFile();
+  });
+
+  $('gridConfigFile').addEventListener('change', async ev => {
+    const fileObj = ev.target.files[0];
+    $('gridConfigInfo').textContent = '';
+    state.gridConfig = null;
+    if (!fileObj) return;
+    try {
+      const cfg = Converter.parseGridConfig(await fileObj.text());
+      state.gridConfig = cfg;
+      const g = cfg.grids[0];
+      const info = (cfg.program === 'scatty' ? 'Scatty' : 'Spinteract') + ' config | ' +
+        (cfg.grids.length > 1 ? `${cfg.grids.length} grids, first ` : 'grid ') +
+        `${g.dims.join(' x ')} from hkl ${g.corner.map(x => +x.toFixed(6)).join(' ')}` +
+        (cfg.customFrame ? ' | custom HKL_TO_X/Y/Z frame' : '');
+      $('gridConfigInfo').textContent = info;
+      log(`Grid config "${fileObj.name}": ${info}`);
+    } catch (e) {
+      $('gridConfigInfo').textContent = 'Error: ' + e.message;
+      log('Error reading grid config: ' + e.message, 'err');
+    }
+  });
+
+  // Spinteract writes one image per data set (..._img_NN.vtk) and one grid
+  // per data set in its config; match them by number.
+  function pickGrid(cfg, dataName) {
+    const m = /_(\d+)\.vtk$/i.exec(dataName || '');
+    const index = cfg.grids.length > 1 && m ? Number(m[1]) - 1 : 0;
+    return index >= 0 && index < cfg.grids.length ? index : 0;
+  }
 
   $('structFile').addEventListener('change', async ev => {
     const fileObj = ev.target.files[0];
@@ -322,16 +407,27 @@
             ' input needs a structure file or a manual parent cell');
         }
         if (state.data.kind === 'vtk') {
-          model = Converter.parseVtk(state.data.text, parent);
+          const opts = {};
+          if (state.gridConfig) {
+            const index = pickGrid(state.gridConfig, state.dataFile && state.dataFile.name);
+            opts.grid = state.gridConfig.grids[index];
+            opts.customFrame = state.gridConfig.customFrame;
+            if (state.gridConfig.grids.length > 1) {
+              log(`Using grid ${index + 1} of ${state.gridConfig.grids.length} from the config.`);
+            }
+          }
+          model = Converter.parseVtk(state.data.text, parent, opts);
         } else {
           model = Converter.parseOldDat(state.data.text, parent);
           if (model.nsecOriginal > 1) {
             log(`Note: input has ${model.nsecOriginal} symmetry sections; section 1 Q coordinates used.`);
           }
         }
+        logNotes(model);
         resolved = { cell: parent, source: state.struct ? 'structure file' : 'manual entry' };
       } else {
         model = state.data.model;
+        logNotes(model);
         resolved = resolveCell(model);
         if (!resolved) {
           if (outFmt === 'dat' || outFmt === 'vtk') {
@@ -360,6 +456,11 @@
       if (outFmt === 'dat' || outFmt === 'vtk') {
         if (Converter.isUnitMetric(resolved.cell.lengths, resolved.cell.angles)) {
           throw new Error('cannot write ' + outFmt + ' with a unit-metric cell - supply a structure file or a manual parent cell');
+        }
+        const nonFinite = Converter.countNonFinite(model.values);
+        if (nonFinite) {
+          log(`${nonFinite} NaN/infinite voxels written as 0` +
+              (outFmt === 'dat' ? ' (RMCProfile leaves points with I = 0 out of the fit).' : '.'));
         }
         const outName = base + (outFmt === 'dat' ? '_diffuse3d.dat' : '_diffuse.vtk');
         if (outFmt === 'dat') {
