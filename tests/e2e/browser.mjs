@@ -456,6 +456,22 @@ const scenarios = [
         const m = await H.Converter.readUnifiedData(await H.openH5Bytes(fs.readFileSync(await convert('example_diffuse3d_unified.h5'))));
         if (Math.abs(m.cellLengths[0] - 8.1) > 1e-9) throw new Error('cell ' + m.cellLengths);
     }],
+    ['series: three files with the same settings, the bad one reported, the rest downloaded', async () => {
+        fs.writeFileSync(path.join(work, 'bad_series.txt'), 'not a volume\n');
+        await evaluate('window.showDirectoryPicker = undefined');     // no folder dialog when headless
+        await setValue('outFormat', 'npz');
+        await setFile('#seriesFiles', [path.join(ROOT, 'Examples/example_unified.h5'), path.join(work, 'bad_series.txt'),
+            path.join(ROOT, 'Examples/example_yell.h5')]);
+        const text = await waitLog(/\d of 3 converted/, 60000);
+        if (!/2 of 3 converted/.test(text) || !/Error: bad_series\.txt:/.test(text)) throw new Error(text);
+        for (const name of ['example_unified.npz', 'example_yell.npz']) {
+            const file = path.join(downloads, name);
+            for (let i = 0; i < 50 && !(fs.existsSync(file) && fs.statSync(file).size); i++) await sleep(100);
+            const m = H.Converter.readNpz(fs.readFileSync(file));
+            if (m.dims.join() !== '5,5,5') throw new Error(`${name}: ${m.dims}`);
+        }
+        if (await evaluate('document.getElementById("seriesBtn").disabled')) throw new Error('Series stays disabled');
+    }],
     ['crop on read: only the chosen hkl box is read', async () => {
         await evaluate(`(() => {
             for (const [axis, end, v] of [['h', 0, -0.5], ['h', 1, 1], ['l', 0, 0], ['l', 1, 0.5]]) {

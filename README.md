@@ -284,6 +284,13 @@ chunked in-memory download is used. The log reports the expected output
 size first, and reading, processing and writing show progress and can be
 cancelled. The log can be copied or downloaded.
 
+**Series…** (next to Convert) converts several files, one after another,
+with the page's current cell source, recipe (and its extra volumes), crop
+and output settings — a temperature or composition series. In Chromium the
+outputs go into one folder you pick; elsewhere each is downloaded. A file
+that fails is reported and the series goes on; Cancel stops it. The data
+loaded in the page stay as they were.
+
 ### Large files
 
 Data files are read without first loading them into memory: HDF5 files

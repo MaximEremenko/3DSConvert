@@ -205,10 +205,12 @@
 
   // ------------------------------------------------------------ busy state
   const LOCKED = ['dataFile', 'browseBtn', 'replaceBtn', 'structFile', 'gridConfigFile', 'yellSpace', 'nexusPath',
-    'extraFiles', 'extraBtn', 'addStep', 'loadRecipe', 'clearRecipe', 'presetBtn'];
+    'extraFiles', 'extraBtn', 'addStep', 'loadRecipe', 'clearRecipe', 'presetBtn', 'seriesBtn'];
 
+  let seriesRunning = false;
   function updateButton() {
-    $('convertBtn').disabled = !state.data || !!current;
+    $('convertBtn').disabled = !state.data || !!current || seriesRunning;
+    $('seriesBtn').disabled = !!current || seriesRunning;
     updateOutput();
   }
 
@@ -355,7 +357,7 @@
           return;
         }
       }
-      s.baseName = s.main.replace(/\.(h5|hdf5|hdf|he5|nx|nxs|nx5|dat|txt|vtk|npz|json)$/i, '');
+      s.baseName = baseNameOf(s.main);
       s.size = (files.find(f => f.name === s.main) || {}).size || 0;
       state.data = s;
       if (files.length > 1) {
@@ -504,7 +506,7 @@
     ev.preventDefault();
     dragDepth = 0;
     $('dropVeil').hidden = true;
-    if (current) {
+    if (current || seriesRunning) {
       log('Busy with another task; drop the files again when it ends.', 'warn');
       return;
     }
@@ -1729,6 +1731,7 @@
     $('hklOpts').hidden = fmt !== 'hkl';
     $('datOpts1').hidden = $('datOpts2').hidden = fmt !== 'dat';
     $('outCard').classList.toggle('done', !!state.data);
+    if (seriesRunning) return;                 // the bar shows the series position
     const s = state.data;
     if (!s) {
       $('outName').textContent = 'No data loaded yet';
@@ -1845,10 +1848,46 @@
     return params;
   }
 
-  $('convertBtn').addEventListener('click', async () => {
-    clearLog();
-    const params = checkedParams();
-    if (!params) return;
+  // Where output goes: the browser's save dialog or a download, or a folder
+  // the user picked (a series). text() gives a sink for streamed output,
+  // bytes() saves a whole file; both say how in their `how`.
+  const BROWSER_SAVER = {
+    text: openTextSink,
+    async bytes(name, data, mime) {
+      download(data, name, mime);
+      return 'downloaded';
+    },
+  };
+
+  function folderSaver(dir) {
+    const open = async name => {
+      let existed = true;
+      try {
+        await dir.getFileHandle(name);
+      } catch (_) {
+        existed = false;
+      }
+      const writable = await (await dir.getFileHandle(name, { create: true })).createWritable();
+      return { writable, how: `into the folder "${dir.name}"` + (existed ? ', replacing the old file' : '') };
+    };
+    return {
+      async text(name) {
+        const { writable, how } = await open(name);
+        return { how, write: chunk => writable.write(chunk), close: () => writable.close(), abort: () => writable.abort().catch(() => {}) };
+      },
+      async bytes(name, data) {
+        const { writable, how } = await open(name);
+        await writable.write(data);
+        await writable.close();
+        return how;
+      },
+    };
+  }
+
+  // Prepare and write the data the worker holds with `params` and save the
+  // output through `saver`; base and inputAxes name the output. Returns
+  // the output name.
+  async function convertLoaded(params, base, inputAxes, saver) {
     const format = params.format, streamed = STREAMED.has(format);
     let sink = null;
     try {
@@ -1861,15 +1900,15 @@
       if (plan.estimate) {
         log(`Output: about ${fmtBytes(plan.estimate)}` + (USES.compression.includes(format) && params.compression ? ' before compression' : '') + '.');
       }
-      const tag = !plan.processed ? '' : direct && state.data.axesType !== 'uvw' ? '_dpdf' : '_processed';
-      const outName = fileNameFor(state.data.baseName || 'converted', tag, format);
+      const tag = !plan.processed ? '' : direct && inputAxes !== 'uvw' ? '_dpdf' : '_processed';
+      const outName = fileNameFor(base, tag, format);
       const t0 = Date.now();
       if (plan.nonFinite) {
         log(`${fmtInt(plan.nonFinite)} NaN/infinite voxels written as 0` +
           (format === 'dat' ? ' (RMCProfile leaves points with I = 0 out of the fit).' : '.'), 'warn');
       }
       if (streamed) {
-        sink = await openTextSink(outName, format, format === 'vtk' && params.vtkEncoding === 'binary');
+        sink = await saver.text(outName, format, format === 'vtk' && params.vtkEncoding === 'binary');
         const written = await run('Writing…', 'write', {}, { onChunk: chunk => sink.write(chunk) });
         await sink.close();
         log(`Wrote ${outName} (${sink.how})`, 'ok');
@@ -1883,20 +1922,97 @@
         if (plan.estimate > 1.9 * 1073741824) {
           log(USES.compression.includes(format)
             ? 'Warning: HDF5 files are assembled in memory, and Chrome/Edge cannot hold one above ' +
-              'about 2 GB; float32, the /entry/data-only layout or compression reduce the size.'
+              'about 2 GB; float32, the /entry/data-only layout or compression reduce the size (or use the command-line tool).'
             : 'Warning: this file is assembled in memory, and above about 2 GB the browser may fail; float32 halves it.', 'err');
         }
         const result = await run('Writing…', 'write', {});
-        if (result.kind === 'blob') download(result.blob, outName, 'application/octet-stream');
-        else download(result.bytes, outName, 'application/x-hdf5');
-        log(`Wrote ${outName} in ${((Date.now() - t0) / 1000).toFixed(1)} s`, 'ok');
+        const how = result.kind === 'blob'
+          ? await saver.bytes(outName, result.blob, 'application/octet-stream')
+          : await saver.bytes(outName, result.bytes, 'application/x-hdf5');
+        log(`Wrote ${outName} in ${((Date.now() - t0) / 1000).toFixed(1)} s (${how})`, 'ok');
       }
-      $('outDetail').textContent = `Saved ${outName}`;
+      return outName;
     } catch (e) {
       if (sink) await sink.abort();
+      throw e;
+    }
+  }
+
+  $('convertBtn').addEventListener('click', async () => {
+    clearLog();
+    const params = checkedParams();
+    if (!params) return;
+    try {
+      const outName = await convertLoaded(params, state.data.baseName || 'converted', state.data.axesType, BROWSER_SAVER);
+      $('outDetail').textContent = `Saved ${outName}`;
+    } catch (e) {
       if (e.cancelled) log('Cancelled.', 'warn');
       else log('Error: ' + e.message, 'err');
     }
+  });
+
+  // ------------------------------------------------------------ series
+  // The current cell, recipe and output settings applied to each chosen file
+  // in turn (a temperature or composition series): written into one folder
+  // where the browser allows it, else downloaded one by one. A file that
+  // fails is reported and the series goes on; Cancel stops it.
+  const baseNameOf = name => name.replace(/\.(h5|hdf5|hdf|he5|nx|nxs|nx5|dat|txt|vtk|npz|json)$/i, '');
+
+  async function convertSeries(files) {
+    clearLog();
+    const params = checkedParams();
+    if (!params) return;
+    let saver = BROWSER_SAVER;
+    if ('showDirectoryPicker' in window && window.showDirectoryPicker) {
+      try {
+        saver = folderSaver(await window.showDirectoryPicker({ mode: 'readwrite' }));
+      } catch (e) {
+        if (e.name === 'AbortError') return;
+        log(`No folder access (${e.message}); each output is downloaded instead.`, 'warn');
+      }
+    }
+    log(`Series of ${files.length} files to ${FORMAT_TITLE[params.format]}, with this page's cell, recipe and output settings.`);
+    const title = $('outName').textContent;
+    let done = 0;
+    seriesRunning = true;
+    for (const [i, file] of files.entries()) {
+      const label = `${i + 1} of ${files.length}: ${file.name}`;
+      $('outName').textContent = `Series ${label}`;
+      try {
+        const cfg = state.gridConfig;
+        const s = await run(`Reading ${i + 1}/${files.length}…`, 'loadData', {
+          files: [file], paths: [''], yellSpace: $('yellSpace').value, nexusPath: null, crop: readCrop(),
+          readSigma: $('readSigma').checked, grid: cfg ? cfg.grids[pickGrid(cfg, file.name)] : null,
+        });
+        if (!s || !s.dims) throw new Error(s && s.cellFiles ? 'the file holds a unit cell, not a volume' : 'no data read');
+        log(`${label}: ${KIND_LABEL[s.kind] || s.kind} | grid ${s.dims.join(' x ')}`, 'ok');
+        const p = Object.assign({}, params, { grid: undefined, customFrame: undefined });
+        if (cfg && s.kind === 'vtk') {
+          p.grid = cfg.grids[pickGrid(cfg, file.name)];
+          p.customFrame = cfg.customFrame;
+        }
+        await convertLoaded(p, baseNameOf(file.name), s.axesType, saver);
+        done++;
+      } catch (e) {
+        if (e.cancelled) {
+          log('Series cancelled.', 'warn');
+          break;
+        }
+        log(`Error: ${file.name}: ${e.message}`, 'err');
+      }
+    }
+    seriesRunning = false;
+    log(`${done} of ${files.length} converted.`, done === files.length ? 'ok' : 'warn');
+    $('outName').textContent = title;
+    // The worker now holds the last file of the series: reload the page's own.
+    if (state.dataFiles.length) await loadDataFile(state.data && state.data.nexusPath);
+    else updateButton();
+  }
+  $('seriesBtn').addEventListener('click', () => $('seriesFiles').click());
+  $('seriesFiles').addEventListener('change', ev => {
+    const files = Array.from(ev.target.files || []);
+    ev.target.value = '';
+    if (files.length) convertSeries(files);
   });
 
   renderSteps();
