@@ -751,6 +751,38 @@
   }
 
   let openStep = null;          // index of the expanded step
+  let dragFrom = null;          // index of the step being dragged
+
+  // Undo: the recipe as it was before each change; a burst of edits to the
+  // fields counts as one change.
+  const undoStack = [];
+  let editBurst = 0;
+  function remember() {
+    undoStack.push(JSON.stringify(state.recipe));
+    if (undoStack.length > 50) undoStack.shift();
+    $('undoBtn').disabled = false;
+  }
+  function rememberEdit() {
+    if (!editBurst) remember();
+    clearTimeout(editBurst);
+    editBurst = setTimeout(() => { editBurst = 0; }, 1200);
+  }
+  function undo() {
+    if (!undoStack.length) return;
+    state.recipe = JSON.parse(undoStack.pop());
+    openStep = null;
+    renderSteps();
+    stepsChanged();
+    $('undoBtn').disabled = !undoStack.length;
+  }
+  $('undoBtn').addEventListener('click', undo);
+  document.addEventListener('keydown', ev => {
+    if ((ev.ctrlKey || ev.metaKey) && !ev.shiftKey && !ev.altKey && ev.key.toLowerCase() === 'z' && undoStack.length &&
+      !/^(INPUT|TEXTAREA|SELECT)$/.test(ev.target.tagName) && !ev.target.isContentEditable) {
+      ev.preventDefault();
+      undo();
+    }
+  });
 
   function renderSteps() {
     const list = $('steps');
@@ -763,6 +795,49 @@
       const dot = el('div', 'dot');
       dot.appendChild(icon(STEP_ICON[step.op] || 'sliders', 16));
       rail.append(dot, el('div', 'line'));
+      rail.draggable = true;
+      rail.title = 'Drag to reorder';
+      rail.addEventListener('dragstart', ev => {
+        dragFrom = n;
+        ev.dataTransfer.effectAllowed = 'move';
+        ev.dataTransfer.setData('text/plain', 'recipe step');
+        ev.dataTransfer.setDragImage(item, 18, 18);
+        item.classList.add('dragging');
+      });
+      rail.addEventListener('dragend', () => {
+        dragFrom = null;
+        for (const li of $('steps').children) li.classList.remove('dragging', 'drop-before', 'drop-after');
+      });
+      const dropAfter = ev => {
+        const r = item.getBoundingClientRect();
+        return ev.clientY > r.top + r.height / 2;
+      };
+      item.addEventListener('dragover', ev => {
+        if (dragFrom === null) return;
+        ev.preventDefault();
+        ev.dataTransfer.dropEffect = 'move';
+        const after = dropAfter(ev);
+        item.classList.toggle('drop-before', !after);
+        item.classList.toggle('drop-after', after);
+      });
+      item.addEventListener('dragleave', () => item.classList.remove('drop-before', 'drop-after'));
+      item.addEventListener('drop', ev => {
+        if (dragFrom === null) return;
+        ev.preventDefault();
+        ev.stopPropagation();
+        const from = dragFrom;
+        let to = n + (dropAfter(ev) ? 1 : 0);
+        dragFrom = null;
+        if (to > from) to--;
+        if (to !== from) {
+          remember();
+          const [moved] = state.recipe.splice(from, 1);
+          state.recipe.splice(to, 0, moved);
+          openStep = null;
+          stepsChanged();
+        }
+        renderSteps();
+      });
       const box = el('div', 'box');
       const head = el('div', 'stephead');
       const toggle = button('toggle');
@@ -778,6 +853,7 @@
       sw.setAttribute('aria-checked', String(on));
       sw.setAttribute('aria-label', (on ? 'Turn off: ' : 'Turn on: ') + title);
       sw.addEventListener('click', () => {
+        remember();
         state.recipe[n] = Object.assign({}, state.recipe[n], { enabled: !on });
         if (on) state.recipe[n].enabled = false;
         else delete state.recipe[n].enabled;
@@ -787,6 +863,7 @@
       const remove = button('btn ghost icon', '', 'x', 'remove');
       remove.setAttribute('aria-label', 'Remove ' + title);
       remove.addEventListener('click', () => {
+        remember();
         state.recipe.splice(n, 1);
         openStep = openStep === n ? null : openStep !== null && openStep > n ? openStep - 1 : openStep;
         renderSteps();
@@ -804,6 +881,7 @@
           if (v !== undefined) next[key] = v;
         }
         if (!on) next.enabled = false;
+        if (!quiet) rememberEdit();
         state.recipe[n] = next;
         const c = checkStep(next);
         status.textContent = c.error || c.text;
@@ -823,6 +901,7 @@
         const b = button('btn small', label, iconName, tip);
         b.disabled = shift < 0 ? n === 0 : n === state.recipe.length - 1;
         b.addEventListener('click', () => {
+          remember();
           const [moved] = state.recipe.splice(n, 1);
           state.recipe.splice(n + shift, 0, moved);
           openStep = n + shift;
@@ -856,6 +935,7 @@
   }
 
   function addSteps(steps) {
+    remember();
     for (const s of steps) {
       const step = JSON.parse(JSON.stringify(s));
       if (step.op === 'combine' && !step.file && state.extraNames.length) step.file = state.extraNames[0];
@@ -872,6 +952,7 @@
   });
 
   $('clearRecipe').addEventListener('click', () => {
+    if (state.recipe.length) remember();
     state.recipe = [];
     openStep = null;
     renderSteps();
@@ -883,14 +964,22 @@
     download([text], ((state.data && state.data.baseName) || 'processing') + '_recipe.json', 'application/json');
   });
 
+  // A recipe object (or a bare list of steps) as editor steps: checked,
+  // defaults filled in, switched-off steps kept.
+  function parseRecipe(raw) {
+    const list = Array.isArray(raw) ? raw : raw && Array.isArray(raw.steps) ? raw.steps : null;
+    if (!list) throw new Error('expected { "steps": [ ... ] }');
+    const steps = Processing.normalizeRecipe({
+      steps: list.map(s => Object.fromEntries(Object.entries(s || {}).filter(([k]) => k !== 'enabled'))),
+    }).steps;
+    return steps.map((s, i) => (list[i] && list[i].enabled === false ? Object.assign(s, { enabled: false }) : s));
+  }
+
   async function loadRecipeFile(file) {
     try {
-      const raw = JSON.parse(await file.text());
-      const steps = Processing.normalizeRecipe(Array.isArray(raw) ? raw : {
-        steps: (raw.steps || []).map(s => Object.fromEntries(Object.entries(s).filter(([k]) => k !== 'enabled'))),
-      }).steps;
-      const off = (Array.isArray(raw) ? raw : raw.steps || []).map(s => s && s.enabled === false);
-      state.recipe = steps.map((s, i) => (off[i] ? Object.assign(s, { enabled: false }) : s));
+      const steps = parseRecipe(JSON.parse(await file.text()));
+      remember();
+      state.recipe = steps;
       openStep = null;
       renderSteps();
       stepsChanged();
@@ -900,6 +989,31 @@
     }
   }
   $('loadRecipe').addEventListener('click', () => $('recipeFile').click());
+
+  function openJson(open) {
+    $('jsonPanel').hidden = !open;
+    $('jsonBtn').setAttribute('aria-expanded', String(open));
+    if (!open) return;
+    $('recipeJson').value = JSON.stringify({ version: 1, steps: state.recipe }, null, 2);
+    $('jsonError').textContent = '';
+    $('recipeJson').focus();
+  }
+  $('jsonBtn').addEventListener('click', () => openJson($('jsonPanel').hidden));
+  $('jsonCancel').addEventListener('click', () => openJson(false));
+  $('jsonApply').addEventListener('click', () => {
+    try {
+      const steps = parseRecipe(JSON.parse($('recipeJson').value));
+      remember();
+      state.recipe = steps;
+      openStep = null;
+      renderSteps();
+      stepsChanged();
+      openJson(false);
+      log(`Recipe applied from JSON: ${steps.length} step(s)`, 'ok');
+    } catch (e) {
+      $('jsonError').textContent = e.message;
+    }
+  });
   $('recipeFile').addEventListener('change', async ev => {
     const file = ev.target.files[0];
     if (file) await loadRecipeFile(file);

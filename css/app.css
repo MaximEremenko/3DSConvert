@@ -209,6 +209,18 @@ details.more[open] > summary { margin-bottom: 10px; }
 .fields input.wide { width: 15em; }
 .fields select { width: auto; font-family: var(--font); }
 .stepactions { display: flex; gap: 6px; }
+.step { position: relative; }
+.step .rail { cursor: grab; }
+.step.dragging { opacity: .45; }
+.step.drop-before::before, .step.drop-after::after { content: ''; position: absolute; left: 42px; right: 0; height: 3px;
+  border-radius: 2px; background: var(--accent); }
+.step.drop-before::before { top: -6px; }
+.step.drop-after::after { bottom: 3px; }
+.jsonpanel { display: flex; flex-direction: column; gap: 8px; }
+.jsonpanel textarea { width: 100%; min-height: 180px; padding: 10px 12px; border: 1px solid var(--border-strong); border-radius: 10px;
+  background: var(--raised); color: var(--text); font-family: var(--mono); font-size: 12.5px; line-height: 1.5; resize: vertical; }
+.jsonpanel .row { align-items: center; }
+#jsonError { color: var(--err); }
 .addrow { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding-left: 42px; }
 .addrow select { width: auto; max-width: 240px; }
 .menu { position: absolute; z-index: 25; top: calc(100% + 6px); right: 0; min-width: 280px; padding: 6px;
