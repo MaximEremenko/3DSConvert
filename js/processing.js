@@ -685,38 +685,25 @@
     // judged). profile(s) gives { level, err } of sector s, or of whole
     // shells with s = -1. The bins are `width` wide in |Q|, or of equal width
     // du in a coordinate u(|Q|) (`coord`: { u, q, du }, q its inverse).
-    function ringProfiles(model, cell, step, coord) {
+    // `geometry` (from an earlier call) saves working out |Q| and the
+    // sectors again.
+    function ringProfiles(model, cell, step, coord, geometry) {
         const w = step.width, nsec = Math.max(1, Math.round(step.sectors));
         const binOf = coord ? q => Math.floor(coord.u(q) / coord.du) : q => Math.floor(q / w);
         const centre = coord ? b => coord.q((b + 0.5) * coord.du) : b => (b + 0.5) * w;
         const binWidth = coord ? b => coord.q((b + 1) * coord.du) - coord.q(b * coord.du) : () => w;
-        const Q = qMatrix(cell), dirs = nsec > 1 ? sphereDirections(nsec) : null;
+        const Q = qMatrix(cell);
         const N = voxelCount(model), v = model.values;
-        const bin = new Int32Array(N).fill(-1), sec = nsec > 1 ? new Uint16Array(N) : null, qs = new Float32Array(N);
-        const q0 = mulMV(Q, model.corner), [qa, qb, qc] = model.vectors.map(u => mulMV(Q, u));
-        const [nh, nk, nl] = model.dims;
-        let nb = 0, i = 0;
-        for (let il = 0; il < nl; il++)
-            for (let ik = 0; ik < nk; ik++)
-                for (let ih = 0; ih < nh; ih++, i++) {
-                    const x = q0[0] + ih * qa[0] + ik * qb[0] + il * qc[0];
-                    const y = q0[1] + ih * qa[1] + ik * qb[1] + il * qc[1];
-                    const z = q0[2] + ih * qa[2] + ik * qb[2] + il * qc[2];
-                    const q = Math.sqrt(x * x + y * y + z * z);
-                    qs[i] = q;
-                    if (sec && q > 0) {
-                        let best = 0, bd = -2;
-                        for (let d = 0; d < nsec; d++) {
-                            const c = (dirs[d][0] * x + dirs[d][1] * y + dirs[d][2] * z) / q;
-                            if (c > bd) { bd = c; best = d; }
-                        }
-                        sec[i] = best;
-                    }
-                    if (v[i] === v[i]) {
-                        bin[i] = binOf(q);
-                        if (bin[i] + 1 > nb) nb = bin[i] + 1;
-                    }
-                }
+        const [qa, qb, qc] = model.vectors.map(u => mulMV(Q, u));
+        const { qs, sec } = geometry || ringGeometry(model, cell, nsec);
+        const bin = new Int32Array(N).fill(-1);
+        let nb = 0;
+        for (let i = 0; i < N; i++) {
+            if (v[i] === v[i]) {
+                bin[i] = binOf(qs[i]);
+                if (bin[i] + 1 > nb) nb = bin[i] + 1;
+            }
+        }
         if (!nb) throw new Error('ring removal: no finite values');
         // voxels a whole shell would hold: 4 pi q^2 w over the Q volume of a
         // voxel (2 pi q w over its area for a single layer)
@@ -745,7 +732,34 @@
             }
             return { level, err };
         };
-        return { nb, nsec, qs, sec, bin, w, voxelQ, profile, centre };
+        return { nb, nsec, qs, sec, bin, w, voxelQ, profile, centre, geometry: { qs, sec } };
+    }
+
+    // |Q| of every voxel and its direction sector (null for one sector).
+    function ringGeometry(model, cell, nsec) {
+        const Q = qMatrix(cell), dirs = nsec > 1 ? sphereDirections(nsec) : null;
+        const N = voxelCount(model), sec = nsec > 1 ? new Uint16Array(N) : null, qs = new Float32Array(N);
+        const q0 = mulMV(Q, model.corner), [qa, qb, qc] = model.vectors.map(u => mulMV(Q, u));
+        const [nh, nk, nl] = model.dims;
+        let i = 0;
+        for (let il = 0; il < nl; il++)
+            for (let ik = 0; ik < nk; ik++)
+                for (let ih = 0; ih < nh; ih++, i++) {
+                    const x = q0[0] + ih * qa[0] + ik * qb[0] + il * qc[0];
+                    const y = q0[1] + ih * qa[1] + ik * qb[1] + il * qc[1];
+                    const z = q0[2] + ih * qa[2] + ik * qb[2] + il * qc[2];
+                    const q = Math.sqrt(x * x + y * y + z * z);
+                    qs[i] = q;
+                    if (sec && q > 0) {
+                        let best = 0, bd = -2;
+                        for (let d = 0; d < nsec; d++) {
+                            const c = (dirs[d][0] * x + dirs[d][1] * y + dirs[d][2] * z) / q;
+                            if (c > bd) { bd = c; best = d; }
+                        }
+                        sec[i] = best;
+                    }
+                }
+        return { qs, sec };
     }
 
     // The profile with its empty bins bridged linearly (ends held), for the
@@ -1265,7 +1279,7 @@
             // constant, logarithmic where it grows with |Q|; bins a quarter
             // of a width. When the widths fitted in it end at a bound of
             // their search, the next pass is made for them (at most three)
-            let s0 = Math.max(step.sigma0, 1e-4), r0 = step.resolution, result = null, logs = [];
+            let s0 = Math.max(step.sigma0, 1e-4), r0 = step.resolution, result = null, logs = [], geometry = null;
             for (let pass = 0; pass < 3; pass++) {
                 const a0 = s0, b0 = r0;
                 const coord = {
@@ -1273,7 +1287,8 @@
                     q: u => (b0 > 0 ? a0 / b0 * Math.sinh(b0 * u) : u * a0),
                     du: 0.25,
                 };
-                const rp = Object.assign(ringProfiles(model, ctx.cell, step, coord), { du: coord.du, s0init: a0, rinit: b0 });
+                const rp = Object.assign(ringProfiles(model, ctx.cell, step, coord, geometry), { du: coord.du, s0init: a0, rinit: b0 });
+                geometry = rp.geometry;
                 logs = [];
                 result = materialRings(model, rp, step, Object.assign({}, ctx, { log: t => logs.push(t) }));
                 if (!result.atLimit) break;

@@ -405,7 +405,7 @@ NaN marks masked or missing voxels throughout, and |Q| is Cartesian in
 | Background B(\|Q\|) | subtracts a constant, linear, a − b·c^\|Q\| or tabulated function of \|Q\| (two table rows at one \|Q\| make a step) |
 | Background from \|Q\| shells | subtracts the minimum or a percentile of each \|Q\| shell, optionally smoothed over neighbouring shells |
 | Background: Laue + thermal | the diffuse scattering of uncorrelated disorder, per formula unit Σ over sites of count × (⟨f²⟩ − ⟨f e^−W⟩²) with 2W = Uiso Q²: the Laue term of species sharing a site and the thermal diffuse scattering the Debye–Waller factors take from the Bragg peaks. The composition is written as sites, e.g. `Pb; Mg 0.333 + Nb 0.667; 3*O` (occupancies; what is missing to 1 is vacancy), with Uiso for all or per element (`0.01, Pb 0.03`); X-ray (Waasmaier–Kirfel), neutron (coherent lengths) or electron (Peng) scattering, from 3DSCalculator's tables. It is scaled by least squares to a low percentile of each \|Q\| shell (with an offset if asked), or by a given factor |
-| Remove rings (Fourier filter) | the median \|Q\| profile (per direction sector if asked) is split by a Gaussian low-pass in Fourier space, iterated so the smooth part passes under the rings; what is sharper than the cutoff and rises above four times the uncertainty of the median is a ring and is subtracted at its \|Q\| from every voxel, leaving anisotropic diffuse scattering alone. Shells covered less than a set fraction are not judged; with a sample-holder powder, only its lines are touched |
+| Remove powder rings | the rings of named materials - sample-environment metals (aluminium, copper, vanadium, niobium, titanium, zirconium, beryllium, ...), ice, calibrants (Si, CeO2, LaB6, ...) or a custom `fcc Al 4.05` - are predicted from their structure and fitted to the data, then subtracted at their \|Q\| from every voxel, so anisotropic diffuse scattering stays; `any` removes every ring sharper than a cutoff instead. See below |
 | Combine | subtracts, adds, multiplies or divides by another volume (times a factor), interpolated onto this grid if the grids differ |
 | Replace low values | sets values below a threshold to a number or NaN |
 | Symmetrize | averages over Laue-equivalent points (-1 to m-3m; hexagonal axes for the trigonal groups), or only fills empty voxels; *median* takes the median of the equivalents and *clip* their mean without those more than k robust σ from it, so a spike or a spurious peak in one equivalent drops out. The grid is extended to its symmetric images (a half volume becomes whole) unless that is switched off; a grid that already holds them stays as it is |
@@ -430,6 +430,31 @@ Recipes can be saved and loaded. Unified output of processed data records
 the recipe in `/entry/process` (an `NXprocess` group; the JSON and a
 readable list of the steps sit in its `recipe` `NXnote`), and reading such
 a file lists the steps in the log.
+
+**Powder rings.** For each material the lines come from its structure:
+every reflection's integrated intensity m\|F\|²·exp(−2W) (X-ray, neutron or
+electron form factors, a Debye–Waller B) spread over the sphere of its
+\|Q\|, so a line's strength in a reciprocal-space volume is Σ\|F\|²/(4πQ²).
+The data enter as a robust profile, the median of every \|Q\| bin (per
+direction sector too) with its uncertainty. The bins are equal in the
+coordinate u = asinh(rQ/σ₀)/r, in which a line of width
+σ(Q) = √(σ₀² + (rQ)²) is one unit wide everywhere: u follows \|Q\| where
+the width is constant (monochromatic area detectors) and ln\|Q\| where it
+grows in proportion (time of flight). The same Gaussian high-pass (six line
+widths by default) is taken off the profile and off the model, so a smooth
+background and broad diffuse features drop out of the fit. The line
+amplitudes then follow from non-negative, Huber-weighted least squares
+(each line with an intensity of its own by default, since texture and
+absorption change the ratios; or the structure-factor ratios), with
+one-dimensional searches for each lattice parameter (±1 % by default) and a
+joint search for σ₀ and r; the profile is rebuilt for the fitted widths
+when they end at a bound. Amplitudes under three standard errors are
+dropped, and a material whose lines explain under 2 % of the high-passed
+profile, or whose fit shows no clear lattice match, is left out and
+logged. With direction sectors (8 by default) the amplitudes are fitted
+again per sector, for rings whose strength changes around the sphere. On a
+CORELLI volume in an aluminium can the method finds a = 4.0491 Å for the
+aluminium and removes 96–104 % of the (111), (200) and (220) ring excess.
 
 **3D-ΔPDF.** The step computes P(r) = |det V| Σ I(q) exp(2πi q·r) over all
 grid points q, where the columns of V are the grid steps, so P approximates
