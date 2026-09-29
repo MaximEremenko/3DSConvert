@@ -72,16 +72,23 @@
     Converts 3-D diffuse scattering data between the <b>unified HDF5</b> format
     (<code>/scattering/data</code> and <code>/entry/data</code> layouts, RMCProfile / DiffuseCode),
     <b>Yell&nbsp;1.0</b> HDF5 (DISCUS / Yell / Meerkat), the
-    <b>RMCProfile old text</b> format, and <b>VTK</b> (Scatty / Spinteract / 3DSCalculator).
+    <b>RMCProfile old text</b> format, and <b>VTK</b> (Scatty / Spinteract / 3DSCalculator),
+    and reads <b>NeXus</b> volumes (Mantid MDHistoWorkspace, NXdata such as NXrefine).
     Everything runs locally in your browser &mdash; no upload.
   </p>
 
   <div class="panel">
     <h2>1 &middot; Data file</h2>
     <label>Diffuse data
-      <span class="hint">(unified .h5 / Yell .h5 / old-format .dat / .vtk &mdash; auto-detected)</span></label>
-    <input type="file" id="dataFile">
+      <span class="hint">(unified .h5 / Yell .h5 / NeXus .nxs (Mantid MDHistoWorkspace, NXdata) /
+      old-format .dat / .vtk &mdash; auto-detected; for NeXus data kept in linked files, select
+      those files too)</span></label>
+    <input type="file" id="dataFile" multiple>
     <div id="dataInfo" class="hint"></div>
+    <div id="nexusPick" hidden>
+      <label>NeXus data <span class="hint">(the file holds several NXdata groups)</span></label>
+      <select id="nexusPath"></select>
+    </div>
     <div class="row">
       <div>
         <label>Grid config for Q-space VTK
@@ -272,7 +279,7 @@
     };
   }
 
-  const state = { data: null, struct: null, dataFile: null, gridConfig: null };
+  const state = { data: null, struct: null, dataFiles: [], gridConfig: null };
   let client, current = null, hardCancelTimer = null;
 
   try {
@@ -294,7 +301,7 @@
     $('busy').hidden = !on;
     $('progressBar').removeAttribute('value');   // indeterminate until the first report
     $('progressText').textContent = label || '';
-    for (const id of ['dataFile', 'structFile', 'gridConfigFile', 'yellSpace']) $(id).disabled = on;
+    for (const id of ['dataFile', 'structFile', 'gridConfigFile', 'yellSpace', 'nexusPath']) $(id).disabled = on;
     updateButton();
   }
 
@@ -328,7 +335,9 @@
       client = createClient();
       state.data = null;
       state.struct = null;
+      state.dataFiles = [];
       for (const id of ['dataFile', 'structFile']) $(id).value = '';
+      $('nexusPick').hidden = true;
       $('dataInfo').textContent = '';
       $('structInfo').textContent = '';
       log('The worker did not stop in time and was restarted; select the files again.', 'err');
@@ -340,16 +349,37 @@
   }
 
   // ------------------------------------------------------------ inputs
-  async function loadDataFile() {
-    const file = state.dataFile;
+  // nexusPath: keep the chosen NXdata group when reloading the same files.
+  async function loadDataFile(nexusPath) {
+    const files = state.dataFiles;
     $('dataInfo').textContent = '';
     state.data = null;
     updateButton();
+    if (!nexusPath) $('nexusPick').hidden = true;
     try {
-      const s = await run('Reading…', 'loadData', { file, yellSpace: $('yellSpace').value });
+      const s = await run('Reading…', 'loadData', {
+        files, paths: files.map(f => f.webkitRelativePath || ''),
+        yellSpace: $('yellSpace').value, nexusPath: nexusPath || null,
+      });
       if (!s) return;
-      s.baseName = file.name.replace(/\.(h5|hdf5|hdf|he5|nx|nxs|nx5|dat|txt|vtk)$/i, '');
+      s.baseName = s.main.replace(/\.(h5|hdf5|hdf|he5|nx|nxs|nx5|dat|txt|vtk)$/i, '');
       state.data = s;
+      if (files.length > 1) {
+        log(`Data file: ${s.main}` + (s.companions && s.companions.length
+          ? `; linked files: ${s.companions.join(', ')}` : '; the other selected files are not used'));
+      }
+      if (s.candidates && s.candidates.length > 1) {
+        const pick = $('nexusPath');
+        pick.textContent = '';
+        for (const c of s.candidates) {
+          const opt = document.createElement('option');
+          opt.value = c.path;
+          opt.textContent = `${c.path} (${c.shape ? c.shape.join(' x ') : 'linked'})` + (c.isDefault ? ' - default' : '');
+          pick.appendChild(opt);
+        }
+        pick.value = s.nexusPath;
+        $('nexusPick').hidden = false;
+      }
       let info;
       if (s.kind === 'dat') {
         info = `RMCProfile old text format | grid ${s.dims.join(' x ')} in Q`;
@@ -358,16 +388,19 @@
       } else if (s.kind === 'vtk-hkl') {
         info = `VTK STRUCTURED_POINTS in r.l.u. ("${s.title}") | grid ${s.dims.join(' x ')}`;
       } else {
-        info = (s.kind === 'yell' ? 'Yell 1.0' : 'Unified data format') +
-               ` | grid ${s.dims.join(' x ')}` +
-               (s.kind === 'unified' ? ` | axes ${s.axesType || 'hkl'}` : '') +
+        const label = {
+          yell: 'Yell 1.0', unified: 'Unified data format', 'mantid-md': 'Mantid MDHistoWorkspace',
+          nexus: `NeXus ${s.nexusPath}`,
+        }[s.kind];
+        info = label + ` | grid ${s.dims.join(' x ')}` +
+               (s.kind === 'unified' || s.kind === 'nexus' ? ` | axes ${s.axesType || 'hkl'}` : '') +
                ` | ${s.precision}` +
                ` | stored cell: ${s.cellLengths.map(x => x.toPrecision(6)).join(' ')} / ` +
                s.cellAngles.map(x => x.toPrecision(4)).join(' ') +
                (Converter.isUnitMetric(s.cellLengths, s.cellAngles) ? '  (unit metric)' : '');
       }
       $('dataInfo').textContent = info;
-      log(`Data file "${file.name}": ${info}`);
+      log(`Data file "${s.main}": ${info}`);
       logNotes(s.notes);
       if (s.legacyContract) {
         log('Legacy unified metadata accepted; new unified output will write the mandatory current contract.');
@@ -381,12 +414,16 @@
   }
 
   $('dataFile').addEventListener('change', ev => {
-    state.dataFile = ev.target.files[0] || null;
+    state.dataFiles = Array.from(ev.target.files);
     loadDataFile();
   });
 
   $('yellSpace').addEventListener('change', () => {
-    if (state.dataFile) loadDataFile();
+    if (state.dataFiles.length) loadDataFile(state.data && state.data.nexusPath);
+  });
+
+  $('nexusPath').addEventListener('change', () => {
+    if (state.dataFiles.length) loadDataFile($('nexusPath').value);
   });
 
   $('gridConfigFile').addEventListener('change', async ev => {
@@ -505,7 +542,7 @@
       compression: Number($('compression').value),
     };
     if (state.gridConfig && state.data.kind === 'vtk') {
-      const index = pickGrid(state.gridConfig, state.dataFile && state.dataFile.name);
+      const index = pickGrid(state.gridConfig, state.data.main);
       params.grid = state.gridConfig.grids[index];
       params.customFrame = state.gridConfig.customFrame;
       if (state.gridConfig.grids.length > 1) {

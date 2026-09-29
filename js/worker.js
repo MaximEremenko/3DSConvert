@@ -80,23 +80,32 @@ function converterWorker(self, h5wasm, Converter) {
         };
     }
 
-    // Remount both input files; HDF5 files are closed between calls.
+    // Remount the inputs; HDF5 files are closed between calls.
+    // state.files.data: [{ at, file }] placed under data/<at>; .struct: File.
     function mountFiles() {
         try {
             FS.unmount(MOUNT);
         } catch (_) {
             // nothing mounted yet
         }
-        const blobs = [];
-        for (const role of ['data', 'struct']) {
-            const file = state.files[role];
-            if (file) blobs.push({ name: `${role}/${file.name}`, data: file });
-        }
+        const blobs = (state.files.data || []).map(x => ({ name: 'data/' + x.at, data: x.file }));
+        if (state.files.struct) blobs.push({ name: 'struct/' + state.files.struct.name, data: state.files.struct });
         FS.mount(FS.filesystems.WORKERFS, { blobs }, MOUNT);
     }
 
-    function openMounted(role) {
-        return new h5wasm.File(`${MOUNT}/${role}/${state.files[role].name}`, 'r');
+    function openAt(relPath) {
+        return new h5wasm.File(`${MOUNT}/${relPath}`, 'r');
+    }
+
+    const DATA_KINDS = new Set(['unified', 'yell', 'mantid-md', 'nexus']);
+
+    function kindOf(relPath) {
+        const f = openAt(relPath);
+        try {
+            return Converter.detectH5Kind(f);
+        } finally {
+            f.close();
+        }
     }
 
     async function isHdf5(file) {
@@ -124,39 +133,84 @@ function converterWorker(self, h5wasm, Converter) {
             return {};
         },
 
-        async loadData({ file, yellSpace }, ctx) {
+        // files: the selected data file, or a NeXus file plus the files its
+        // external links point to; paths: their folder-relative paths (may be
+        // empty); nexusPath: the NXdata group to read (default: @default).
+        async loadData({ files, paths, yellSpace, nexusPath }, ctx) {
             state.data = null;
             state.plan = null;
-            state.files.data = file || null;
+            files = (files || []).filter(Boolean);
+            state.files.data = files.map((file, i) => ({ at: `${i}/${file.name}`, file }));
             mountFiles();
-            if (!file) return { result: null };
-            const opts = { size: file.size, tick: ctx.tick, progress: f => ctx.progress('Reading', f) };
-            if (await isHdf5(file)) {
-                const f = openMounted('data');
-                try {
-                    const kind = Converter.detectH5Kind(f);
-                    let model;
-                    if (kind === 'yell') {
-                        model = await Converter.readYell(f, Object.assign({ space: yellSpace }, opts));
-                    } else if (kind === 'unified') {
-                        model = await Converter.readUnifiedData(f, opts);
-                    } else if (kind === 'structure') {
-                        throw new Error('this is a structure file - load it in section 2');
-                    } else {
-                        throw new Error('unrecognized HDF5 layout');
-                    }
-                    state.data = { kind, model };
-                } finally {
-                    f.close();
+            if (!files.length) return { result: null };
+            const hdf5 = [];
+            for (const file of files) hdf5.push(await isHdf5(file));
+            let main = 0;
+            if (files.length > 1) {
+                if (hdf5.some(x => !x)) {
+                    throw new Error('several files can be selected only for NeXus data whose external ' +
+                        'links point to the others; select a single text data file');
                 }
-            } else {
+                const kinds = files.map((file, i) => kindOf(`data/${i}/${file.name}`));
+                main = kinds.findIndex(k => DATA_KINDS.has(k));
+                if (main < 0) throw new Error(Converter.unsupportedKindMessage(kinds[0]) || 'no data file among the selection');
+            }
+            const file = files[main];
+            const opts = { size: file.size, tick: ctx.tick, progress: f => ctx.progress('Reading', f) };
+            if (!hdf5[main]) {
                 const head = new TextDecoder().decode(await file.slice(0, 256).arrayBuffer());
                 const vtk = Converter.isVtk(head);
                 const grid = vtk ? await Converter.readVtkStream(file.stream(), opts)
                     : await Converter.readOldDatStream(file.stream(), opts);
                 state.data = { kind: vtk ? (grid.frame === 'hkl' ? 'vtk-hkl' : 'vtk') : 'dat', grid };
+                return { result: Object.assign(summarize(state.data), { main: file.name }) };
             }
-            return { result: summarize(state.data) };
+
+            state.files.data = [{ at: file.name, file }];
+            mountFiles();
+            let f = openAt('data/' + file.name);
+            const extra = { main: file.name, companions: [] };
+            try {
+                const kind = Converter.detectH5Kind(f);
+                let model;
+                if (kind === 'yell') {
+                    model = await Converter.readYell(f, Object.assign({ space: yellSpace }, opts));
+                } else if (kind === 'unified') {
+                    model = await Converter.readUnifiedData(f, opts);
+                } else if (kind === 'mantid-md') {
+                    model = await Converter.readMantidMD(f, opts);
+                } else if (kind === 'nexus') {
+                    const candidates = Converter.nexusCandidates(f);
+                    const path = candidates.some(c => c.path === nexusPath) ? nexusPath : candidates[0].path;
+                    // Put the other selected files where the external links expect them.
+                    const links = Converter.unresolvedLinks(f, path);
+                    const others = files.map((x, i) => ({ name: x.name, path: (paths && paths[i]) || '', i }))
+                        .filter(x => x.i !== main);
+                    if (links.length && others.length) {
+                        const plan = Converter.planLinkMounts(links, others);
+                        if (plan.mounts.length) {
+                            f.close();
+                            f = null;
+                            for (const m of plan.mounts) {
+                                const other = others[m.index];
+                                state.files.data.push({ at: m.at, file: files[other.i] });
+                                extra.companions.push(`${other.name} as ${m.at}`);
+                            }
+                            mountFiles();
+                            f = openAt('data/' + file.name);
+                        }
+                    }
+                    model = await Converter.readNexusData(f, Object.assign({ path }, opts));
+                    extra.candidates = candidates.map(c => ({ path: c.path, shape: c.shape, isDefault: c.isDefault }));
+                    extra.nexusPath = path;
+                } else {
+                    throw new Error(Converter.unsupportedKindMessage(kind));
+                }
+                state.data = { kind, model };
+            } finally {
+                if (f) f.close();
+            }
+            return { result: Object.assign(summarize(state.data), extra) };
         },
 
         async loadStructure({ file }) {
@@ -166,7 +220,7 @@ function converterWorker(self, h5wasm, Converter) {
             if (!file) return { result: null };
             let parent;
             if (await isHdf5(file)) {
-                const f = openMounted('struct');
+                const f = openAt('struct/' + file.name);
                 try {
                     parent = Converter.readUnifiedStructure(f);
                 } finally {

@@ -206,12 +206,35 @@
         return out;
     }
 
-    // Dataset in C order [nl,nk,nh] (h fastest): slabs copy straight in.
+    // Dataset in C order [nl,nk,nh] (h fastest), or a lower-rank array in
+    // the same flat order: slabs copy straight in.
     async function readHFastest(ds, path, dims, opts) {
-        const [nh, nk, nl] = dims;
-        const out = allocFor(ds, nh * nk * nl);
-        await forEachSlab(ds, path, opts, (l0, count, slab) => out.set(slab, l0 * nk * nh));
+        const out = allocFor(ds, dims[0] * dims[1] * dims[2]);
+        await forEachSlab(ds, path, opts, (start, count, slab) => out.set(slab, start * (slab.length / count)));
         return out;
+    }
+
+    // Any rank-1..3 dataset; axisOfDim[d] is the model axis (0 = abscissa)
+    // of dataset dimension d in C order. Returns { values, dims }.
+    async function readPermuted(ds, path, axisOfDim, opts) {
+        const shape = Array.from(ds.shape || []).map(Number);
+        while (shape.length < 3) shape.push(1);
+        const dims = [1, 1, 1];
+        axisOfDim.forEach((axis, d) => { dims[axis] = shape[d]; });
+        const stride = [1, dims[0], dims[0] * dims[1]];
+        const s0 = stride[axisOfDim[0]], s1 = stride[axisOfDim[1]], s2 = stride[axisOfDim[2]];
+        const out = allocFor(ds, dims[0] * dims[1] * dims[2]);
+        const n1 = shape[1], n2 = shape[2];
+        await forEachSlab(ds, path, opts, (start, count, slab) => {
+            let src = 0;
+            for (let d0 = start; d0 < start + count; d0++) {
+                for (let d1 = 0; d1 < n1; d1++) {
+                    const base = d0 * s0 + d1 * s1;
+                    for (let d2 = 0; d2 < n2; d2++) out[base + d2 * s2] = slab[src++];
+                }
+            }
+        });
+        return { values: out, dims };
     }
 
     function normalizeRadiation(value) {
@@ -436,7 +459,30 @@
         if (f.get('entry/data/data_values')) return 'unified';
         if (f.get('data') && f.get('lower_limits') && f.get('unit_cell')) return 'yell';
         if (f.get('entry/data/atom_position') || f.get('entry/data/unit_cells')) return 'structure';
+        if (f.get('MDHistoWorkspace')) return 'mantid-md';
+        if (f.get('MDEventWorkspace')) return 'mantid-events';
+        const top = f.keys();
+        if (top.some(k => /^mantid_workspace_\d+$/.test(k))) return 'mantid-workspace';
+        if (nexusCandidates(f).length) return 'nexus';
+        for (const k of top) {
+            const g = f.get(k);
+            if (isGroup(g) && g.keys().some(n => attributeText(g.get(n), 'NX_class') === 'NXevent_data')) return 'nexus-events';
+        }
         return 'unknown';
+    }
+
+    // Why a recognised HDF5 file cannot be converted, or null.
+    function unsupportedKindMessage(kind) {
+        return {
+            'mantid-events': 'this is a Mantid MDEventWorkspace (events, not a grid); bin it ' +
+                '(e.g. BinMD or MDNorm) and save the MDHistoWorkspace with SaveMD',
+            'mantid-workspace': 'this is a Mantid event or histogram workspace, not a reciprocal-space ' +
+                'volume; convert it to an MDHistoWorkspace in HKL (e.g. MDNorm) and save that with SaveMD',
+            'nexus-events': 'this is a raw event NeXus file from the instrument; it needs data reduction ' +
+                '(e.g. in Mantid) into an HKL volume first',
+            structure: 'this is a structure file - load it in section 2',
+            unknown: 'unrecognized HDF5 layout',
+        }[kind] || null;
     }
 
     // opts: { tick, progress, slabBytes } (see forEachSlab).
@@ -695,6 +741,430 @@
             dims: [nh, nk, nl], corner, vectors, values,
             cellLengths: cell.slice(0, 3), cellAngles: cell.slice(3, 6),
             radiation: 'unknown', axes: [1, 2, 3], notes,
+        };
+    }
+
+    // ------------------------------------------------------------------ NeXus
+
+    const isDataset = obj => !!obj && typeof obj.slice === 'function' && obj.shape !== undefined;
+    const isGroup = obj => !!obj && typeof obj.keys === 'function' && !isDataset(obj);
+    const isExternalLink = obj => !!obj && typeof obj.filename === 'string' && typeof obj.obj_path === 'string';
+
+    // Projection names such as "[H,H,0]", "[-H,H,0]", "[0.5H,0,0]", "[0,K,0]"
+    // -> [1,1,0], [-1,1,0], [0.5,0,0], [0,1,0]; null when not of that form.
+    function projectionVector(name) {
+        const m = /^\s*\[([^\]]*)\]\s*$/.exec(String(name || ''));
+        if (!m) return null;
+        const parts = m[1].split(',').map(s => s.trim());
+        if (parts.length !== 3) return null;
+        const v = parts.map(p => {
+            if (/^[+-]?(\d+\.?\d*|\.\d+)(e[+-]?\d+)?$/i.test(p)) return Number(p);
+            const q = /^([+-]?(?:\d+\.?\d*|\.\d+)?)\*?[HKL]$/i.exec(p);
+            if (!q) return NaN;
+            return q[1] === '' || q[1] === '+' ? 1 : q[1] === '-' ? -1 : Number(q[1]);
+        });
+        return v.every(Number.isFinite) && v.some(x => x !== 0) ? v : null;
+    }
+
+    // Axis values -> first grid point and step for n points. Values of length
+    // n + 1 are bin edges (Mantid) and give bin centres; n values are points.
+    function uniformAxis(values, n, label) {
+        const edges = values.length === n + 1;
+        if (!edges && values.length !== n) {
+            throw new Error(`${label} has ${values.length} values for ${n} grid points`);
+        }
+        const m = values.length - 1;
+        const step = m > 0 ? (values[m] - values[0]) / m : 0;
+        const tol = 1e-4 * Math.abs(step) + 1e-6 * Math.max(Math.abs(values[0]), Math.abs(values[m]));
+        for (let i = 1; i < m; i++) {
+            if (Math.abs(values[i] - (values[0] + i * step)) > tol) throw new Error(`${label} is not evenly spaced`);
+        }
+        return { first: edges ? values[0] + step / 2 : values[0], step, edges };
+    }
+
+    function firstNumber(f, path) {
+        const v = numbersAt(f, path);
+        return v && v.length && Number.isFinite(v[0]) ? v[0] : null;
+    }
+
+    // --- Mantid SaveMD (version 2) MDHistoWorkspace ---
+    // signal is stored C [D(n-1),...,D0], so D0 varies fastest and model axis j
+    // is dimension Dj. D0..D2 hold bin edges. For the HKL frame each dimension
+    // is a projection: hkl = W * (d0, d1, d2) with the basis vectors in the
+    // columns of the row-major logs/W_MATRIX, also spelled out in the long
+    // names ("[H,H,0]"). NaN marks bins without events.
+    async function readMantidMD(f, opts) {
+        opts = opts || {};
+        const g = 'MDHistoWorkspace/data/';
+        const notes = [];
+        const sig = f.get(g + 'signal');
+        if (!isDataset(sig)) throw new Error('MDHistoWorkspace: missing data/signal');
+        const shape = Array.from(sig.shape || []).map(Number);
+        if (shape.length === 1) {
+            throw new Error('this MDHistoWorkspace was written by SaveMD version 1 (flat arrays); ' +
+                're-save it with SaveMD version 2');
+        }
+        if (shape.length > 3) {
+            throw new Error(`the MDHistoWorkspace has ${shape.length} dimensions; bin it to three ` +
+                '(e.g. BinMD or MDNorm) before saving');
+        }
+        const nd = shape.length;
+        const expected = Array.from({ length: nd }, (_, i) => 'D' + (nd - 1 - i)).join(':');
+        const axesAttr = attributeText(sig, 'axes') || expected;
+        if (axesAttr.split(/[:,]/).map(s => s.trim()).join(':') !== expected) {
+            throw new Error(`MDHistoWorkspace: unexpected signal axes "${axesAttr}"`);
+        }
+        const dims = [1, 1, 1];
+        for (let j = 0; j < nd; j++) dims[j] = shape[nd - 1 - j];
+
+        const system = firstNumber(f, 'MDHistoWorkspace/coordinate_system');
+        const info = [];
+        for (let j = 0; j < nd; j++) {
+            const d = f.get(g + 'D' + j);
+            if (!isDataset(d)) throw new Error(`MDHistoWorkspace: missing data/D${j}`);
+            const longName = attributeText(d, 'long_name');
+            const axis = uniformAxis(numbersAt(f, g + 'D' + j), dims[j], `dimension D${j} (${longName || 'unnamed'})`);
+            info.push(Object.assign({ frame: attributeText(d, 'frame'), units: attributeText(d, 'units'), longName }, axis));
+        }
+        const frames = [...new Set(info.map(a => a.frame).filter(Boolean))];
+        const hkl = system === 3 || (system === null && frames.length === 1 && frames[0] === 'HKL');
+        if (!hkl || frames.some(fr => fr !== 'HKL')) {
+            const name = { 0: 'general', 1: 'Q (lab frame)', 2: 'Q (sample frame)' }[system] || frames.join('/') || 'unknown';
+            throw new Error(`the MDHistoWorkspace is in the ${name} frame; only HKL workspaces are ` +
+                'supported - bin it in HKL (e.g. with MDNorm) before saving');
+        }
+
+        const W = numbersAt(f, 'MDHistoWorkspace/experiment0/logs/W_MATRIX/value');
+        const basis = [];
+        for (let j = 0; j < 3; j++) {
+            const named = j < nd ? projectionVector(info[j].longName) : null;
+            let v = named;
+            if (W && W.length === 9) {
+                v = [W[j], W[3 + j], W[6 + j]];
+                if (named && named.some((x, c) => Math.abs(x - v[c]) > 1e-6)) {
+                    notes.push(`warning: W_MATRIX column ${j} (${v.join(', ')}) disagrees with the name ` +
+                        `"${info[j].longName}" of dimension D${j}; W_MATRIX used`);
+                }
+            }
+            basis.push(v || [0, 1, 2].map(c => (c === j ? 1 : 0)));
+        }
+        if (W && W.length === 9 && W.some((x, i) => Math.abs(x - (i % 4 === 0 ? 1 : 0)) > 1e-12)) {
+            notes.push('projection from W_MATRIX: ' +
+                info.map((a, j) => `D${j} = ${a.longName || basis[j].join(',')}`).join(', '));
+        }
+        const transform = f.get('MDHistoWorkspace/transform_to_orig');
+        if (isDataset(transform)) {
+            notes.push('warning: the workspace carries a BinMD transform (transform_to_orig), which is ' +
+                'not applied; the grid follows the dimension names and W_MATRIX');
+        }
+        if (nd < 3) notes.push(`${nd}-D workspace read as a ${dims.join(' x ')} grid`);
+        const corner = [0, 0, 0];
+        const vectors = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+        for (let j = 0; j < nd; j++) {
+            for (let c = 0; c < 3; c++) {
+                corner[c] += basis[j][c] * info[j].first;
+                vectors[j][c] = dims[j] > 1 ? basis[j][c] * info[j].step : 0;
+            }
+        }
+
+        const progress = opts.progress;
+        const values = await readHFastest(sig, g + 'signal', dims,
+            Object.assign({}, opts, { progress: progress && (x => progress(0.9 * x)) }));
+        let masked = 0, infinite = 0;
+        const mask = f.get(g + 'mask');
+        if (isDataset(mask) && sameShape(Array.from(mask.shape).map(Number), shape)) {
+            await forEachSlab(mask, g + 'mask',
+                { tick: opts.tick, progress: progress && (x => progress(0.9 + 0.1 * x)) }, (start, count, slab) => {
+                    const off = start * (slab.length / count);
+                    for (let i = 0; i < slab.length; i++) {
+                        if (slab[i] && values[off + i] === values[off + i]) {
+                            values[off + i] = NaN;
+                            masked++;
+                        }
+                    }
+                });
+        }
+        for (let i = 0; i < values.length; i++) {
+            if (values[i] === Infinity || values[i] === -Infinity) {
+                values[i] = NaN;
+                infinite++;
+            }
+        }
+        const missing = countNonFinite(values);
+        if (masked) notes.push(`${masked} masked voxels set to NaN`);
+        if (infinite) notes.push(`${infinite} infinite voxels (normalisation by zero) set to NaN`);
+        if (missing) {
+            notes.push(`${missing} of ${values.length} voxels (${(100 * missing / values.length).toFixed(1)}%) ` +
+                'hold no data (NaN)');
+        }
+
+        const ol = 'MDHistoWorkspace/experiment0/sample/oriented_lattice/unit_cell_';
+        const cell = ['a', 'b', 'c', 'alpha', 'beta', 'gamma'].map(n => firstNumber(f, ol + n));
+        let lengths = [1, 1, 1], angles = [90, 90, 90];
+        if (cell.every(x => x !== null) && cell[0] > 0 && cell[1] > 0 && cell[2] > 0) {
+            lengths = cell.slice(0, 3);
+            angles = cell.slice(3, 6);
+        } else {
+            notes.push('no oriented lattice stored; supply the parent cell');
+        }
+        if (f.get('MDHistoWorkspace/experiment1')) {
+            notes.push('the workspace holds several experiments; the lattice of experiment0 is used');
+        }
+        notes.push('radiation set to neutron (Mantid workspace); change it under Output if needed');
+        return {
+            dims, corner, vectors, values, cellLengths: lengths, cellAngles: angles,
+            radiation: 'neutron', axes: pickAxes(vectors, dims), axesType: 'hkl', notes,
+        };
+    }
+
+    // --- generic NeXus NXdata ---
+
+    function nxSignalName(group) {
+        const name = attributeText(group, 'signal');
+        if (name && !/^\d+$/.test(name)) return name;
+        for (const key of group.keys()) {
+            const child = group.get(key);
+            if (isDataset(child) && child.attrs && child.attrs.signal &&
+                Number(firstValue(child.attrs.signal.value)) === 1) return key;
+        }
+        return group.keys().includes('data') ? 'data' : null;
+    }
+
+    // NXdata groups with a 1- to 3-D signal (4-D ones are listed so that the
+    // reader can explain them). The @default chain marks the preferred one.
+    function nexusCandidates(f) {
+        let defaultPath = null;
+        const rootDefault = attributeText(f, 'default');
+        if (rootDefault) {
+            const entry = f.get(rootDefault);
+            const inner = isGroup(entry) ? attributeText(entry, 'default') : '';
+            if (inner) defaultPath = '/' + rootDefault + '/' + inner;
+        }
+        const found = [];
+        const visit = (group, path, depth) => {
+            for (const key of group.keys()) {
+                const child = group.get(key);
+                if (!isGroup(child)) continue;
+                const childPath = path + '/' + key;
+                if (attributeText(child, 'NX_class') === 'NXdata') {
+                    const signal = nxSignalName(child);
+                    const ds = signal && child.get(signal);
+                    const shape = isDataset(ds) ? Array.from(ds.shape).map(Number)
+                        : isExternalLink(ds) ? null : undefined;
+                    if (signal && shape !== undefined && (!shape || (shape.length >= 1 && shape.length <= 4))) {
+                        found.push({ path: childPath, signal, shape, isDefault: childPath === defaultPath });
+                    }
+                } else if (depth < 3) {
+                    visit(child, childPath, depth + 1);
+                }
+            }
+        };
+        visit(f, '', 0);
+        found.sort((a, b) => (b.isDefault - a.isDefault));
+        return found;
+    }
+
+    // External links of an NXdata group whose target files are not available.
+    function unresolvedLinks(f, path) {
+        const group = f.get(path);
+        if (!isGroup(group)) return [];
+        return group.keys().map(key => ({ key, link: group.get(key) }))
+            .filter(x => isExternalLink(x.link))
+            .map(x => ({ name: x.key, filename: x.link.filename, objPath: x.link.obj_path }));
+    }
+
+    // Where to place selected companion files so that HDF5 resolves the
+    // external links of the main file: a relative link "300/transform.nxs"
+    // needs the file at <main file's folder>/300/transform.nxs; an absolute
+    // one is looked up by its file name next to the main file. files:
+    // [{ name, path }] (path = relative path from a folder pick, may be '').
+    // Returns { mounts: [{ at, index }], missing: [filename] }.
+    function planLinkMounts(links, files) {
+        const mounts = [], missing = [];
+        const done = new Set();
+        for (const link of links) {
+            const target = String(link.filename).replace(/\\/g, '/').replace(/^(\.\/)+/, '');
+            if (done.has(target)) continue;
+            done.add(target);
+            const base = target.split('/').pop();
+            const absolute = /^([a-z]:)?\//i.test(target);
+            let matches = files.map((file, index) => ({ file, index })).filter(x => x.file.name === base);
+            if (matches.length > 1) {
+                const bySuffix = matches.filter(x => x.file.path &&
+                    ('/' + x.file.path.replace(/\\/g, '/')).endsWith('/' + target));
+                if (bySuffix.length === 1) matches = bySuffix;
+            }
+            if (matches.length !== 1 || (!absolute && target.split('/').includes('..'))) {
+                missing.push(target);
+                continue;
+            }
+            mounts.push({ at: absolute ? base : target, index: matches[0].index });
+        }
+        return { mounts, missing };
+    }
+
+    function axisNamesOf(group, signalDs, rank) {
+        const raw = group.attrs && group.attrs.axes ? group.attrs.axes.value
+            : signalDs.attrs && signalDs.attrs.axes ? signalDs.attrs.axes.value : null;
+        let names = null;
+        if (typeof raw === 'string') names = raw.split(/[:,\s]+/).filter(Boolean);
+        else if (raw && (Array.isArray(raw) || ArrayBuffer.isView(raw))) names = Array.from(raw, x => textValue(x));
+        if (names && names.length === rank) return names.map(n => (n === '.' ? null : n));
+        // AXISNAME_indices
+        const byIndex = new Array(rank).fill(null);
+        for (const key of Object.keys(group.attrs || {})) {
+            const m = /^(.*)_indices$/.exec(key);
+            if (!m) continue;
+            const idx = Number(firstValue(group.attrs[key].value));
+            if (Number.isInteger(idx) && idx >= 0 && idx < rank) byIndex[idx] = m[1];
+        }
+        return byIndex;
+    }
+
+    // hkl or Cartesian-Q direction of an axis from its name, long_name and units.
+    function classifyAxis(name, longName, units) {
+        const proj = projectionVector(longName) || projectionVector(name);
+        if (proj) return { frame: 'hkl', dir: proj, pure: false };
+        const unit = c => [0, 1, 2].map(i => (i === c ? 1 : 0));
+        const u = String(units || '').toLowerCase().replace(/\s+/g, '');
+        const inverseAngstrom = /(angstrom|å|a)(\^?-1|⁻¹)|1\/(angstrom|å|a)|invangstrom/.test(u);
+        const letter = String(name || '').replace(/^q_?/i, '').toLowerCase();
+        if (/^[hkl]$/.test(letter) && !inverseAngstrom) return { frame: 'hkl', dir: unit('hkl'.indexOf(letter)), pure: true };
+        if (/^[xyz]$/.test(letter) && (inverseAngstrom || /^q/i.test(name))) {
+            return { frame: 'Q', dir: unit('xyz'.indexOf(letter)), pure: true };
+        }
+        const ln = /^\s*([HKL])\b/i.exec(String(longName || ''));
+        if (ln) return { frame: 'hkl', dir: unit('hkl'.indexOf(ln[1].toLowerCase())), pure: true };
+        return null;
+    }
+
+    function readNexusMeta(f, dataPath) {
+        const parts = dataPath.split('/').filter(Boolean);
+        const entries = [];
+        for (let i = parts.length - 1; i >= 1; i--) entries.push('/' + parts.slice(0, i).join('/'));
+        if (!entries.includes('/entry') && f.get('entry')) entries.push('/entry');
+        const meta = {};
+        const text = p => datasetText(f, p);
+        for (const e of entries) {
+            const s = e + '/sample/';
+            const abc = ['a', 'b', 'c', 'alpha', 'beta', 'gamma'].map(n => firstNumber(f, s + 'unitcell_' + n));
+            const six = numbersAt(f, s + 'unit_cell');
+            const lengths = numbersAt(f, s + 'unit_cell_abc');
+            const angles = numbersAt(f, s + 'unit_cell_alphabetagamma');
+            if (!meta.cell) {
+                if (abc.every(x => x !== null)) meta.cell = abc;
+                else if (six && six.length >= 6) meta.cell = six.slice(0, 6);
+                else if (lengths && angles && lengths.length >= 3 && angles.length >= 3) {
+                    meta.cell = lengths.slice(0, 3).concat(angles.slice(0, 3));
+                }
+            }
+            if (meta.temperature === undefined) {
+                const t = firstNumber(f, s + 'temperature');
+                if (t !== null) meta.temperature = t;
+            }
+            if (!meta.laueGroup && text(s + 'laue_group')) meta.laueGroup = text(s + 'laue_group');
+            if (!meta.spaceGroup && text(s + 'space_group')) meta.spaceGroup = text(s + 'space_group');
+            if (meta.wavelength === undefined) {
+                const w = firstNumber(f, e + '/instrument/monochromator/wavelength');
+                if (w !== null) meta.wavelength = w;
+            }
+            if (!meta.radiation && text(e + '/instrument/source/probe')) {
+                meta.radiation = normalizeRadiation(text(e + '/instrument/source/probe'));
+            }
+        }
+        return meta;
+    }
+
+    // Read one NXdata group (opts.path, else the @default one) as a model.
+    // hkl axes (letters, "H (r.l.u.)" or projections like "[H,H,0]") give an
+    // hkl grid; Cartesian Qx/Qy/Qz axes in 1/Angstrom give axesType 'Q'.
+    async function readNexusData(f, opts) {
+        opts = opts || {};
+        const candidates = nexusCandidates(f);
+        const pick = opts.path ? candidates.find(c => c.path === opts.path) : candidates[0];
+        if (!pick) throw new Error(opts.path ? `no NXdata group ${opts.path}` : 'no NXdata group with a signal found');
+        const group = f.get(pick.path);
+        const sig = group.get(pick.signal);
+        if (isExternalLink(sig)) {
+            throw new Error(`${pick.path}/${pick.signal} is stored in "${sig.filename}"; select that file ` +
+                'together with this one');
+        }
+        const shape = Array.from(sig.shape).map(Number);
+        if (shape.length > 3) {
+            throw new Error(`${pick.path}/${pick.signal} is ${shape.length}-D (${shape.join(' x ')}); ` +
+                'only 1- to 3-D data can be converted');
+        }
+        const rank = shape.length;
+        const notes = [`NeXus data ${pick.path} (signal "${pick.signal}", ${shape.join(' x ')})`];
+        const names = axisNamesOf(group, sig, rank);
+        const axes = names.map((name, d) => {
+            if (!name) throw new Error(`${pick.path}: dimension ${d} has no axis`);
+            const ds = group.get(name);
+            if (isExternalLink(ds)) throw new Error(`${pick.path}/${name} is stored in "${ds.filename}"`);
+            if (!isDataset(ds)) throw new Error(`${pick.path}: axis "${name}" not found`);
+            const longName = attributeText(ds, 'long_name');
+            const kind = classifyAxis(name, longName, attributeText(ds, 'units'));
+            if (!kind) {
+                throw new Error(`${pick.path}: axis "${name}" is not an hkl or Q axis ` +
+                    '(expected names like h/k/l, Qh/Qk/Ql, Qx/Qy/Qz or "[H,H,0]")');
+            }
+            const values = numbersAt(f, `${pick.path}/${name}`);
+            return Object.assign({ name, longName }, kind, uniformAxis(values, shape[d], `axis ${name}`));
+        });
+        const frames = new Set(axes.map(a => a.frame));
+        if (frames.size !== 1) throw new Error(`${pick.path}: axes mix hkl and Q`);
+        const frame = axes[0].frame;
+
+        // Model axes: h, k, l order for plain letter axes, else fastest first.
+        const pure = axes.every(a => a.pure) && new Set(axes.map(a => a.dir.indexOf(1))).size === rank;
+        let axisOfDim = pure ? axes.map(a => a.dir.indexOf(1)) : axes.map((_, d) => rank - 1 - d);
+        if (rank < 3) {
+            const free = [0, 1, 2].filter(a => !axisOfDim.includes(a));
+            axisOfDim = axisOfDim.concat(free.slice(0, 3 - rank));
+        }
+        const read = await readPermuted(sig, `${pick.path}/${pick.signal}`, axisOfDim, opts);
+        const values = read.values;
+        const dims = read.dims;
+        const corner = [0, 0, 0];
+        const vectors = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+        axes.forEach((a, d) => {
+            const axis = axisOfDim[d];
+            for (let c = 0; c < 3; c++) {
+                corner[c] += a.dir[c] * a.first;
+                vectors[axis][c] = dims[axis] > 1 ? a.dir[c] * a.step : 0;
+            }
+        });
+        if (axes.some(a => a.edges)) notes.push('axes hold bin edges; grid points are the bin centres');
+
+        const weights = group.get('weights');
+        if (isDataset(weights) && sameShape(Array.from(weights.shape).map(Number), shape)) {
+            const w = (await readPermuted(weights, `${pick.path}/weights`, axisOfDim, { tick: opts.tick })).values;
+            let zero = 0;
+            for (let i = 0; i < values.length; i++) {
+                if (w[i] > 0) values[i] /= w[i];
+                else { values[i] = NaN; zero++; }
+            }
+            notes.push('signal divided by "weights"' + (zero ? `; ${zero} voxels with zero weight set to NaN` : ''));
+        }
+
+        const meta = readNexusMeta(f, pick.path);
+        let lengths = [1, 1, 1], angles = [90, 90, 90];
+        if (meta.cell && meta.cell[0] > 0 && meta.cell[1] > 0 && meta.cell[2] > 0) {
+            lengths = meta.cell.slice(0, 3);
+            angles = meta.cell.slice(3, 6);
+        } else if (frame === 'hkl') {
+            notes.push('no unit cell found in the file; supply the parent cell');
+        }
+        if (meta.wavelength !== undefined) notes.push(`wavelength ${meta.wavelength} Angstrom`);
+        if (meta.temperature !== undefined) notes.push(`temperature ${meta.temperature} K`);
+        if (meta.laueGroup) notes.push(`Laue group ${meta.laueGroup}`);
+        if (/symm/i.test(pick.path)) notes.push('the data are symmetrized (NXrefine symm_transform)');
+        const missing = countNonFinite(values);
+        if (missing) notes.push(`${missing} of ${values.length} voxels hold no data (NaN)`);
+        return {
+            dims, corner, vectors, values, cellLengths: lengths, cellAngles: angles,
+            radiation: meta.radiation || 'unknown', axes: pickAxes(vectors, dims),
+            axesType: frame === 'Q' ? 'Q' : 'hkl', notes, nexusPath: pick.path,
         };
     }
 
@@ -1530,7 +2000,8 @@
     return {
         cellToLattice, latticeToCell, reciprocalBasis, hklToQ, qToHkl, isUnitMetric, modelAxesToHkl,
         parseRmc6f, readUnifiedStructure, isHdf5Signature,
-        detectH5Kind, readUnifiedData, readYell,
+        detectH5Kind, unsupportedKindMessage, readUnifiedData, readYell,
+        readMantidMD, readNexusData, nexusCandidates, unresolvedLinks, planLinkMounts, projectionVector,
         parseOldDat, readOldDatStream, writeOldDat, writeOldDatChunks, countNonFinite,
         isVtk, vtkFrame, parseGridConfig, parseVtk, readVtkStream, writeVtk, writeVtkChunks,
         toHklModel, resolveCell, planConversion, estimateOutputBytes, outputDtype,
