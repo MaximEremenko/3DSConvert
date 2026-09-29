@@ -172,7 +172,9 @@ remembered; by default the page follows the system).
    metric; see the table below.
 3. **Processing** (optional): add steps, start from a preset, or load a
    saved recipe. Each step opens to show its parameters, can be switched off
-   without losing them, moved and removed; see Processing below.
+   without losing them, dragged by its icon to another place, and removed;
+   Undo (or Ctrl+Z outside text fields) steps back through changes, and the
+   JSON view edits the whole recipe as text. See Processing below.
 4. **Output**: pick the format card; for HDF5 output, also the precision
    (the same as the input, float64 or float32), the unified layout (both
    `/scattering/data` and `/entry/data`, or `/entry/data` only, which
@@ -186,8 +188,12 @@ remembered; by default the page follows the system).
 (*After recipe* runs it once; Convert then reuses the result). A slider
 moves through the planes; the colour scale is viridis on a log or linear
 robust range, blue–orange and centred on zero for a 3D-ΔPDF, and grey marks
-voxels without data. Pointing at the slice reads out its coordinates and
-value.
+voxels without data; a histogram of the slice sits under it. Pointing at the
+slice reads out its coordinates and value; a click pins that point, and the
+other planes then go through it. The slice also works from the keyboard:
+arrow keys move a cursor, Enter pins it, Page Up and Page Down change the
+plane. The *|Q| profile* view plots the shell averages against |Q|, with
+their standard error, for the data as read or after the recipe.
 
 Text output (`.dat`, `.vtk`, profiles) is streamed directly to disk in
 browsers that support the File System Access API (Chromium); elsewhere a
