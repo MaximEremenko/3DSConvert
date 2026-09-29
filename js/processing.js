@@ -1061,6 +1061,23 @@
             return Object.assign(m, { lines: materialLines(m, radiation, qmax * 1.05) });
         });
         const centres = Float64Array.from({ length: nb }, (_, b) => rp.centre(b));
+        // only the bins near the lines (anywhere in the lattice search, with
+        // room for the widths and the high-pass) judge the fit: elsewhere the
+        // profile holds the sample's own structure, and in a symmetrized
+        // volume the shells near the origin hold a few distinct values whose
+        // tiny uncertainties would outweigh everything else
+        const nearLine = new Uint8Array(nb);
+        if (rp.coordU) {
+            const reach = Math.max(12, 2 * step.highPass);
+            for (const m of mats) {
+                for (const line of m.lines) {
+                    const lo = rp.coordU(line.q / (1 + step.refine)) - reach, hi = rp.coordU(line.q / Math.max(0.5, 1 - step.refine)) + reach;
+                    for (let b = Math.max(0, Math.floor(lo / rp.du)); b <= Math.min(nb - 1, Math.ceil(hi / rp.du)); b++) nearLine[b] = 1;
+                }
+            }
+        } else {
+            nearLine.fill(1);
+        }
         // in the profile's coordinate every line is one width wide: the
         // high-pass takes off what is broader than `highPass` line widths
         const highPass = x => {
@@ -1100,7 +1117,11 @@
             if (!prepared.has(prof)) {
                 const br = bridged(prof.level);
                 if (br) {
-                    const y = highPass(br.full), base = Float64Array.from(prof.err, e => (e < Infinity && e > 0 ? 1 / (e * e) : 0));
+                    // uncertainties at least a quarter of their median near the
+                    // lines (copies of one value by symmetry make them tiny)
+                    const errs = Float64Array.from([...prof.err.keys()].filter(b => nearLine[b] && prof.err[b] < Infinity && prof.err[b] > 0), b => prof.err[b]);
+                    const floor = errs.length ? 0.25 * medianOf(errs, errs.length) : 0;
+                    const y = highPass(br.full), base = Float64Array.from(prof.err, (e, b) => (nearLine[b] && e < Infinity && e > 0 ? 1 / Math.max(e, floor) ** 2 : 0));
                     // Huber's loss, quadratic up to 5 x the robust spread of
                     // the data themselves, then linear
                     const zs = Float64Array.from([...y.keys()].filter(b => base[b]), b => Math.abs(y[b]) * Math.sqrt(base[b]));
@@ -1371,7 +1392,7 @@
         ctx.log(`ring width sigma = sqrt(${s0.toPrecision(3)}^2 + (${r.toPrecision(3)} Q)^2) 1/A; ` +
             `the rings account for ${Math.round(100 * gain)} % of the high-passed |Q| profile` +
             (free ? `; ${fit.owner.length} line groups with intensities of their own` : ''));
-        if (!fit.x.some(t => t > 0)) ctx.log('no rings of these materials in the data; nothing subtracted');
+        if (!fit.x.some(t => t !== 0)) ctx.log('no rings of these materials in the data; nothing subtracted');
         // at a bound of the width search: the next pass looks further
         const atLimit = step.fitWidth && (s0 > 0.97 * sMax || s0 < 1.03 * sMax / 9 || r > 0.97 * rMax);
         const names = mats.map(m => m.name);
@@ -1467,24 +1488,39 @@
     // the next pass is made for them (at most three). Returns the result of
     // materialRings and the geometry of the voxels.
     function fitMaterialRings(model, step, ctx) {
-        let s0 = Math.max(step.sigma0, 1e-4), r0 = step.resolution, result = null, logs = [], geometry = null;
-        for (let pass = 0; pass < 3; pass++) {
-            const a0 = s0, b0 = r0;
-            const coord = {
-                u: q => (b0 > 0 ? Math.asinh(b0 * q / a0) / b0 : q / a0),
-                q: u => (b0 > 0 ? a0 / b0 * Math.sinh(b0 * u) : u * a0),
-                du: 0.25,
-            };
-            const rp = Object.assign(ringProfiles(model, ctx.cell, step, coord, geometry), { du: coord.du, s0init: a0, rinit: b0 });
-            geometry = rp.geometry;
-            logs = [];
-            result = materialRings(model, rp, step, Object.assign({}, ctx, { log: t => logs.push(t) }));
-            if (!result.atLimit) break;
-            s0 = Math.max(result.s0, 1e-4);
-            r0 = result.r;
+        const once = (st, geometryIn) => {
+            let s0 = Math.max(st.sigma0, 1e-4), r0 = st.resolution, result = null, logs = [], geometry = geometryIn;
+            for (let pass = 0; pass < 3; pass++) {
+                const a0 = s0, b0 = r0;
+                const coord = {
+                    u: q => (b0 > 0 ? Math.asinh(b0 * q / a0) / b0 : q / a0),
+                    q: u => (b0 > 0 ? a0 / b0 * Math.sinh(b0 * u) : u * a0),
+                    du: 0.25,
+                };
+                const rp = Object.assign(ringProfiles(model, ctx.cell, st, coord, geometry), { du: coord.du, s0init: a0, rinit: b0, coordU: coord.u });
+                geometry = rp.geometry;
+                logs = [];
+                result = materialRings(model, rp, st, Object.assign({}, ctx, { log: t => logs.push(t) }));
+                if (!result.atLimit) break;
+                s0 = Math.max(result.s0, 1e-4);
+                r0 = result.r;
+            }
+            return { result, geometry, logs };
+        };
+        let out = once(step, null);
+        if (step.positive && !out.result.lines.length) {
+            // no positive rings: an empty-can subtraction may have taken off
+            // more than the rings and left them negative
+            const signed = once(Object.assign({}, step, { positive: false }), out.geometry);
+            const negative = signed.result.lines.filter(x => x.height < 0).length;
+            if (signed.result.lines.length && 2 * negative >= signed.result.lines.length) {
+                ctx.log('no positive rings, but negative ones (an empty-can subtraction took off more than the rings): ' +
+                    'fitted with intensities of either sign');
+                out = signed;
+            }
         }
-        logs.forEach(t => ctx.log(t));
-        return { result, geometry };
+        out.logs.forEach(t => ctx.log(t));
+        return { result: out.result, geometry: out.geometry };
     }
 
     // Powder rings removed. With materials named (aluminium, ice, "fcc Al

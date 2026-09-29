@@ -461,7 +461,15 @@ they end at a bound. By default every line has an intensity of its own
 where it is significant (texture and absorption change the ratios) and a
 weak one keeps the structure-factor ratio. A material is left out, and
 logged, when its lines explain under 2 % of the high-passed profile, show
-no clear lattice match or give fewer than two significant lines. A sector
+no clear lattice match or give fewer than two significant lines. Only the
+bins near the lines (anywhere in the lattice search) judge the fit, and no
+uncertainty counts below a quarter of their median: in a symmetrized volume
+the shells near the origin hold copies of a few values, whose tiny
+uncertainties would otherwise outweigh the rings (on a CORELLI m-3m volume
+at 533 K aluminium was not found before). An empty-can subtraction that
+took off more than the rings leaves them negative: when a fit of positive
+rings finds none, one with either sign is tried and kept if most lines come
+out negative. A sector
 fits its own amplitudes when they beat one scale on the whole-shell lines
 by more than their number (Akaike's criterion); the subtraction blends the
 sectors smoothly by direction, so no seams are left. In binned data a voxel

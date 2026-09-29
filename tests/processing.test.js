@@ -541,6 +541,14 @@ test('removeRings of materials: aluminium lines from the structure, fitted and t
     // each line an intensity of its own does the same
     const free = await Processing.applyRecipe(data, { steps: [{ op: 'removeRings', materials: 'Al', intensities: 'free', voxelWidth: false }] }, { cell });
     assert.ok(near(free) < 0.08 * near(data));
+    // an empty-can subtraction that took off too much leaves the rings
+    // negative: with no positive rings, they are fitted with either sign
+    const over = Object.assign(grid(3, 0.1, (h, k, l) => smooth(h, k, l) - rings(Qof(h, k, l)) + 0.5 * (rnd() - 0.5)), { radiation: 'neutron' });
+    const negative = [];
+    const back = await Processing.applyRecipe(over, { steps: [{ op: 'removeRings', materials: 'aluminium', voxelWidth: false }] },
+        { cell, log: t => negative.push(t) });
+    assert.match(negative.join('\n'), /no positive rings, but negative ones/);
+    assert.ok(near(back) < 0.1 * near(over), `${near(over)} -> ${near(back)}`);
     // bright spots of large grains on the (111) ring: masked, the ring itself taken off
     const spotted = Object.assign({}, data, { values: Float64Array.from(data.values) }), spots = [];
     forHkl(spotted, (i, h, k, l) => {
