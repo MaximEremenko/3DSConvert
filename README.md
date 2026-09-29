@@ -463,9 +463,20 @@ logged, when its lines explain under 2 % of the high-passed profile, show
 no clear lattice match or give fewer than two significant lines. A sector
 fits its own amplitudes when they beat one scale on the whole-shell lines
 by more than their number (Akaike's criterion); the subtraction blends the
-sectors smoothly by direction, so no seams are left. On a CORELLI volume in
-an aluminium can, the fit gives a = 4.0491 Å (0.012 % from aluminium at
-300 K) and removes 95–105 % of the (111), (200) and (220) ring excess.
+sectors smoothly by direction, so no seams are left. In binned data a voxel
+holds the mean over its extent, which widens a line along the direction n
+by √(Σᵢ(qᵢ·n)²/12) (qᵢ the voxel's steps in Q); this term is on by default
+and is to be switched off for point-sampled, calculated volumes. A part of
+the sample environment off the sample position moves its lines with the
+direction: each sector may shift its lines (by up to 0.2 % by default),
+kept only when that fits better by more than its cost and by more than a
+tenth of a line width. Large grains (beryllium windows, annealed copper)
+leave bright spots on a ring that no smooth model takes off; *mask spots*
+then empties the voxels on a line's core more than four robust σ above the
+median of that line in that sector. On a CORELLI volume in an aluminium can
+the fit gives a = 4.0494 Å (0.006 % from aluminium at 300 K) and removes
+98–102 % of the (111), (200) and (220) ring excess. The *Sample-environment
+rings* preset runs it for aluminium and copper.
 
 Recommended order: subtract an empty-can measurement if there is one, then
 remove the remaining rings, then treat the Bragg peaks (mask, punch and

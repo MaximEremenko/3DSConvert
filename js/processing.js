@@ -292,7 +292,7 @@
         symmetrize: { mode: 'average', expand: true, k: 3 },
         removeRings: {
             materials: 'aluminium', temperature: 0, radiation: 'auto', intensities: 'free', refine: 0.01, fitWidth: true, sigma0: 0.005,
-            resolution: 0.004,
+            resolution: 0.004, voxelWidth: true, shift: 0.002, maskSpots: false,
             width: 0.005, cutoff: 0.05, highPass: 6, sectors: 8, coverage: 0.25, positive: true,
         },
         backgroundDebyeWaller: { radiation: 'auto', uiso: '0.01', fit: true, scale: 1, offset: false, percentile: 5, width: 0.05 },
@@ -733,7 +733,8 @@
             }
             return { level, err };
         };
-        return { nb, nsec, qs, sec, bin, w, voxelQ, profile, centre, geometry: { qs, sec } };
+        const steps = [qa, qb, qc].filter((_, a) => model.dims[a] > 1);
+        return { nb, nsec, qs, sec, bin, w, voxelQ, profile, centre, steps, geometry: { qs, sec } };
     }
 
     // |Q| of every voxel and its direction sector (null for one sector).
@@ -990,13 +991,15 @@
     }
 
     // Line profile of a material at bin centres (or any |Q|): Gaussians of
-    // unit area, width sqrt(s0^2 + (r Q)^2), at the lines' |Q| / lambda
+    // unit area, width sqrt(sv^2 + s0^2 + (r Q)^2) (sv: the voxel's own), at
+    // the lines' |Q| / lambda
     // (lambda: the ratio of the lattice parameter to the listed one).
-    function lineCurve(lines, lambda, s0, r) {
+    function lineCurve(lines, lambda, s0, r, sv) {
+        const v2 = (sv || 0) * (sv || 0);
         return q => {
             let sum = 0;
             for (const line of lines) {
-                const mu = line.q / lambda, s = Math.sqrt(s0 * s0 + r * r * mu * mu), d = (q - mu) / s;
+                const mu = line.q / lambda, s = Math.sqrt(v2 + s0 * s0 + r * r * mu * mu), d = (q - mu) / s;
                 if (d * d < 50) sum += line.strength * Math.exp(-0.5 * d * d) / (s * 2.5066282746310002);
             }
             return sum;
@@ -1061,7 +1064,7 @@
         };
         // columns of the model: one per material, or (free intensities) one
         // per group of lines closer than two widths
-        const columns = (lambdas, s0, r, free, skip) => {
+        const columns = (lambdas, s0, r, free, skip, sv) => {
             const cols = [], owner = [];
             mats.forEach((m, k) => {
                 if (skip && skip.has(k)) return;
@@ -1069,19 +1072,19 @@
                     let group = [];
                     const flush = () => {
                         if (!group.length) return;
-                        const curve = lineCurve(group, lambdas[k], s0, r);
+                        const curve = lineCurve(group, lambdas[k], s0, r, sv);
                         cols.push(Float64Array.from(centres, curve));
                         owner.push([k, group]);
                         group = [];
                     };
                     for (const line of m.lines) {
                         const last = group[group.length - 1];
-                        if (last && line.q / lambdas[k] - last.q / lambdas[k] > 2 * Math.hypot(s0, r * line.q)) flush();
+                        if (last && line.q / lambdas[k] - last.q / lambdas[k] > 2 * Math.hypot(s0, r * line.q, sv || 0)) flush();
                         group.push(line);
                     }
                     flush();
                 } else {
-                    cols.push(Float64Array.from(centres, lineCurve(m.lines, lambdas[k], s0, r)));
+                    cols.push(Float64Array.from(centres, lineCurve(m.lines, lambdas[k], s0, r, sv)));
                     owner.push([k, m.lines]);
                 }
             });
@@ -1105,13 +1108,23 @@
             const pre = prepared.get(prof);
             if (!pre) return null;
             const { y, base, c: hc } = pre;
-            const { cols, owner } = columns(lambdas, s0, r, free, skip);
+            const { cols, owner } = columns(lambdas, s0, r, free, skip, prof.sv);
             const hp = cols.map(highPass);
             const resid = x => Float64Array.from(y, (yb, b) => (base[b] ? (yb - hp.reduce((s, c, i) => s + x[i] * c[b], 0)) * Math.sqrt(base[b]) : NaN));
             let wt = base, fit = null, z = null;
             const signed = !step.positive;
+            // a line whose profile lies mostly off the judged bins (the edge
+            // of the data, a gap) would only explain noise with its tail
+            const inside = hp.map(c => {
+                let on = 0, all = 0;
+                for (let b = 0; b < nb; b++) {
+                    all += c[b] * c[b];
+                    if (base[b]) on += c[b] * c[b];
+                }
+                return all > 0 && on >= 0.3 * all;
+            });
             for (let it = 0; it < 3; it++) {
-                fit = nonNegative(hp, y, wt, null, signed);
+                fit = nonNegative(hp, y, wt, inside, signed);
                 // Huber reweighting of the standardized residuals: what the
                 // lines cannot explain (diffuse leakage) counts less, but
                 // nothing is dropped
@@ -1130,7 +1143,7 @@
                     used++;
                 }
                 const s2 = ssr / Math.max(1, used - fit.idx.length);
-                const keep = new Array(hp.length).fill(false);
+                const keep = new Array(hp.length).fill(false);   // (off lines stay out: they are not in fit.idx)
                 fit.idx.forEach((i, k) => {
                     const e = new Array(fit.idx.length).fill(0);
                     e[k] = 1;
@@ -1159,9 +1172,9 @@
         const sectorShare = (prof, x, lambdas, s0, r, free, skip) => {
             const f = fitProfile(prof, lambdas, s0, r, free, false, skip);
             if (!f) return { t: 1, loss: Infinity };
-            const pre = prepared.get(prof), { cols } = columns(lambdas, s0, r, free, skip);
+            const pre = prepared.get(prof), { cols } = columns(lambdas, s0, r, free, skip, prof.sv);
             const sum = highPass(Float64Array.from(centres, (_, b) => cols.reduce((acc, c, i) => acc + x[i] * c[b], 0)));
-            const t = nonNegative([sum], pre.y, pre.base).x[0] || 0;
+            const t = Math.min(10, nonNegative([sum], pre.y, pre.base).x[0] || 0);
             let loss = 0;
             for (let b = 0; b < nb; b++) {
                 if (!pre.base[b]) continue;
@@ -1170,7 +1183,12 @@
             }
             return { t: t > 0 ? t : 1, loss };
         };
-        const whole = rp.profile(-1);
+        // a voxel holds the mean over its extent: along the direction n a
+        // line is widened by sqrt(sum_i (q_i . n)^2 / 12), q_i its steps in
+        // Q; over whole shells by sqrt(sum_i |q_i|^2 / 36)
+        const svOf = n => (step.voxelWidth ? Math.sqrt(rp.steps.reduce((acc, q) => acc + (q[0] * n[0] + q[1] * n[1] + q[2] * n[2]) ** 2, 0) / 12) : 0);
+        const svAvg = step.voxelWidth ? Math.sqrt(rp.steps.reduce((acc, q) => acc + q[0] * q[0] + q[1] * q[1] + q[2] * q[2], 0) / 36) : 0;
+        const whole = Object.assign(rp.profile(-1), { sv: svAvg });
         let lambdas = mats.map(() => 1), s0 = rp.s0init, r = step.resolution;
         const objective = () => {
             const f = fitProfile(whole, lambdas, s0, r);
@@ -1252,9 +1270,9 @@
         // lines of their own intensity keep it where it is significant; a
         // weak line takes what the structure factors give it at the scale
         // the material has in the same profile
-        const fillWeak = (f, prof) => {
+        const fillWeak = (f, prof, lam) => {
             if (!free || !f) return f;
-            const g = fitProfile(prof, lambdas, s0, r, false, true, skip);
+            const g = fitProfile(prof, lam || lambdas, s0, r, false, true, skip);
             if (!g) return f;
             const scale = k => {
                 const i = g.owner.findIndex(([owner]) => owner === k);
@@ -1264,21 +1282,58 @@
         };
         fit = fillWeak(fit, whole);
         // scales of every column, per sector when asked
-        const sectorScale = [];
+        const sectorScale = [], sectorLambda = [], sectorSv = [], shifts = [];
+        const dirs = nsec > 1 ? sphereDirections(nsec) : null;
         let shared = 0;
         for (let s = 0; s < nsec; s++) {
             if (nsec === 1) {
                 sectorScale.push(fit.x);
+                sectorLambda.push(lambdas);
+                sectorSv.push(svAvg);
                 continue;
             }
-            const prof = rp.profile(s);
-            const f = fillWeak(fitProfile(prof, lambdas, s0, r, free, true, skip), prof);
-            const one = sectorShare(prof, fit.x, lambdas, s0, r, free, skip);
+            const prof = Object.assign(rp.profile(s), { sv: svOf(dirs[s]) });
+            sectorSv.push(prof.sv);
+            // a component off the sample position moves its lines with the
+            // direction: a shift of this sector's lines, kept when it fits
+            // better by more than its cost (Akaike, one parameter)
+            let mu = 1;
+            if (step.shift > 0) {
+                const lossAt = m => {
+                    const g = fitProfile(prof, lambdas.map(l => l * m), s0, r, false, false, skip);
+                    return g ? g.loss : Infinity;
+                };
+                const g1 = fitProfile(prof, lambdas, s0, r, false, false, skip);
+                const at1 = g1 ? g1.loss : Infinity, red = g1 ? Math.max(1, g1.loss / Math.max(1, g1.judged)) : 1;
+                let best = 1, fb = at1;
+                for (let i = 0; i <= 12; i++) {
+                    const m = 1 - step.shift + 2 * step.shift * i / 12, f = lossAt(m);
+                    if (f < fb) { fb = f; best = m; }
+                }
+                let lo = Math.max(1 - step.shift, best - step.shift / 6), hi = Math.min(1 + step.shift, best + step.shift / 6);
+                const g = (Math.sqrt(5) - 1) / 2;
+                for (let it = 0; it < 16; it++) {
+                    const c = hi - g * (hi - lo), d = lo + g * (hi - lo);
+                    if (lossAt(c) < lossAt(d)) hi = d; else lo = c;
+                }
+                const m = (lo + hi) / 2;
+                // and only a shift worth a tenth of a line width
+                const rel = Math.hypot(prof.sv || 0, s0, r * qLow) / qLow;
+                if ((at1 - lossAt(m)) / red > 2 && Math.abs(m - 1) > 0.1 * rel) mu = m;
+            }
+            shifts.push(mu);
+            const lam = lambdas.map(l => l * mu);
+            sectorLambda.push(lam);
+            const f = fillWeak(fitProfile(prof, lam, s0, r, free, true, skip), prof, lam);
+            const one = sectorShare(prof, fit.x, lam, s0, r, free, skip);
             // lines of the sector's own only when they fit better than one
             // scale by more than their number (Akaike's criterion); else the
             // whole-shell lines with one texture factor
             const own = f ? f.x.filter(t => t !== 0).length : 0;
-            if (f && f.judged >= 30 && own > 0 && one.loss - f.loss > 2 * (own - 1)) {
+            const red = f ? Math.max(1, f.loss / Math.max(1, f.judged - own)) : 1;
+            const top = Math.max(...fit.x.map(Math.abs));
+            const sane = f && f.x.every((x, i) => Math.abs(x) <= 20 * Math.max(Math.abs(fit.x[i]), 0.05 * top));
+            if (f && sane && f.judged >= 30 && own > 0 && (one.loss - f.loss) / red > 2 * (own - 1)) {
                 sectorScale.push(f.x);
                 continue;
             }
@@ -1286,6 +1341,12 @@
             sectorScale.push(fit.x.map(x => x * one.t));
         }
         if (shared) ctx.log(`${shared} of ${nsec} direction sectors take the whole-shell lines with a scale of their own`);
+        const moved = shifts.filter(m => m !== 1);
+        if (moved.length) {
+            ctx.log(`${moved.length} of ${nsec} direction sectors have their lines shifted, by ` +
+                `${(100 * (Math.min(...moved) - 1)).toFixed(3)} to ${(100 * (Math.max(...moved) - 1)).toFixed(3)} % of |Q| ` +
+                '(a part off the sample position, or a cell that is off along some directions)');
+        }
         const gain = fit.before > 0 ? 1 - fit.loss / fit.before : 0;
         mats.forEach((m, k) => {
             if (skip.has(k)) return;
@@ -1312,16 +1373,16 @@
         // ring intensity per voxel: per sector, the fitted columns summed on
         // a fine |Q| table
         const fine = Math.max(2e-5, Math.hypot(s0, r * qLow) / 10), nf = Math.ceil(qmax * 1.05 / fine) + 2;
-        const curves = fit.owner.map(([k, lines]) => lineCurve(lines, lambdas[k], s0, r));
-        const colTables = curves.map(f => Float64Array.from({ length: nf }, (_, i) => f(i * fine)));
-        const tables = sectorScale.map(x => Float64Array.from({ length: nf }, (_, i) => colTables.reduce((sum, t, c) => sum + x[c] * t[i], 0)));
+        const tables = sectorScale.map((x, sct) => {
+            const curves = fit.owner.map(([k, lines], c) => (x[c] ? lineCurve(lines, sectorLambda[sct][k], s0, r, sectorSv[sct]) : null));
+            return Float64Array.from({ length: nf }, (_, i) => curves.reduce((sum, f, c) => (f ? sum + x[c] * f(i * fine) : sum), 0));
+        });
         const at = (table, q) => {
             const f = q / fine, i0 = Math.min(nf - 2, Math.floor(f)), t = f - i0;
             return (1 - t) * table[i0] + t * table[i0 + 1];
         };
         // between sectors the tables are blended with weights exp(kappa
         // cos angle) to the sector centres, so no seams are left
-        const dirs = nsec > 1 ? sphereDirections(nsec) : null;
         const kappa = nsec > 1 ? 2 / (1 - Math.cos(Math.sqrt(4 * Math.PI / nsec))) : 0;
         const ring = (j, n) => {
             const q = rp.qs[j];
@@ -1334,7 +1395,60 @@
             }
             return sum / wsum;
         };
-        return { ring, s0, r, atLimit };
+        // the cores of the lines taken off: |Q| and width
+        const cores = [];
+        fit.owner.forEach(([k, lines], c) => {
+            if (!fit.x[c]) return;
+            for (const line of lines) {
+                const q = line.q / lambdas[k];
+                cores.push({ q, s: Math.sqrt(svAvg * svAvg + s0 * s0 + r * r * q * q) });
+            }
+        });
+        return { ring, s0, r, atLimit, cores: cores.sort((x, y) => x.q - y.q) };
+    }
+
+    // Large grains (beryllium windows, annealed copper) make spotty rings
+    // that a smooth model cannot take off: on the cores of the lines
+    // (within 1.5 widths), per direction sector and line, voxels more than
+    // four robust sigma (1.4826 x MAD) above the median are masked.
+    function maskSpots(values, geometry, cores, nsk) {
+        if (!cores.length) return 0;
+        const { qs, sec } = geometry, N = values.length, nc = cores.length;
+        const coreOf = q => {
+            let lo = 0, hi = nc - 1;
+            while (lo < hi) {
+                const mid = (lo + hi) >> 1;
+                if (cores[mid].q < q) lo = mid + 1; else hi = mid;
+            }
+            for (const i of [lo - 1, lo]) if (i >= 0 && i < nc && Math.abs(q - cores[i].q) < 1.5 * cores[i].s) return i;
+            return -1;
+        };
+        const key = new Int32Array(N).fill(-1), counts = new Int32Array(nsk * nc + 1);
+        for (let j = 0; j < N; j++) {
+            if (values[j] !== values[j]) continue;
+            const c = coreOf(qs[j]);
+            if (c < 0) continue;
+            key[j] = (sec ? sec[j] : 0) * nc + c;
+            counts[key[j] + 1]++;
+        }
+        for (let t = 0; t < nsk * nc; t++) counts[t + 1] += counts[t];
+        const members = new Int32Array(counts[nsk * nc]), at = counts.slice(0, nsk * nc);
+        for (let j = 0; j < N; j++) if (key[j] >= 0) members[at[key[j]]++] = j;
+        let masked = 0;
+        for (let t = 0; t < nsk * nc; t++) {
+            const idx = members.subarray(counts[t], counts[t + 1]);
+            if (idx.length < 10) continue;
+            const v = Float64Array.from(idx, j => values[j]), med = medianOf(Float64Array.from(v), v.length);
+            const mad = 1.4826 * medianOf(Float64Array.from(v, x => Math.abs(x - med)), v.length);
+            if (!(mad > 0)) continue;
+            for (let i = 0; i < idx.length; i++) {
+                if (v[i] > med + 4 * mad) {
+                    values[idx[i]] = NaN;
+                    masked++;
+                }
+            }
+        }
+        return masked;
     }
 
     // Powder rings removed. With materials named (aluminium, ice, "fcc Al
@@ -1388,6 +1502,7 @@
                 r0 = result.r;
             }
             logs.forEach(t => ctx.log(t));
+            const cores = result.cores || [];
             // the direction of every voxel, for the blend between sectors
             const Qm = qMatrix(ctx.cell), q0 = mulMV(Qm, model.corner), [qa, qb, qc] = model.vectors.map(u => mulMV(Qm, u));
             const [nh, nk, nl] = model.dims, n = [0, 0, 0];
@@ -1405,6 +1520,10 @@
                         n[2] = z / q;
                         values[j] -= result.ring(j, q > 0 ? n : null);
                     }
+            if (step.maskSpots) {
+                const masked = maskSpots(values, geometry, cores, Math.max(1, Math.round(step.sectors)));
+                ctx.log(`${masked} voxels on the ring cores masked as spots (large grains)`);
+            }
         }
         return withValues(model, values);
     }
@@ -2713,7 +2832,7 @@ D|0.413048 0.294953 0.187491 0.080701 0.023736 15.56995 32.39847 5.711404 61.889
             fields: {
                 materials: 'any', temperature: 'nonnegative', radiation: 'radiation', intensities: 'ringIntensities', refine: 'fraction', fitWidth: 'boolean',
                 sigma0: 'nonnegative', resolution: 'nonnegative', width: 'positive', cutoff: 'positive', highPass: 'positive', sectors: 'sectors', coverage: 'fraction',
-                positive: 'boolean',
+                positive: 'boolean', voxelWidth: 'boolean', shift: 'fraction', maskSpots: 'boolean',
             },
         },
         scale: { run: stepScale, fields: { factor: 'number', offset: 'number', positive: 'boolean' } },
@@ -2826,7 +2945,8 @@ D|0.413048 0.294953 0.187491 0.080701 0.023736 15.56995 32.39847 5.711404 61.889
                   'lines from the structure, fitted to the |Q| profile ' +
                   `high-passed at ${step.highPass} line widths (${step.intensities === 'free' ? 'free' : 'structure-factor'} intensities` +
                   `${step.refine > 0 ? `, lattice within ${+(100 * step.refine).toFixed(2)} %` : ''}${step.fitWidth ? ', widths fitted' : ''}` +
-                  `${step.sectors > 1 ? `, ${step.sectors} direction sectors` : ''})`;
+                  `${step.sectors > 1 ? `, ${step.sectors} direction sectors${step.shift > 0 ? ` shifting up to ${+(100 * step.shift).toFixed(2)} %` : ''}` : ''}` +
+                  `${step.maskSpots ? ', spots on the rings masked' : ''})`;
             case 'maskQ': return `mask |Q| outside ${step.min === undefined || step.min === null ? 0 : step.min}..${step.max === undefined || step.max === null ? 'inf' : step.max} 1/A`;
             case 'despike': return step.k > 0
                 ? `despike: voxels beyond ${step.k} robust sigma of the median of their ${step.size === 2 ? '5 x 5 x 5' : '3 x 3 x 3'} neighbourhood take that median`

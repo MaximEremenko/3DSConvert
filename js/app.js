@@ -924,6 +924,9 @@
       ['highPass', 'num', 'Fourier high-pass: broader than this many line widths is background'],
       ['sectors', 'num', 'direction sectors (1 = whole shells)'], ['coverage', 'num', 'judge only shells covered at least this much (0–1)'],
       ['cutoff', 'num', 'any: remove what is sharper in |Q| than (Å⁻¹)'], ['width', 'num', 'any: |Q| profile bin (Å⁻¹)'],
+      ['voxelWidth', 'bool', 'widen the lines by the voxel size along each direction (binned data)'],
+      ['shift', 'num', 'let each direction sector shift its lines by up to (fraction; a part off the sample position)'],
+      ['maskSpots', 'bool', 'mask bright spots left on the rings (large grains)'],
       ['positive', 'bool', 'only positive rings (off after an empty-can subtraction, which can leave negative ones)']]],
     backgroundDebyeWaller: ['Background: Laue + thermal (Debye–Waller)', [
       ['composition', 'text', 'sites, e.g. Pb; Mg 0.333 + Nb 0.667; 3*O'], ['uiso', 'text', 'Uiso (Å²): one value, or e.g. 0.01, Pb 0.03'],
@@ -984,7 +987,8 @@
     normalize: { background: '', backgroundNorm: '', scale: 1, fitScale: false, laue: 'none' },
     maskQ: { min: 0.3 },
     removeRings: { materials: 'aluminium', temperature: 0, radiation: 'auto', intensities: 'free', refine: 0.01, fitWidth: true, sigma0: 0.005,
-      resolution: 0.004, highPass: 6, sectors: 8, coverage: 0.25, cutoff: 0.05, width: 0.005, positive: true },
+      resolution: 0.004, voxelWidth: true, shift: 0.002, maskSpots: false, highPass: 6, sectors: 8, coverage: 0.25, cutoff: 0.05, width: 0.005,
+      positive: true },
     backgroundDebyeWaller: { composition: '', uiso: '0.01', radiation: 'auto', fit: true, percentile: 5, width: 0.05, offset: false, scale: 1 },
     correctUB: { mode: 'refine', centring: 'P', radius: 0.25, snr: 10, peaks: 300, shift: false, ub: [], ubNew: [] },
     despike: { size: 1, k: 5 }, window: { kind: 'lorch', qmax: 0 },
@@ -993,20 +997,19 @@
     { name: '3D-ΔPDF of a cubic crystal', note: 'm-3m symmetrize · Bragg mask · ΔPDF', steps: [
       { op: 'symmetrize', laue: 'm-3m', mode: 'average', k: 3, expand: true },
       { op: 'maskBragg', shape: 'box', size: 0.2, centring: 'P' }, { op: 'deltaPdf', taper: 0, engine: 'cpu' }] },
-    { name: 'Clean up a volume', note: 'despike · aluminium rings · symmetrize without outliers', steps: [
-      { op: 'despike', size: 1, k: 5 }, { op: 'removeRings', materials: 'aluminium', temperature: 0, radiation: 'auto', intensities: 'free', refine: 0.01,
-        fitWidth: true, sigma0: 0.005, resolution: 0.004, highPass: 6, sectors: 8, coverage: 0.25, cutoff: 0.05, width: 0.005, positive: true },
+    { name: 'Clean up a volume', note: 'despike · sample-environment rings · symmetrize without outliers', steps: [
+      { op: 'despike', size: 1, k: 5 }, { op: 'removeRings', materials: 'aluminium, copper', temperature: 0, radiation: 'auto', intensities: 'free', refine: 0.01,
+        fitWidth: true, sigma0: 0.005, resolution: 0.004, voxelWidth: true, shift: 0.002, maskSpots: false, highPass: 6, sectors: 8,
+        coverage: 0.25, cutoff: 0.05, width: 0.005, positive: true },
       { op: 'symmetrize', laue: 'm-3m', mode: 'clip', k: 3, expand: true }] },
     { name: 'Subtract a background volume', note: 'load it under Other volumes', steps: [
       { op: 'combine', operation: 'subtract', scale: 1 }] },
     { name: 'Diffuse scattering only', note: 'Bragg mask · background from |Q| shells', steps: [
       { op: 'maskBragg', shape: 'box', size: 0.1, centring: 'P' }, { op: 'backgroundShells', width: 0.05, percentile: 5, smooth: 1 }] },
-    { name: 'CORELLI → RMCProfile .dat', note: 'positive · Al rings · shell background · clip · Bragg mask', steps: [
-      { op: 'scale', factor: 1, offset: 0, positive: true },
-      { op: 'maskRings', powder: 'aluminium', q: [], width: 0.03 },
-      { op: 'backgroundShells', width: 0.05, percentile: 0, smooth: 2 },
-      { op: 'clip', below: 0, to: 0.001 },
-      { op: 'maskBragg', shape: 'box', size: 0.1, centring: 'P' }] },
+    { name: 'Sample-environment rings', note: 'aluminium and copper lines from their structures, fitted and taken off', steps: [
+      { op: 'removeRings', materials: 'aluminium, copper', temperature: 0, radiation: 'auto', intensities: 'free', refine: 0.01,
+        fitWidth: true, sigma0: 0.005, resolution: 0.004, voxelWidth: true, shift: 0.002, maskSpots: false, highPass: 6, sectors: 8,
+        coverage: 0.25, cutoff: 0.05, width: 0.005, positive: true }] },
   ];
 
   for (const [group, ops] of STEP_GROUPS) {

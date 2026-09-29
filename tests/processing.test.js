@@ -525,7 +525,7 @@ test('removeRings of materials: aluminium lines from the structure, fitted and t
         return s / c;
     };
     const logs = [];
-    const out = await Processing.applyRecipe(data, { steps: [{ op: 'removeRings', materials: 'aluminium, copper, ice' }] },
+    const out = await Processing.applyRecipe(data, { steps: [{ op: 'removeRings', materials: 'aluminium, copper, ice', voxelWidth: false }] },
         { cell, log: t => logs.push(t) });
     const text = logs.join('\n');
     const fitted = /aluminium: a = ([\d.]+) A/.exec(text);
@@ -539,11 +539,24 @@ test('removeRings of materials: aluminium lines from the structure, fitted and t
     });
     assert.ok(far / n < 0.2, `away from the lines ${far / n}`);
     // each line an intensity of its own does the same
-    const free = await Processing.applyRecipe(data, { steps: [{ op: 'removeRings', materials: 'Al', intensities: 'free' }] }, { cell });
+    const free = await Processing.applyRecipe(data, { steps: [{ op: 'removeRings', materials: 'Al', intensities: 'free', voxelWidth: false }] }, { cell });
     assert.ok(near(free) < 0.08 * near(data));
+    // bright spots of large grains on the (111) ring: masked, the ring itself taken off
+    const spotted = Object.assign({}, data, { values: Float64Array.from(data.values) }), spots = [];
+    forHkl(spotted, (i, h, k, l) => {
+        if (Math.abs(Qof(h, k, l) - lines[0][0]) < 0.01 && rnd() < 0.2) {
+            spotted.values[i] += 300;
+            spots.push(i);
+        }
+    });
+    const cleaned = await Processing.applyRecipe(spotted, { steps: [{ op: 'removeRings', materials: 'aluminium', voxelWidth: false, maskSpots: true }] }, { cell });
+    const hit = spots.filter(i => Number.isNaN(cleaned.values[i])).length;
+    let others = 0;
+    for (let i = 0; i < cleaned.values.length; i++) if (Number.isNaN(cleaned.values[i]) && !Number.isNaN(spotted.values[i])) others++;
+    assert.ok(spots.length > 10 && hit >= 0.9 * spots.length && others - hit < 0.1 * spots.length, `${hit} of ${spots.length} spots, ${others - hit} others`);
     // aluminium near 5 K is 0.42 % smaller: the fit then reports how far the |Q| scale is off
     const cold = [];
-    await Processing.applyRecipe(data, { steps: [{ op: 'removeRings', materials: 'aluminium', temperature: 5 }] },
+    await Processing.applyRecipe(data, { steps: [{ op: 'removeRings', materials: 'aluminium', temperature: 5, voxelWidth: false }] },
         { cell, log: t => cold.push(t) });
     const check = /aluminium at 5 K should have a = (4\.03\d+) A; the fit differs by ([\d.]+) %/.exec(cold.join(' '));
     assert.ok(check && Math.abs(Number(check[2]) - 100 * (aAl / Number(check[1]) - 1)) < 0.05, cold.join('\n'));
