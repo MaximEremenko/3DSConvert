@@ -202,6 +202,27 @@ python -m http.server
 
 then browse to `http://localhost:8000/`.
 
+### Command line
+
+The same readers, processing and writers run from Node.js 22 or later,
+for scripts, series and outputs above the browser's 2 GB:
+
+```
+node cli/3dsconvert.js data.nxs --to unified
+node cli/3dsconvert.js scan_*.nxs --to npz --out-dir converted --crop h=-6:6,k=-6:6,l=-2:2
+node cli/3dsconvert.js data.nxs --to unified --recipe corelli.json --extra background.nxs
+node cli/3dsconvert.js data.dat --to vti --structure model.rmc6f
+```
+
+`--help` lists the options: they are the page's (cell, structure file,
+recipe and its extra volumes, crop on read, uncertainties, precision,
+layout, gzip, the per-format choices). Several inputs are converted one
+after another with the same settings, and a file that fails does not stop
+the others; the exit code is 1 if any failed. Text output is streamed to
+disk; HDF5 output is built in memory, so its size is limited by the RAM
+(a 2.9 GB unified file from a 1.1 GB Mantid workspace took 16 s). Existing
+files are kept unless `--force` is given.
+
 ## Usage
 
 The page is a workspace: four cards on the left (data, unit cell,
@@ -392,6 +413,8 @@ in all files, so results are easy to compare.
   the canonical copy of a library shared with the companion browser tools
   (see Provenance).
 - `js/h5wasm.js` — vendored h5wasm bundle (see Third-party code).
+- `cli/3dsconvert.js` — the command-line tool: runs the worker core in
+  Node.js, reading input files from disk as needed.
 - `Examples/` — the example dataset described above.
 - `tests/` — Node.js regression tests and a browser test (see Validation).
 

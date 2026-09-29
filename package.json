@@ -3,6 +3,9 @@
   "private": true,
   "description": "Browser-based converter for 3-D single-crystal diffuse-scattering data",
   "license": "Apache-2.0",
+  "bin": {
+    "3dsconvert": "cli/3dsconvert.js"
+  },
   "engines": {
     "node": ">=22"
   },
