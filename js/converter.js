@@ -22,11 +22,21 @@
  *   Yell /data                C dims [nh,nk,nl]  (flat: l fastest)
  *   /scattering/data/step_vectors      flat[axis*3 + comp]
  *   /entry/data/data_increment_vector  flat[comp*3 + axis]
+ * Readers also accept the transposed /scattering/data layout of the
+ * write_diffuse_scattering.py reference writer (C dims [nh,nk,nl],
+ * step_vectors flat[comp*3 + axis]) when the shape or the NeXus
+ * AXISNAME_indices attributes identify it, including legacy
+ * "Disorder scattering 1.0" files without lower_limits/step_vectors.
  *
  * Scatty VTK (STRUCTURED_POINTS, ASCII): ORIGIN/SPACING are cartesian Q in
  * 1/Angstrom with the 2*pi convention (verified against Scatty's paired
  * *_list.txt hkl output); point values are x fastest, z slowest, which
- * matches the internal h-fastest layout directly.
+ * matches the internal h-fastest layout directly. STRUCTURED_POINTS stores
+ * no axis directions: Scatty and Spinteract write ORIGIN as the cartesian
+ * corner but SPACING only as step lengths along their (orthogonal, possibly
+ * rotated) grid axes, so rotated grids need the program's config file.
+ * 3DSCalculator's "(HKL grid)" VTK and Scatty's supercell Bragg-peak VTK
+ * store ORIGIN/SPACING in reciprocal-lattice units instead.
  */
 (function (root, factory) {
     if (typeof module === 'object' && module.exports) {
@@ -46,6 +56,14 @@
         'hkl', 'Q', '2theta', 'dstar', 'sin(theta)/lambda', 'theta',
         'xyz', 'uvw', 'r',
     ]);
+    // HDF5 filters compiled into h5wasm: deflate, shuffle, fletcher32, szip,
+    // n-bit, scale-offset. Anything else is a plugin the engine lacks, and
+    // h5wasm then returns undecoded bytes instead of raising an error.
+    const BUILTIN_FILTERS = new Set([1, 2, 3, 4, 5, 6]);
+    const PLUGIN_FILTER_NAMES = {
+        307: 'bzip2', 32000: 'LZF', 32001: 'Blosc', 32004: 'LZ4',
+        32008: 'bitshuffle', 32013: 'ZFP', 32015: 'Zstandard', 32026: 'Blosc2',
+    };
 
     function textValue(value) {
         if (value === null || value === undefined) return '';
@@ -77,6 +95,73 @@
     function attributeText(obj, name) {
         const attr = obj && obj.attrs && obj.attrs[name];
         return attr ? textValue(attr.value) : '';
+    }
+
+    function firstValue(value) {
+        if (ArrayBuffer.isView(value) || Array.isArray(value)) return value.length ? value[0] : undefined;
+        return value;
+    }
+
+    function readDataset(ds, path) {
+        let filters = [];
+        try { filters = ds.filters || []; } catch (_) { filters = []; }
+        const missing = filters.filter(x => !BUILTIN_FILTERS.has(Number(x.id)));
+        if (missing.length) {
+            const names = missing.map(x =>
+                `${PLUGIN_FILTER_NAMES[x.id] || x.name || 'unknown'} (filter id ${x.id})`).join(', ');
+            throw new Error(`${path} is compressed with ${names}, which this HDF5 engine cannot ` +
+                'decode (it reads gzip/deflate, shuffle, szip, fletcher32, n-bit and scale-offset); ' +
+                're-save the file without it, e.g. h5repack -f GZIP=4 in.h5 out.h5');
+        }
+        const value = ds.value;
+        if (value instanceof BigInt64Array || value instanceof BigUint64Array) {
+            return Float64Array.from(value, Number);
+        }
+        return value;
+    }
+
+    // Numeric dataset as a plain array; null when absent unless `required`
+    // names the file kind for the error message.
+    function numbersAt(f, path, required) {
+        const ds = f.get(path);
+        if (!ds) {
+            if (required) throw new Error(`${required}: missing ${path}`);
+            return null;
+        }
+        const value = readDataset(ds, path);
+        const list = ArrayBuffer.isView(value) || Array.isArray(value) ? Array.from(value) : [value];
+        return list.map(Number);
+    }
+
+    function normalizeRadiation(value) {
+        const text = String(value || '').trim().toLowerCase();
+        if (!text) return 'unknown';
+        if (/^x[-_ ]?rays?$/.test(text)) return 'xray';
+        if (/^neutrons?$/.test(text)) return 'neutron';
+        if (/^electrons?$/.test(text)) return 'electron';
+        return text;
+    }
+
+    // C-order [nh,nk,nl] (l fastest) -> internal h-fastest layout.
+    function lFastestToHFastest(flat, nh, nk, nl) {
+        const values = new Float64Array(nh * nk * nl);
+        for (let il = 0; il < nl; il++)
+            for (let ik = 0; ik < nk; ik++)
+                for (let ih = 0; ih < nh; ih++)
+                    values[(il * nk + ik) * nh + ih] = flat[(ih * nk + ik) * nl + il];
+        return values;
+    }
+
+    function countNonFinite(values) {
+        let n = 0;
+        for (let i = 0; i < values.length; i++) if (!Number.isFinite(values[i])) n++;
+        return n;
+    }
+
+    // Number() plus Fortran "D" exponents (1.0D+00).
+    function num(token) {
+        const v = Number(token);
+        return Number.isNaN(v) ? Number(String(token).replace(/[dD]/, 'e')) : v;
     }
 
     function unifiedDictionary(f) {
@@ -248,11 +333,7 @@
     // describes the supercell replication and must not divide these lengths.
     function readUnifiedStructure(f) {
         validateUnifiedDictionary(f, 'structure');
-        const need = p => {
-            const d = f.get(p);
-            if (!d) throw new Error('unified structure: missing ' + p);
-            return Array.from(d.value).map(Number);
-        };
+        const need = p => numbersAt(f, p, 'unified structure');
         const lengths = need('entry/data/unit_cell_lengths');
         const angles = need('entry/data/unit_cell_angles');
         const cells = need('entry/data/unit_cells');
@@ -290,118 +371,279 @@
         throw new Error('no unified diffuse data group found');
     }
 
+    function axisNamesAttr(group) {
+        const attr = group.attrs && group.attrs.axes;
+        if (!attr) return ['h', 'k', 'l'];
+        const v = attr.value;
+        const list = typeof v === 'string' ? v.split(/[:,\s]+/) :
+            Array.from(ArrayBuffer.isView(v) || Array.isArray(v) ? v : [v], x => textValue(x));
+        const names = list.map(x => String(x).trim()).filter(Boolean);
+        return names.length === 3 ? names : ['h', 'k', 'l'];
+    }
+
+    // Which of the two self-consistent /scattering/data layouts a file uses:
+    //   'abs-fastest'  C dims [n_top, n_ord, n_abs], step_vectors flat[axis*3 + comp]
+    //                  (this converter; RMCProfile/DISCUS Fortran writers)
+    //   'abs-slowest'  C dims [n_abs, n_ord, n_top], step_vectors flat[comp*3 + axis]
+    //                  (write_diffuse_scattering.py; legacy "Disorder scattering 1.0")
+    function scatteringLayout(f, g, group, names, shape, notes) {
+        const indices = names.map(n => {
+            const attr = group.attrs && group.attrs[n + '_indices'];
+            return attr ? Number(firstValue(attr.value)) : NaN;
+        });
+        if (indices.every(Number.isFinite)) {
+            if (indices.join() === '0,1,2') return 'abs-slowest';
+            if (indices.join() === '2,1,0') return 'abs-fastest';
+            throw new Error('scattering/data: unsupported axis order ' +
+                names.map((n, i) => `${n}_indices=${indices[i]}`).join(', '));
+        }
+        const lengths = names.map(n => {
+            const ds = f.get(g + n);
+            return ds && ds.shape && ds.shape.length === 1 ? Number(ds.shape[0]) : NaN;
+        });
+        if (!lengths.every(Number.isFinite)) return 'abs-fastest';
+        const fastest = shape[0] === lengths[2] && shape[1] === lengths[1] && shape[2] === lengths[0];
+        const slowest = shape[0] === lengths[0] && shape[1] === lengths[1] && shape[2] === lengths[2];
+        if (slowest && !fastest) {
+            notes.push(`scattering/data is stored as C [${names.join(',')}] ` +
+                '(write_diffuse_scattering.py layout); read accordingly');
+            return 'abs-slowest';
+        }
+        if (!slowest && !fastest) {
+            throw new Error(`scattering/data: data shape ${shape.join(' x ')} does not match the ` +
+                `${names.join('/')} coordinate lengths ${lengths.join('/')}`);
+        }
+        if (slowest && !f.get(g + 'data_axes') && !f.get('entry/data/data_values')) {
+            notes.push(`the grid is ${shape.join(' x ')}, so its axis order cannot be told from the ` +
+                'shape; assumed this converter\'s layout (abscissa fastest). If h and l look swapped, ' +
+                'the file uses the write_diffuse_scattering.py layout');
+        }
+        return 'abs-fastest';
+    }
+
+    // Legacy files keep the grid only in the h/k/l coordinate arrays.
+    function gridFromCoordinates(f, g, names, dims) {
+        const corner = [0, 0, 0];
+        const vectors = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+        names.forEach((name, axis) => {
+            const comp = 'hkl'.indexOf(name.toLowerCase());
+            if (comp < 0 || name.length !== 1) {
+                throw new Error(`scattering/data: axis "${name}" is not h, k or l; ` +
+                    'only reciprocal-space hkl grids are supported');
+            }
+            const coords = numbersAt(f, g + name, 'scattering/data');
+            const n = dims[axis];
+            if (coords.length !== n) throw new Error(`scattering/data: ${name} has ${coords.length} values, expected ${n}`);
+            const step = n > 1 ? (coords[n - 1] - coords[0]) / (n - 1) : 0;
+            for (let i = 0; i < n; i++) {
+                if (Math.abs(coords[i] - (coords[0] + i * step)) > 1e-6 * Math.max(1, Math.abs(coords[n - 1] - coords[0]))) {
+                    throw new Error(`scattering/data: ${name} coordinates are not evenly spaced`);
+                }
+            }
+            corner[comp] = coords[0];
+            vectors[axis][comp] = step;
+        });
+        return { corner, vectors };
+    }
+
     function readScatteringGroup(f) {
         const g = 'scattering/data/';
+        const group = f.get('scattering/data');
         const ds = f.get(g + 'data');
-        const shape = ds.shape;                     // [nl, nk, nh]
+        const shape = Array.from(ds.shape || []).map(Number);
         if (shape.length !== 3) throw new Error('scattering data must be rank 3');
-        const [nl, nk, nh] = shape;
-        const values = Float64Array.from(ds.value); // already h fastest
-        const corner = Array.from(f.get(g + 'lower_limits').value).map(Number);
-        const sv = Array.from(f.get(g + 'step_vectors').value).map(Number);
-        const vectors = [0, 1, 2].map(axis => [0, 1, 2].map(comp => sv[axis * 3 + comp]));
-        const lengths = Array.from(f.get(g + 'unit_cell_lengths').value).map(Number);
-        const angles = Array.from(f.get(g + 'unit_cell_angles').value).map(Number);
-        let axes = [1, 2, 3];
-        const axesDs = f.get(g + 'data_axes');
-        if (axesDs) axes = Array.from(axesDs.value).map(Number);
-        let radiation = 'unknown';
-        const attrs = f.get('scattering/data').attrs;
-        if (attrs && attrs.radiation) {
-            const v = attrs.radiation.value;
-            radiation = String(Array.isArray(v) ? v[0] : v);
+        const notes = [];
+        const names = axisNamesAttr(group);
+        const layout = scatteringLayout(f, g, group, names, shape, notes);
+        const dims = layout === 'abs-fastest' ? [shape[2], shape[1], shape[0]] : shape.slice();
+        const [nh, nk, nl] = dims;
+        const raw = readDataset(ds, g + 'data');
+        const values = layout === 'abs-fastest' ? Float64Array.from(raw) : lFastestToHFastest(raw, nh, nk, nl);
+
+        let corner = numbersAt(f, g + 'lower_limits');
+        const sv = numbersAt(f, g + 'step_vectors');
+        let vectors;
+        if (corner && sv && sv.length === 9) {
+            vectors = [0, 1, 2].map(axis => [0, 1, 2].map(comp =>
+                layout === 'abs-fastest' ? sv[axis * 3 + comp] : sv[comp * 3 + axis]));
+        } else {
+            ({ corner, vectors } = gridFromCoordinates(f, g, names, dims));
+            notes.push(`no lower_limits/step_vectors: grid taken from the ${names.join('/')} coordinate arrays`);
         }
-        const contract = validateDataContract(f, f.get('scattering/data'), 'reciprocal');
+
+        let lengths = numbersAt(f, g + 'unit_cell_lengths');
+        let angles = numbersAt(f, g + 'unit_cell_angles');
+        if (!lengths || !angles) {
+            const cell = numbersAt(f, g + 'unit_cell');
+            if (cell && cell.length >= 6) {
+                lengths = cell.slice(0, 3);
+                angles = cell.slice(3, 6);
+            }
+        }
+        if (!lengths || !angles) {
+            lengths = [1, 1, 1];
+            angles = [90, 90, 90];
+            notes.push('no unit cell stored; treated as unit metric');
+        }
+        const axes = numbersAt(f, g + 'data_axes') ||
+            (names.every(n => ['h', 'k', 'l'].includes(n)) && new Set(names).size === 3
+                ? names.map(n => 'hkl'.indexOf(n) + 1) : pickAxes(vectors, dims));
+        const radiation = normalizeRadiation(
+            attributeText(group, 'radiation') || attributeText(group, 'scattering'));
+        const contract = validateDataContract(f, group, attributeText(group, 'space') || 'reciprocal');
         return {
-            dims: [nh, nk, nl], corner, vectors, values,
+            dims, corner, vectors, values,
             cellLengths: lengths, cellAngles: angles, radiation, axes,
-            axesType: contract.axesType, numberType: contract.numberType,
+            axesType: contract.axesType, numberType: contract.numberType, notes,
         };
+    }
+
+    function sameShape(a, b) {
+        return a.length === b.length && a.every((x, i) => x === b[i]);
     }
 
     function readEntryGroup(f) {
         const g = 'entry/data/';
-        const dims = Array.from(f.get(g + 'data_dimension').value).map(Number); // [nh,nk,nl]
+        const dims = numbersAt(f, g + 'data_dimension', 'unified data');   // [nh,nk,nl]
+        if (dims.length !== 3 || dims.some(d => !(Number.isInteger(d) && d >= 1))) {
+            throw new Error('unified data: data_dimension must hold three positive integers');
+        }
         const [nh, nk, nl] = dims;
         const ds = f.get(g + 'data_values');       // C dims [nh,nk,nl], l fastest
-        const flat = ds.value;
-        const values = new Float64Array(nh * nk * nl);
-        for (let il = 0; il < nl; il++)
-            for (let ik = 0; ik < nk; ik++)
-                for (let ih = 0; ih < nh; ih++)
-                    values[(il * nk + ik) * nh + ih] = flat[(ih * nk + ik) * nl + il];
-        const corner = Array.from(f.get(g + 'data_corner').value).map(Number);
-        const iv = Array.from(f.get(g + 'data_increment_vector').value).map(Number);
-        const vectors = [0, 1, 2].map(axis => [0, 1, 2].map(comp => iv[comp * 3 + axis]));
-        const lengths = Array.from(f.get(g + 'unit_cell_lengths').value).map(Number);
-        const angles = Array.from(f.get(g + 'unit_cell_angles').value).map(Number);
-        let axes = [1, 2, 3];
-        const axesDs = f.get(g + 'data_axes');
-        if (axesDs) axes = Array.from(axesDs.value).map(Number);
-        let radiation = 'unknown';
-        const radDs = f.get(g + 'data_radiation');
-        if (radDs) {
-            const v = radDs.value;
-            radiation = String(Array.isArray(v) ? v[0] : v).trim() || 'unknown';
+        const shape = Array.from(ds.shape || []).map(Number);
+        const squeeze = a => a.filter(x => x !== 1);
+        const notes = [];
+        let reversed = false;
+        if (!sameShape(shape, dims) && !(shape.length !== 3 && sameShape(squeeze(shape), squeeze(dims)))) {
+            if (!sameShape(shape, [nl, nk, nh])) {
+                throw new Error(`unified data: data_values shape ${shape.join(' x ')} does not match ` +
+                    `data_dimension ${dims.join(' x ')}`);
+            }
+            // A Fortran-view writer stores the transpose of every array.
+            reversed = true;
+            notes.push('data_values is stored in reversed [nl,nk,nh] order; read accordingly');
         }
+        const flat = readDataset(ds, g + 'data_values');
+        const values = reversed ? Float64Array.from(flat) : lFastestToHFastest(flat, nh, nk, nl);
+        const corner = numbersAt(f, g + 'data_corner', 'unified data');
+        const iv = numbersAt(f, g + 'data_increment_vector', 'unified data');
+        const vectors = [0, 1, 2].map(axis => [0, 1, 2].map(comp =>
+            reversed ? iv[axis * 3 + comp] : iv[comp * 3 + axis]));
+        const lengths = numbersAt(f, g + 'unit_cell_lengths', 'unified data');
+        const angles = numbersAt(f, g + 'unit_cell_angles', 'unified data');
+        const axes = numbersAt(f, g + 'data_axes') || [1, 2, 3];
+        const radiation = normalizeRadiation(datasetText(f, g + 'data_radiation'));
         const reciprocal = datasetText(f, g + 'data_type_reciprocal');
         const contract = validateDataContract(f, f.get('entry/data'), reciprocal);
         return {
             dims, corner, vectors, values,
             cellLengths: lengths, cellAngles: angles, radiation, axes,
-            axesType: contract.axesType, numberType: contract.numberType,
+            axesType: contract.axesType, numberType: contract.numberType, notes,
         };
     }
 
-    function readYell(f) {
-        const need = p => {
-            const d = f.get(p);
-            if (!d) throw new Error('Yell file: missing ' + p);
-            return d;
-        };
-        const dirDs = f.get('is_direct');
-        if (dirDs) {
-            const v = Number(Array.isArray(dirDs.value) ? dirDs.value[0] : dirDs.value);
-            if (v !== 0) throw new Error('Yell file holds direct-space data; only reciprocal space is supported');
+    // is_direct as a number (booleans and 64-bit ints included), or null.
+    function yellDirectFlag(f) {
+        const ds = f.get('is_direct');
+        if (!ds) return null;
+        const v = firstValue(ds.value);
+        if (typeof v === 'boolean') return v ? 1 : 0;
+        const n = Number(v);
+        return Number.isFinite(n) ? n : NaN;
+    }
+
+    function pad3(list, fill) {
+        const out = list.slice(0, 3);
+        while (out.length < 3) out.push(fill);
+        return out;
+    }
+
+    // opts.space: 'auto' (default) trusts is_direct; 'reciprocal' overrides an
+    // is_direct value that is neither 0 nor 1.
+    function readYell(f, opts) {
+        opts = opts || {};
+        const notes = [];
+        const flag = yellDirectFlag(f);
+        if (flag === 1) {
+            throw new Error('Yell file holds direct-space data (is_direct = 1); only reciprocal space is supported');
         }
-        const ds = need('data');
-        const shape = ds.shape;                    // [nh, nk, nl], l fastest
-        if (shape.length !== 3) throw new Error('Yell data must be rank 3');
-        const [nh, nk, nl] = shape;
-        const flat = ds.value;
-        const values = new Float64Array(nh * nk * nl);
-        for (let il = 0; il < nl; il++)
-            for (let ik = 0; ik < nk; ik++)
-                for (let ih = 0; ih < nh; ih++)
-                    values[(il * nk + ik) * nh + ih] = flat[(ih * nk + ik) * nl + il];
-        const corner = Array.from(need('lower_limits').value).map(Number);
+        if (flag !== null && flag !== 0) {
+            if (opts.space !== 'reciprocal') {
+                const err = new Error(`Yell is_direct = ${flag} is neither 0 nor 1, so the flag looks ` +
+                    'corrupted; if the file holds reciprocal-space intensities, set the Yell data space ' +
+                    'to "reciprocal"');
+                err.code = 'YELL_INVALID_IS_DIRECT';
+                throw err;
+            }
+            notes.push(`is_direct = ${flag} ignored; read as reciprocal space`);
+        }
+        const ds = f.get('data');
+        if (!ds) throw new Error('Yell file: missing data');
+        const shape = Array.from(ds.shape || []).map(Number);   // [nh, nk, nl], l fastest
+        if (shape.length < 1 || shape.length > 3) throw new Error('Yell data must be rank 1, 2 or 3');
+        const [nh, nk, nl] = pad3(shape, 1);
+        if (shape.length < 3) notes.push(`${shape.length}-D data read as a ${nh} x ${nk} x ${nl} grid`);
+        const values = lFastestToHFastest(readDataset(ds, 'data'), nh, nk, nl);
+        const corner = pad3(numbersAt(f, 'lower_limits', 'Yell file'), 0);
         let vectors;
         if (f.get('step_sizes_abs') && f.get('step_sizes_ord') && f.get('step_sizes_top')) {
             vectors = ['step_sizes_abs', 'step_sizes_ord', 'step_sizes_top']
-                .map(p => Array.from(f.get(p).value).map(Number));
+                .map(p => pad3(numbersAt(f, p), 0));
         } else {
-            const s = Array.from(need('step_sizes').value).map(Number);
+            let s = numbersAt(f, 'step_sizes');
+            if (!s) {
+                s = numbersAt(f, 'step_size');
+                if (!s) throw new Error('Yell file: missing step_sizes');
+                notes.push('step sizes read from "step_size"');
+            }
+            s = pad3(s, 0);
             vectors = [[s[0], 0, 0], [0, s[1], 0], [0, 0, s[2]]];
         }
-        const cell = Array.from(need('unit_cell').value).map(Number);
+        const cell = numbersAt(f, 'unit_cell', 'Yell file');
         return {
             dims: [nh, nk, nl], corner, vectors, values,
             cellLengths: cell.slice(0, 3), cellAngles: cell.slice(3, 6),
-            radiation: 'unknown', axes: [1, 2, 3],
+            radiation: 'unknown', axes: [1, 2, 3], notes,
         };
     }
 
     // ------------------------------------------------------------- old text .dat
 
+    function firstLineTokens(text) {
+        let start = 0;
+        while (start < text.length) {
+            let end = text.indexOf('\n', start);
+            if (end < 0) end = text.length;
+            const line = text.slice(start, end).trim();
+            if (line) return line.split(/\s+/);
+            start = end + 1;
+        }
+        return [];
+    }
+
+    // Header "npoints nsec" (experimental input) or "npoints nsec scale offset"
+    // (RMCProfile *_calc.dat output). Values are kept as stored.
     function parseOldDat(text, parentCell) {
         const A = cellToLattice(parentCell.lengths, parentCell.angles);
+        const header = firstLineTokens(text);
+        if (header.length < 2 || header.length > 4 || header.some(t => !Number.isFinite(num(t)))) {
+            throw new Error('old-format .dat: unrecognized header line (expected "npoints nsec" ' +
+                'or "npoints nsec scale offset")');
+        }
         const tokens = text.trim().split(/\s+/);
-        let p = 0;
-        const npoints = parseInt(tokens[p++], 10);
-        const nsec = parseInt(tokens[p++], 10);
+        let p = header.length;
+        const npoints = parseInt(header[0], 10);
+        const nsec = parseInt(header[1], 10);
         if (!(npoints > 0) || !(nsec >= 1)) throw new Error('bad npoints/nsec header');
+        const notes = [];
+        let datHeader = null;
+        if (header.length > 2) {
+            datHeader = { scale: num(header[2]), offset: header.length > 3 ? num(header[3]) : 0 };
+            notes.push(`RMCProfile calculation header: scale = ${datHeader.scale}, offset = ` +
+                `${datHeader.offset}; intensities are kept as stored`);
+        }
         const perRow = 3 + 3 * nsec + 1;
-        if (tokens.length < 2 + npoints * perRow) throw new Error('old-format data file is truncated');
+        if (tokens.length < p + npoints * perRow) throw new Error('old-format data file is truncated');
 
         const pix = new Int32Array(3 * npoints);
         const hklAll = new Float64Array(3 * npoints);
@@ -409,8 +651,8 @@
         let dims = [0, 0, 0];
         for (let n = 0; n < npoints; n++) {
             const i = parseInt(tokens[p], 10), j = parseInt(tokens[p + 1], 10), k = parseInt(tokens[p + 2], 10);
-            const q = [Number(tokens[p + 3]), Number(tokens[p + 4]), Number(tokens[p + 5])];
-            vals[n] = Number(tokens[p + perRow - 1]);
+            const q = [num(tokens[p + 3]), num(tokens[p + 4]), num(tokens[p + 5])];
+            vals[n] = num(tokens[p + perRow - 1]);
             p += perRow;
             if (!(i >= 1 && j >= 1 && k >= 1)) throw new Error('pixel coordinates must be positive');
             pix[3 * n] = i; pix[3 * n + 1] = j; pix[3 * n + 2] = k;
@@ -449,6 +691,7 @@
             radiation: 'unknown',
             axes: pickAxes(vectors, dims),
             nsecOriginal: nsec,
+            datHeader, notes,
         };
     }
 
@@ -473,6 +716,8 @@
         return axes;
     }
 
+    // Non-finite intensities are written as 0.0: RMCProfile treats I = 0 as a
+    // masked point (excluded from chi^2), while a literal NaN would poison it.
     function* writeOldDatChunks(model, cell, linesPerChunk) {
         const A = cellToLattice(cell.lengths, cell.angles);
         const B = reciprocalBasis(A);
@@ -485,7 +730,8 @@
                     const hkl = [0, 1, 2].map(c =>
                         model.corner[c] + i * model.vectors[0][c] + j * model.vectors[1][c] + k * model.vectors[2][c]);
                     const q = hklToQ(B, hkl);
-                    const v = model.values[(k * nk + j) * nh + i];
+                    const raw = model.values[(k * nk + j) * nh + i];
+                    const v = Number.isFinite(raw) ? raw : 0;
                     out.push(`${i + 1} ${j + 1} ${k + 1} ${q[0].toExponential(16)} ${q[1].toExponential(16)} ${q[2].toExponential(16)} ${v.toExponential(16)}`);
                     if (out.length >= chunkSize) {
                         yield out.join('\n') + '\n';
@@ -509,8 +755,80 @@
         return /^#\s*vtk/i.test(text.trimStart());
     }
 
-    function parseVtk(text, parentCell) {
-        const A = cellToLattice(parentCell.lengths, parentCell.angles);
+    // Line 2 of a legacy VTK file is a free-text title.
+    function vtkTitle(text) {
+        const a = text.indexOf('\n');
+        if (a < 0) return '';
+        let b = text.indexOf('\n', a + 1);
+        if (b < 0) b = text.length;
+        return text.slice(a + 1, b).trim();
+    }
+
+    // 'hkl' when ORIGIN/SPACING are in reciprocal-lattice units (3DSCalculator
+    // "... (HKL grid)", Scatty "... supercell Bragg peaks"), otherwise 'q'.
+    function vtkFrame(text) {
+        return /\(HKL grid\)|supercell Bragg peaks/i.test(vtkTitle(text)) ? 'hkl' : 'q';
+    }
+
+    // Grid behind Scatty / Spinteract Q-space VTK output, from the program's
+    // config file (keywords matched as the Fortran readers do):
+    //   Scatty      CENTRE c; X_AXIS v p -> 2p+1 points from c - v to c + v,
+    //               one point for a zero vector; corner = c - (vx + vy + vz)
+    //   Spinteract  ORIGIN o (the corner); X_AXIS v n -> n points spanning v;
+    //               one ORIGIN/X/Y/Z_AXIS set per single-crystal data set
+    function parseGridConfig(text) {
+        const found = { CENTRE: [], ORIGIN: [], X_AXIS: [], Y_AXIS: [], Z_AXIS: [] };
+        let customFrame = false;
+        for (const line of text.split(/\r?\n/)) {
+            if (/HKL_TO_[XYZ]/.test(line)) customFrame = true;
+            for (const key of Object.keys(found)) {
+                const m = new RegExp(key + '\\s+(.*)$').exec(line);
+                if (m) found[key].push(m[1].trim().split(/[\s,]+/).map(Number));
+            }
+        }
+        const axisKeys = ['X_AXIS', 'Y_AXIS', 'Z_AXIS'];
+        if (!axisKeys.some(k => found[k].length)) {
+            throw new Error('grid config: no X_AXIS, Y_AXIS or Z_AXIS line found');
+        }
+        const program = found.ORIGIN.length ? 'spinteract' : 'scatty';
+        const nsets = program === 'spinteract'
+            ? Math.max(found.ORIGIN.length, ...axisKeys.map(k => found[k].length)) : 1;
+        const grids = [];
+        for (let set = 0; set < nsets; set++) {
+            // Scatty keeps the last occurrence of a keyword; Spinteract counts them.
+            const pick = key => program === 'spinteract' ? found[key][set] : found[key][found[key].length - 1];
+            const base = pick(program === 'spinteract' ? 'ORIGIN' : 'CENTRE') || [0, 0, 0];
+            const axes = axisKeys.map(k => pick(k) || [0, 0, 0, 0]);
+            const numbers = base.slice(0, 3).concat(...axes.map(a => a.slice(0, 4)));
+            if (numbers.length < 15 || numbers.some(x => !Number.isFinite(x))) {
+                throw new Error('grid config: CENTRE/ORIGIN need 3 numbers and each axis 3 numbers plus a point count');
+            }
+            const corner = base.slice(0, 3);
+            const dims = [], vectors = [];
+            axes.forEach(a => {
+                const v = a.slice(0, 3);
+                const nonzero = v.some(x => Math.abs(x) > 1e-12);
+                const n = !nonzero ? 1 : program === 'scatty' ? 2 * Math.round(a[3]) + 1 : Math.max(1, Math.round(a[3]));
+                dims.push(n);
+                if (program === 'scatty') {
+                    for (let c = 0; c < 3; c++) corner[c] -= v[c];
+                    vectors.push(n > 1 ? v.map(x => 2 * x / (n - 1)) : [0, 0, 0]);
+                } else {
+                    vectors.push(n > 1 ? v.map(x => x / (n - 1)) : [0, 0, 0]);
+                }
+            });
+            grids.push({ dims, corner, vectors });
+        }
+        return { program, grids, customFrame };
+    }
+
+    // opts.frame: 'q' | 'hkl' (default: from the title line).
+    // opts.grid:  { dims, corner, vectors } from parseGridConfig, for Q-space
+    //             files whose grid axes are not along cartesian x, y, z.
+    // opts.customFrame: the config redefines the cartesian frame (HKL_TO_X...).
+    function parseVtk(text, parentCell, opts) {
+        opts = opts || {};
+        const frame = opts.frame || vtkFrame(text);
         const lines = text.split(/\r?\n/);
         if (!/^#\s*vtk/i.test((lines[0] || '').trim())) throw new Error('not a VTK file');
         let dims = null, origin = null, spacing = null, dataStart = -1;
@@ -540,23 +858,68 @@
             if (t === '') continue;
             for (const s of t.split(/\s+/)) {
                 if (n >= npoints) break;
-                values[n++] = Number(s);
+                values[n++] = num(s);
             }
         }
         if (n < npoints) throw new Error(`VTK data is truncated (${n} of ${npoints} values)`);
-        // ORIGIN/SPACING are cartesian Q (2*pi/Angstrom); VTK x-fastest point
-        // order equals the internal h-fastest layout, so values copy through.
-        const corner = qToHkl(A, origin);
-        const vectors = [0, 1, 2].map(axis => {
-            if (dims[axis] <= 1 || spacing[axis] === 0) return [0, 0, 0];
-            const q = [0, 0, 0];
-            q[axis] = spacing[axis];
-            return qToHkl(A, q);
-        });
+        // VTK x-fastest point order equals the internal h-fastest layout, so
+        // values copy through.
+        const notes = [];
+        let corner, vectors;
+        if (frame === 'hkl') {
+            corner = origin.slice();
+            vectors = [0, 1, 2].map(axis => {
+                const v = [0, 0, 0];
+                if (dims[axis] > 1) v[axis] = spacing[axis];
+                return v;
+            });
+            notes.push(`VTK "${vtkTitle(text)}" stores ORIGIN/SPACING in reciprocal-lattice units; ` +
+                'read without a Q conversion');
+        } else {
+            if (!parentCell) throw new Error('Q-space VTK input needs the parent cell');
+            // ORIGIN/SPACING are cartesian Q (2*pi/Angstrom).
+            const A = cellToLattice(parentCell.lengths, parentCell.angles);
+            if (opts.grid) {
+                const grid = opts.grid;
+                if (grid.dims.some((d, i) => d !== dims[i])) {
+                    throw new Error(`grid config describes ${grid.dims.join(' x ')} points but the VTK ` +
+                        `has ${dims.join(' x ')}`);
+                }
+                corner = grid.corner.slice();
+                vectors = grid.vectors.map(v => v.slice());
+                if (opts.customFrame) {
+                    notes.push('the config redefines the cartesian frame (HKL_TO_X/Y/Z); ' +
+                        'VTK ORIGIN/SPACING were not cross-checked');
+                } else {
+                    // The header is written with 6 decimals (3f12.6).
+                    const B = reciprocalBasis(A);
+                    const off = (a, b) => Math.abs(a - b) > 5e-6 + 2e-5 * Math.abs(b);
+                    const q0 = hklToQ(B, corner);
+                    const qStep = vectors.map(v => Math.hypot(...hklToQ(B, v)));
+                    if (q0.some((x, i) => off(x, origin[i])) ||
+                        qStep.some((x, i) => dims[i] > 1 && off(x, spacing[i]))) {
+                        notes.push('warning: VTK ORIGIN/SPACING differ from the grid config at this cell ' +
+                            `(expected ORIGIN ${q0.map(x => x.toFixed(6)).join(' ')}, SPACING ` +
+                            `${qStep.map(x => x.toFixed(6)).join(' ')}); check the config and the cell`);
+                    }
+                }
+            } else {
+                corner = qToHkl(A, origin);
+                vectors = [0, 1, 2].map(axis => {
+                    if (dims[axis] <= 1 || spacing[axis] === 0) return [0, 0, 0];
+                    const q = [0, 0, 0];
+                    q[axis] = spacing[axis];
+                    return qToHkl(A, q);
+                });
+                notes.push('VTK stores no axis directions: grid axes assumed along cartesian x, y, z. ' +
+                    'For Scatty/Spinteract grids with rotated axes (e.g. X_AXIS 6 6 0), load the config file');
+            }
+        }
+        const cell = parentCell || { lengths: [1, 1, 1], angles: [90, 90, 90] };
         return {
             dims, corner, vectors, values,
-            cellLengths: parentCell.lengths.slice(), cellAngles: parentCell.angles.slice(),
-            radiation: 'unknown', axes: pickAxes(vectors, dims),
+            cellLengths: cell.lengths.slice(), cellAngles: cell.angles.slice(),
+            radiation: 'unknown', axes: pickAxes(vectors, dims), notes,
         };
     }
 
@@ -594,8 +957,10 @@
             'SCALARS diffuse_scattering float',
             'LOOKUP_TABLE default',
         ];
+        // Legacy VTK readers do not parse NaN; empty points are 0 as in Scatty.
         for (let n = 0; n < model.values.length; n++) {
-            out.push(model.values[n].toExponential(16));
+            const v = model.values[n];
+            out.push((Number.isFinite(v) ? v : 0).toExponential(16));
         }
         return out.join('\n') + '\n';
     }
@@ -744,8 +1109,8 @@
         cellToLattice, latticeToCell, reciprocalBasis, hklToQ, qToHkl, isUnitMetric, modelAxesToHkl,
         parseRmc6f, readUnifiedStructure,
         detectH5Kind, readUnifiedData, readYell,
-        parseOldDat, writeOldDat, writeOldDatChunks,
-        isVtk, parseVtk, writeVtk,
+        parseOldDat, writeOldDat, writeOldDatChunks, countNonFinite,
+        isVtk, vtkFrame, parseGridConfig, parseVtk, writeVtk,
         writeUnifiedData, writeYell,
     };
 }));
