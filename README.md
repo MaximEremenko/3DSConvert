@@ -541,9 +541,28 @@ volume with bands and asymmetric lines the (111) residual falls from 0.036
 after the fit to 0.009, against noise of 0.02, with the sample near its
 Bragg peaks unchanged.
 
-Recommended order: subtract an empty-can measurement if there is one, then
-remove the remaining rings, then treat the Bragg peaks (mask, punch and
-fill) and compute the 3D-ΔPDF. `any` instead removes every ring sharper
+**Rings and symmetry.** A can's rings are ordered about the rotation axis,
+not by the crystal's symmetry. Taken off after symmetrizing, they have lost
+that order (the filter then works as a smooth angular model) and a faint
+material may go unfound; taken off before, the fit and the filter, being
+robust, leave the bright spots of large grains, which symmetrizing averages
+over the 48 copies into a broad ring. On the 533 K CORELLI volume of PMN-PT
+both orders leave the aluminium lines at χ²/n 1.6-4.8 (3.0-6.3 at the
+sample's own shells), but symmetrizing first loses the copper, and removing
+rings first leaves copper (111) at 28, against 2.8 before symmetrizing. A
+second ring filter after symmetrizing, which takes the lines of the first
+fit, brings that to 3.0 with aluminium at 1.4-4.4; *mask spots* in the first
+removal also helps (19), at some cost to the sample's scattering on the ring
+cores. A second ring fit after symmetrizing finds nothing: what is left is
+no line of the fitted shape. Symmetrized, an empty-can volume has a comb of
+maxima along each ring, which a subtraction carries into the sample's volume
+(the streaks along h and k in the half-integer planes of symmetrized,
+can-subtracted CORELLI volumes).
+
+Recommended order: subtract an empty-can measurement if there is one (both
+volumes unsymmetrized, on one scale), then remove the remaining rings, then
+symmetrize and filter the rings once more, then treat the Bragg peaks (mask,
+punch and fill) and compute the 3D-ΔPDF. `any` instead removes every ring sharper
 than a cutoff, for phases that are not in the library.
 
 The method takes the angular low-pass of ring filters for images (rings

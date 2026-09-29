@@ -1279,13 +1279,14 @@
         if (!fit) throw new Error('ring removal: too few |Q| bins with data to fit');
         // a material stays only when its lines explain a share of the profile
         // (2 % or more) and, when its lattice parameter was refined, the fit
-        // clearly prefers that value (15 % below the median of the scan)
+        // clearly prefers that value (10 % below the median of the scan; absent
+        // materials come out at 0-4 %, faint real ones at 12-15 %)
         const skip = new Set();
         mats.forEach((m, k) => {
             const without = fitProfile(whole, lambdas, s0, r, free, true, new Set([k]));
             const share = fit.before > 0 && without ? (without.loss - fit.loss) / fit.before : 0;
             const lines = fit.owner.filter(([owner], i) => owner === k && fit.x[i] !== 0).length;
-            if (share < 0.02 || (step.refine > 0 && match[k] < 0.15) || (free && lines < 2)) {
+            if (share < 0.02 || (step.refine > 0 && match[k] < 0.1) || (free && lines < 2)) {
                 skip.add(k);
                 ctx.log(`${m.name}: no clear lines (they explain ${Math.round(100 * Math.max(0, share))} % of the profile` +
                     (step.refine > 0 ? `, the lattice parameter is ${Math.round(100 * match[k])} % better than elsewhere` : '') +
