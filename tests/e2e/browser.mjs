@@ -362,6 +362,20 @@ const scenarios = [
         if (out.values.some(x => Math.abs(x - 1) > 1e-12)) throw new Error('data / identical norm is not 1');
         if (!/summed over m-3m/.test(await logText())) throw new Error('no symmetry in the log');
     }],
+    ['hkl list: write a Spinteract data file, then read it back as data', async () => {
+        await setFile('#dataFile', path.join(ROOT, 'Examples/example_unified.h5'));
+        await waitLog(/Unified data format \| grid 5 x 5 x 5/);
+        await setValue('outFormat', 'hkl');
+        const out = await convert('example_unified_xtal_data_01.txt');
+        const back = H.Converter.hklListModel(H.Converter.parseHklList(fs.readFileSync(out, 'utf8')));
+        const ref = await H.Converter.readUnifiedData(await H.openH5('Examples/example_unified.h5'));
+        if (H.maxAbsDiff(back.values, ref.values) > 1e-6 * Math.max(...ref.values)) throw new Error('values differ');
+        const text = await logText();
+        if (!/ORIGIN -1 -1 -1/.test(text) || !/every sigma is 1/.test(text)) throw new Error('log:\n' + text);
+        await fresh();
+        await setFile('#dataFile', out);
+        await waitLog(/hkl list \| grid 5 x 5 x 5 \| σ/);
+    }],
     ['crop on read: only the chosen hkl box is read', async () => {
         await evaluate(`(() => {
             for (const [axis, end, v] of [['h', 0, -0.5], ['h', 1, 1], ['l', 0, 0], ['l', 1, 0.5]]) {

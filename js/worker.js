@@ -122,9 +122,15 @@ function converterWorker(self, h5wasm, Converter, Processing, wgpuFftWeb) {
         return Converter.isHdf5Signature(new Uint8Array(await file.slice(0, 8).arrayBuffer()));
     }
 
-    // Old-format .dat or VTK text, parsed as a stream: { kind, grid }.
+    // Old-format .dat, VTK or an hkl list, parsed as a stream: { kind, grid }
+    // or, for an hkl list (placed on opts.grid when a config gives one),
+    // { kind, model }.
     async function readTextVolume(file, opts) {
-        const head = new TextDecoder().decode(await file.slice(0, 256).arrayBuffer());
+        const head = new TextDecoder().decode(await file.slice(0, 4096).arrayBuffer());
+        if (Converter.isHklList(head)) {
+            const list = await Converter.readHklListStream(file.stream(), opts);
+            return { kind: 'hkl', model: Converter.hklListModel(list, opts.grid || null) };
+        }
         const vtk = Converter.isVtk(head);
         const grid = vtk ? await Converter.readVtkStream(file.stream(), opts)
             : await Converter.readOldDatStream(file.stream(), opts);
@@ -321,7 +327,7 @@ function converterWorker(self, h5wasm, Converter, Processing, wgpuFftWeb) {
         // files: the selected data file, or a NeXus file plus the files its
         // external links point to; paths: their folder-relative paths (may be
         // empty); nexusPath: the NXdata group to read (default: @default).
-        async loadData({ files, paths, yellSpace, nexusPath, crop, readSigma }, ctx) {
+        async loadData({ files, paths, yellSpace, nexusPath, crop, readSigma, grid }, ctx) {
             state.data = null;
             state.plan = null;
             state.processed = null;
@@ -343,7 +349,7 @@ function converterWorker(self, h5wasm, Converter, Processing, wgpuFftWeb) {
                 if (main < 0) throw new Error(Converter.unsupportedKindMessage(kinds[0]) || 'no data file among the selection');
             }
             const file = files[main];
-            const opts = { size: file.size, tick: ctx.tick, progress: f => ctx.progress('Reading', f), crop, sigma: !!readSigma };
+            const opts = { size: file.size, tick: ctx.tick, progress: f => ctx.progress('Reading', f), crop, sigma: !!readSigma, grid };
             if (!hdf5[main]) {
                 state.data = await readTextVolume(file, opts);
                 return { result: Object.assign(summarize(state.data), { main: file.name }) };
@@ -506,9 +512,11 @@ function converterWorker(self, h5wasm, Converter, Processing, wgpuFftWeb) {
             if (!state.plan) throw new Error('nothing to write; prepare the conversion first');
             const { plan, params, process } = state.plan;
             const progress = f => ctx.progress('Writing', f);
-            if (params.format === 'dat' || params.format === 'vtk' || params.format === 'profile') {
+            if (params.format === 'dat' || params.format === 'vtk' || params.format === 'profile' || params.format === 'hkl') {
+                let report = null;
                 const chunks = params.format === 'dat' ? Converter.writeOldDatChunks(plan.model, plan.cell)
                     : params.format === 'vtk' ? Converter.writeVtkChunks(plan.model, plan.cell)
+                    : params.format === 'hkl' ? Converter.writeHklListChunks(plan.model, r => { report = r; })
                     : Processing.writeProfileChunks(plan.model, plan.cell, params.profileWidth);
                 const estimate = Math.max(1, Converter.estimateOutputBytes(plan.model, params.format));
                 let written = 0;
@@ -518,7 +526,9 @@ function converterWorker(self, h5wasm, Converter, Processing, wgpuFftWeb) {
                     progress(Math.min(0.99, written / estimate));
                 }
                 progress(1);
-                return { result: { kind: 'text' } };
+                const snippet = params.format === 'hkl' && params.hklTarget !== 'plain'
+                    ? Converter.hklConfigSnippet(plan.model, params.hklTarget) : null;
+                return { result: { kind: 'text', report, snippet } };
             }
             const path = `/out_${outSeq++}.h5`;
             let f = null;

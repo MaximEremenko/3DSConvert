@@ -1518,7 +1518,7 @@
     // The text formats hold Q-space grids; direct-space (uvw) data such as a
     // 3D-ΔPDF go only to the HDF5 formats.
     function checkWritable(model, format) {
-        if (model.axesType === 'uvw' && (format === 'dat' || format === 'vtk')) {
+        if (model.axesType === 'uvw' && (format === 'dat' || format === 'vtk' || format === 'hkl')) {
             throw new Error(`these are direct-space 3D-ΔPDF data (u, v, w axes), and ${format === 'dat'
                 ? 'the old .dat format' : 'VTK'} holds only Q-space grids; write unified HDF5 or Yell instead`);
         }
@@ -1556,6 +1556,228 @@
         // Kept for callers that need one string. The browser UI uses the
         // chunk iterator so large grids never exceed JavaScript's string limit.
         return Array.from(writeOldDatChunks(model, cell)).join('');
+    }
+
+    // ------------------------------------------------------------- hkl lists
+
+    // "h k l I [sigma]" rows: Spinteract's _xtal_data_NN.txt and
+    // _xtal_fit_NN.txt, Scatty's scatty_data_01.txt and *_sc_list.txt. The
+    // rows are points of a grid, possibly with holes (masked points left
+    // out). With twins, Spinteract rows carry more hkl triplets before I and
+    // sigma; the first triplet is used.
+    function hklListParser() {
+        let cap = 1 << 16, n = 0, ncol = 0;
+        let H = new Float64Array(cap), K = new Float64Array(cap), L = new Float64Array(cap);
+        let I = new Float64Array(cap), E = new Float64Array(cap);
+        const grow = () => {
+            cap *= 2;
+            const g = a => { const b = new Float64Array(cap); b.set(a); return b; };
+            H = g(H); K = g(K); L = g(L); I = g(I); E = g(E);
+        };
+        function line(text) {
+            const t = text.trim();
+            if (!t || t[0] === '#' || t[0] === '!') return;
+            const tok = t.split(/\s+/);
+            if (!ncol) {
+                ncol = tok.length;
+                if (ncol < 4) throw new Error(`hkl list: expected "h k l I [sigma]" rows, found ${ncol} columns`);
+            }
+            if (tok.length !== ncol) throw new Error(`hkl list: row ${n + 1} has ${tok.length} columns, the first had ${ncol}`);
+            if (n === cap) grow();
+            const hasSigma = ncol === 5 || (ncol > 5 && (ncol - 2) % 3 === 0);
+            H[n] = num(tok[0]);
+            K[n] = num(tok[1]);
+            L[n] = num(tok[2]);
+            I[n] = num(tok[hasSigma ? ncol - 2 : ncol - 1]);
+            E[n] = hasSigma ? num(tok[ncol - 1]) : NaN;
+            n++;
+        }
+        function finish() {
+            if (!n) throw new Error('hkl list: no data rows');
+            const hasSigma = ncol === 5 || (ncol > 5 && (ncol - 2) % 3 === 0);
+            return {
+                source: 'hkl', frame: 'hkl', n,
+                h: H.subarray(0, n), k: K.subarray(0, n), l: L.subarray(0, n), values: I.subarray(0, n),
+                sigma: hasSigma ? E.subarray(0, n) : null, twins: ncol > 5 ? (ncol - 2) / 3 : 1,
+            };
+        }
+        return { line, finish };
+    }
+
+    function parseHklList(text) {
+        const parser = hklListParser();
+        forEachTextLine(text, parser.line);
+        return parser.finish();
+    }
+
+    async function readHklListStream(stream, opts) {
+        const parser = hklListParser();
+        await forEachStreamLine(stream, opts, parser.line);
+        return parser.finish();
+    }
+
+    // Whether text (the head of a file) looks like an hkl list: its first two
+    // data rows are numbers, four or more of them, the same count in both
+    // (an old-format .dat starts with a 2- or 4-number header instead).
+    function isHklList(head) {
+        const rows = head.split(/\r?\n/).map(x => x.trim()).filter(x => x && x[0] !== '#' && x[0] !== '!').slice(0, 2);
+        if (rows.length < 2) return false;
+        const cols = rows.map(r => r.split(/\s+/));
+        return cols[0].length >= 4 && cols[0].length === cols[1].length &&
+            cols.every(c => c.every(x => Number.isFinite(num(x))));
+    }
+
+    // The grid of an hkl list: from a grid config ({ corner, vectors, dims },
+    // as parseGridConfig gives) or, without one, the axis-aligned grid its
+    // coordinates span. Points off the grid are an error; grid points
+    // without a row are NaN.
+    function hklListModel(list, grid) {
+        const notes = [];
+        let dims, corner, vectors;
+        if (grid) {
+            ({ dims, corner, vectors } = grid);
+            notes.push('grid from the config');
+        } else {
+            corner = [0, 0, 0];
+            vectors = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+            dims = [1, 1, 1];
+            [list.h, list.k, list.l].forEach((col, c) => {
+                const seen = new Set();
+                for (let i = 0; i < col.length; i++) seen.add(Math.round(col[i] * 1e6));
+                const u = Array.from(seen).sort((a, b) => a - b).map(x => x / 1e6);
+                corner[c] = u[0];
+                if (u.length < 2) return;
+                let step = Infinity;
+                for (let i = 1; i < u.length; i++) step = Math.min(step, u[i] - u[i - 1]);
+                step = Math.round(step * 1e6) / 1e6;
+                const n = Math.round((u[u.length - 1] - u[0]) / step) + 1;
+                if (u.some(x => Math.abs((x - u[0]) / step - Math.round((x - u[0]) / step)) > 1e-3) || n > 20000) {
+                    throw new Error(`hkl list: the ${'hkl'[c]} values are not evenly spaced; the grid axes may not ` +
+                        'run along h, k and l - load the Spinteract or Scatty config as the grid config');
+                }
+                dims[c] = n;
+                vectors[c][c] = step;
+            });
+            notes.push('grid inferred from the hkl values (axes along h, k, l)');
+        }
+        const total = dims[0] * dims[1] * dims[2];
+        if (total > 5e8) throw new Error(`hkl list: the grid would hold ${total} points`);
+        // Columns are the step vectors; a single-point axis gets a unit vector
+        // perpendicular to the others, so the matrix stays invertible.
+        const cols = vectors.map((v, a) => (dims[a] > 1 && v.some(x => x !== 0) ? v.slice() : null));
+        for (let a = 0; a < 3; a++) {
+            if (cols[a]) continue;
+            const others = cols.filter(Boolean);
+            let n = others.length === 2 ? cross(others[0], others[1])
+                : others.length === 1 ? cross(others[0], Math.abs(others[0][0]) < 0.9 * Math.hypot(...others[0]) ? [1, 0, 0] : [0, 1, 0])
+                    : [0, 1, 2].map(c => (c === a ? 1 : 0));
+            const len = Math.hypot(n[0], n[1], n[2]);
+            cols[a] = n.map(x => x / len);
+        }
+        const Minv = invert3x3([0, 1, 2].map(r => [cols[0][r], cols[1][r], cols[2][r]]));
+        const values = new Float64Array(total).fill(NaN);
+        const sigma = list.sigma ? new Float64Array(total).fill(NaN) : undefined;
+        let off = 0, dup = 0;
+        for (let i = 0; i < list.n; i++) {
+            const d = [list.h[i] - corner[0], list.k[i] - corner[1], list.l[i] - corner[2]];
+            const f = [0, 1, 2].map(r => Minv[r][0] * d[0] + Minv[r][1] * d[1] + Minv[r][2] * d[2]);
+            const j = f.map(Math.round);
+            if (f.some((x, a) => Math.abs(x - j[a]) > 1e-3) || j.some((x, a) => x < 0 || x >= dims[a])) {
+                off++;
+                continue;
+            }
+            const at = (j[2] * dims[1] + j[1]) * dims[0] + j[0];
+            if (values[at] === values[at]) dup++;
+            values[at] = list.values[i];
+            if (sigma) sigma[at] = list.sigma[i];
+        }
+        if (off) throw new Error(`hkl list: ${off} of ${list.n} points are off the grid ${dims.join(' x ')}`);
+        if (dup) notes.push(`${dup} rows repeat a grid point; the last one is kept`);
+        const empty = total - list.n + dup;
+        if (empty) notes.push(`${empty} of ${total} grid points have no row (NaN)`);
+        if (list.twins > 1) notes.push(`rows hold ${list.twins} twin hkl triplets; the first is used`);
+        if (!list.sigma) notes.push('no uncertainties in the file (4 columns)');
+        return {
+            dims, corner, vectors: vectors.map((v, a) => (dims[a] > 1 ? v : [0, 0, 0])), values, sigma,
+            cellLengths: [1, 1, 1], cellAngles: [90, 90, 90], radiation: 'unknown',
+            axes: pickAxes(vectors, dims), axesType: 'hkl', notes,
+        };
+    }
+
+    function invert3x3(M) {
+        const [a, b, c] = M[0], [d, e, f] = M[1], [g, h, i] = M[2];
+        const A = e * i - f * h, B = f * g - d * i, C = d * h - e * g;
+        const det = a * A + b * B + c * C;
+        if (Math.abs(det) < 1e-300) throw new Error('hkl list: singular grid');
+        return [[A / det, (c * h - b * i) / det, (b * f - c * e) / det],
+            [B / det, (a * i - c * g) / det, (c * d - a * f) / det],
+            [C / det, (b * g - a * h) / det, (a * e - b * d) / det]];
+    }
+
+    // Rows "h k l I sigma" for the voxels with data (masked ones are left
+    // out, as Spinteract and Scatty skip them anyway). sigma comes from the
+    // model; without it every row gets 1. Rows whose sigma is not a positive
+    // number are left out too (Scatty stops on sigma <= 1e-8). report
+    // receives { written, noSigma, badSigma } at the end.
+    function* writeHklListChunks(model, report, rowsPerChunk) {
+        checkWritable(model, 'hkl');
+        const [nh, nk, nl] = model.dims, v = model.values, sg = model.sigma;
+        const chunk = Math.max(1, Number(rowsPerChunk) || 16384);
+        const fmt = x => {
+            const t = x.toFixed(8).replace(/\.?0+$/, '');
+            return t === '-0' ? '0' : t;
+        };
+        let out = [], written = 0, badSigma = 0;
+        for (let il = 0, i = 0; il < nl; il++) {
+            for (let ik = 0; ik < nk; ik++) {
+                for (let ih = 0; ih < nh; ih++, i++) {
+                    const x = v[i];
+                    if (x !== x || !Number.isFinite(x)) continue;
+                    let e = 1;
+                    if (sg) {
+                        e = sg[i];
+                        if (!(e > 1e-8)) {
+                            badSigma++;
+                            continue;
+                        }
+                    }
+                    const hkl = [0, 1, 2].map(c => model.corner[c] + ih * model.vectors[0][c] + ik * model.vectors[1][c] + il * model.vectors[2][c]);
+                    out.push(`${fmt(hkl[0])} ${fmt(hkl[1])} ${fmt(hkl[2])} ${x.toPrecision(9)} ${e.toPrecision(6)}`);
+                    written++;
+                    if (out.length >= chunk) {
+                        yield out.join('\n') + '\n';
+                        out = [];
+                    }
+                }
+            }
+        }
+        if (out.length) yield out.join('\n') + '\n';
+        if (report) report({ written, noSigma: !sg, badSigma });
+    }
+
+    // The grid as a Spinteract (ORIGIN + full-extent axes, n points) or Scatty
+    // (CENTRE + half-extent axes, 2p + 1 points) config snippet.
+    function hklConfigSnippet(model, target) {
+        const f = x => String(+x.toFixed(8));
+        const names = ['X_AXIS', 'Y_AXIS', 'Z_AXIS'];
+        const lines = [];
+        if (target === 'scatty') {
+            const centre = [0, 1, 2].map(c => model.corner[c] + model.vectors.reduce((acc, v, a) => acc + v[c] * (model.dims[a] - 1) / 2, 0));
+            lines.push(`CENTRE ${centre.map(f).join(' ')}`);
+            for (let a = 0; a < 3; a++) {
+                const p = (model.dims[a] - 1) / 2;
+                const half = model.vectors[a].map(x => x * p);
+                lines.push(`${names[a]} ${half.map(f).join(' ')} ${Number.isInteger(p) ? p : Math.floor(p)}`);
+            }
+            if (model.dims.some(n => n % 2 === 0)) lines.push('# note: Scatty grids have an odd number of points per axis; this one has an even count');
+        } else {
+            lines.push(`ORIGIN ${model.corner.map(f).join(' ')}`);
+            for (let a = 0; a < 3; a++) {
+                const full = model.vectors[a].map(x => x * (model.dims[a] - 1));
+                lines.push(`${names[a]} ${full.map(f).join(' ')} ${model.dims[a]}`);
+            }
+        }
+        return lines.join('\n');
     }
 
     // ------------------------------------------------------------- Scatty VTK
@@ -2162,6 +2384,7 @@
             return n * (digits + 4 * 23 + 4);
         }
         if (format === 'vtk') return n * 23 + 512;
+        if (format === 'hkl') return n * 62;
         return 0;
     }
 
@@ -2177,6 +2400,7 @@
         readMantidMD, readNexusData, nexusCandidates, unresolvedLinks, planLinkMounts, projectionVector,
         parseOldDat, readOldDatStream, writeOldDat, writeOldDatChunks, countNonFinite,
         isVtk, vtkFrame, parseGridConfig, parseVtk, readVtkStream, writeVtk, writeVtkChunks,
+        isHklList, parseHklList, readHklListStream, hklListModel, writeHklListChunks, hklConfigSnippet,
         toHklModel, resolveCell, planConversion, checkWritable, estimateOutputBytes, outputDtype,
         writeUnifiedData, writeYell,
     };

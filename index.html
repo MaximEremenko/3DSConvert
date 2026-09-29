@@ -197,10 +197,11 @@
       <button type="button" class="format" data-format="dat" aria-pressed="false"><b><svg class="i s16"><use href="#i-file"/></svg>RMCProfile .dat</b><small data-note="Text · Q in Å⁻¹ · masked voxels as I = 0">Text · Q in Å⁻¹ · masked voxels as I = 0</small></button>
       <button type="button" class="format" data-format="vtk" aria-pressed="false"><b><svg class="i s16"><use href="#i-grid"/></svg>Scatty VTK</b><small data-note="Text · ParaView · axis-aligned grids">Text · ParaView · axis-aligned grids</small></button>
       <button type="button" class="format" data-format="profile" aria-pressed="false"><b><svg class="i s16"><use href="#i-rings"/></svg>|Q| profile</b><small data-note="Shell averages as text">Shell averages as text</small></button>
+      <button type="button" class="format" data-format="hkl" aria-pressed="false"><b><svg class="i s16"><use href="#i-file"/></svg>hkl list</b><small data-note="h k l I σ rows · Spinteract · Scatty">h k l I σ rows · Spinteract · Scatty</small></button>
     </div>
     <select id="outFormat" hidden>
       <option value="unified">Unified</option><option value="yell">Yell</option><option value="dat">dat</option>
-      <option value="vtk">VTK</option><option value="profile">profile</option>
+      <option value="vtk">VTK</option><option value="profile">profile</option><option value="hkl">hkl list</option>
     </select>
     <div class="options">
       <div class="field"><span>Precision</span><div class="seg" role="group" aria-label="Precision" data-for="precision">
@@ -212,6 +213,9 @@
       <label class="field"><span>Radiation</span><select id="radiation" class="text">
         <option value="">keep / unknown</option><option value="neutron">neutron</option><option value="xray">xray</option><option value="electron">electron</option></select></label>
       <label class="field" id="profileOpts" hidden><span>Shell width (Å⁻¹)</span><input id="profileWidth" value="0.05" class="text" inputmode="decimal"></label>
+      <label class="field" id="hklOpts" hidden><span>hkl list for</span><select id="hklTarget" class="text">
+        <option value="spinteract">Spinteract (_xtal_data_01.txt)</option><option value="scatty">Scatty (scatty_data_01.txt)</option>
+        <option value="plain">plain text</option></select></label>
       <select id="precision" hidden><option value="same">same</option><option value="float64">float64</option><option value="float32">float32</option></select>
       <select id="layout" hidden><option value="both">both</option><option value="entry">entry</option></select>
       <select id="compression" hidden><option value="0">none</option><option value="4">gzip</option></select>

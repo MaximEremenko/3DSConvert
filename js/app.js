@@ -271,7 +271,7 @@
   // ------------------------------------------------------------ data
   const KIND_LABEL = {
     yell: 'Yell 1.0', unified: 'Unified HDF5', 'mantid-md': 'Mantid MDHistoWorkspace', nexus: 'NeXus NXdata',
-    dat: 'RMCProfile .dat', vtk: 'VTK · Q', 'vtk-hkl': 'VTK · r.l.u.',
+    dat: 'RMCProfile .dat', vtk: 'VTK · Q', 'vtk-hkl': 'VTK · r.l.u.', hkl: 'hkl list',
   };
 
   // Per grid axis: the component it runs along, its range and step.
@@ -340,6 +340,7 @@
       const s = await run('Reading…', 'loadData', {
         files, paths: files.map(f => f.webkitRelativePath || ''),
         yellSpace: $('yellSpace').value, nexusPath: nexusPath || null, crop: readCrop(), readSigma: $('readSigma').checked,
+        grid: state.gridConfig ? state.gridConfig.grids[pickGrid(state.gridConfig, files[0] && files[0].name)] : null,
       });
       if (!s) return;
       s.baseName = s.main.replace(/\.(h5|hdf5|hdf|he5|nx|nxs|nx5|dat|txt|vtk)$/i, '');
@@ -364,6 +365,8 @@
         info = `RMCProfile old text format | grid ${s.dims.join(' x ')} in Q`;
       } else if (s.kind === 'vtk') {
         info = `VTK STRUCTURED_POINTS in Q | grid ${s.dims.join(' x ')}`;
+      } else if (s.kind === 'hkl') {
+        info = `hkl list | grid ${s.dims.join(' x ')}${s.hasSigma ? ' | σ' : ''}`;
       } else if (s.kind === 'vtk-hkl') {
         info = `VTK STRUCTURED_POINTS in r.l.u. ("${s.title}") | grid ${s.dims.join(' x ')}`;
       } else {
@@ -438,6 +441,7 @@
         (cfg.customFrame ? ' | custom HKL_TO_X/Y/Z frame' : '');
       $('gridConfigInfo').textContent = info;
       log(`Grid config "${fileObj.name}": ${info}`, 'ok');
+      if (state.data && state.data.kind === 'hkl' && !current) loadDataFile();
     } catch (e) {
       $('gridConfigInfo').textContent = 'Error: ' + e.message;
       log('Error reading grid config: ' + e.message, 'err');
@@ -448,7 +452,7 @@
   // Spinteract writes one image per data set (..._img_NN.vtk) and one grid
   // per data set in its config; match them by number.
   function pickGrid(cfg, dataName) {
-    const m = /_(\d+)\.vtk$/i.exec(dataName || '');
+    const m = /_(\d+)\.(vtk|txt)$/i.exec(dataName || '');
     const index = cfg.grids.length > 1 && m ? Number(m[1]) - 1 : 0;
     return index >= 0 && index < cfg.grids.length ? index : 0;
   }
@@ -1647,9 +1651,20 @@
   }
 
   // ------------------------------------------------------------ output
-  const SUFFIX = { unified: '_unified.h5', yell: '_yell.h5', dat: '_diffuse3d.dat', vtk: '_diffuse.vtk', profile: '_profile.txt' };
-  const FORMAT_TITLE = { unified: 'Unified HDF5', yell: 'Yell 1.0', dat: 'RMCProfile .dat', vtk: 'Scatty VTK', profile: '|Q| profile' };
-  const TEXT_FORMATS = new Set(['dat', 'vtk', 'profile']);
+  const SUFFIX = {
+    unified: '_unified.h5', yell: '_yell.h5', dat: '_diffuse3d.dat', vtk: '_diffuse.vtk', profile: '_profile.txt', hkl: '_hkl.txt',
+  };
+  const FORMAT_TITLE = {
+    unified: 'Unified HDF5', yell: 'Yell 1.0', dat: 'RMCProfile .dat', vtk: 'Scatty VTK', profile: '|Q| profile', hkl: 'hkl list',
+  };
+  const TEXT_FORMATS = new Set(['dat', 'vtk', 'profile', 'hkl']);
+
+  // The output file name: Spinteract and Scatty read their data by name.
+  function fileNameFor(base, tag, format) {
+    if (format === 'hkl' && $('hklTarget').value === 'spinteract') return `${base}${tag}_xtal_data_01.txt`;
+    if (format === 'hkl' && $('hklTarget').value === 'scatty') return 'scatty_data_01.txt';
+    return base + tag + SUFFIX[format];
+  }
 
   // Direct-space output: a 3D-ΔPDF in the recipe, or direct-space input.
   const directOutput = () => !!state.data && (state.data.axesType === 'uvw' || activeRecipe().some(s => s.op === 'deltaPdf'));
@@ -1657,7 +1672,7 @@
   function outputName() {
     const s = state.data, steps = activeRecipe().length;
     const tag = !steps ? '' : directOutput() && s.axesType !== 'uvw' ? '_dpdf' : '_processed';
-    return (s.baseName || 'converted') + tag + SUFFIX[$('outFormat').value];
+    return fileNameFor(s.baseName || 'converted', tag, $('outFormat').value);
   }
 
   function updateOutput() {
@@ -1682,6 +1697,7 @@
     }
     $('radiation').disabled = text;
     $('profileOpts').hidden = fmt !== 'profile';
+    $('hklOpts').hidden = fmt !== 'hkl';
     $('outCard').classList.toggle('done', !!state.data);
     const s = state.data;
     if (!s) {
@@ -1713,7 +1729,7 @@
       });
     }
   }
-  for (const id of ['outFormat', 'precision', 'layout', 'compression', 'radiation']) $(id).addEventListener('change', updateOutput);
+  for (const id of ['outFormat', 'precision', 'layout', 'compression', 'radiation', 'hklTarget']) $(id).addEventListener('change', updateOutput);
 
   function download(bytes, filename, mime) {
     const blob = new Blob(Array.isArray(bytes) ? bytes : [bytes], { type: mime });
@@ -1732,6 +1748,7 @@
       try {
         const [description, extension] = {
           dat: ['RMCProfile old diffuse text format', '.dat'], vtk: ['VTK legacy file', '.vtk'], profile: ['|Q| profile', '.txt'],
+          hkl: ['hkl list', '.txt'],
         }[format];
         const handle = await window.showSaveFilePicker({
           suggestedName: filename,
@@ -1770,7 +1787,7 @@
       manual: src === 'manual' ? manualCell() : null, cellPrefer: src,
       precision: $('precision').value, layout: $('layout').value, compression: Number($('compression').value),
       recipe: steps.length ? { version: 1, steps } : null,
-      profileWidth: Number($('profileWidth').value),
+      profileWidth: Number($('profileWidth').value), hklTarget: $('hklTarget').value,
     };
     const bad = state.recipe.map((s, n) => [n + 1, s.enabled === false ? null : checkStep(s, n).error]).filter(x => x[1]);
     for (const [n, error] of bad) log(`Error: processing step ${n}: ${error}`, 'err');
@@ -1805,7 +1822,7 @@
         log(`Output: about ${fmtBytes(plan.estimate)}` + (!text && params.compression ? ' before compression' : '') + '.');
       }
       const tag = !plan.processed ? '' : direct && state.data.axesType !== 'uvw' ? '_dpdf' : '_processed';
-      const outName = (state.data.baseName || 'converted') + tag + SUFFIX[format];
+      const outName = fileNameFor(state.data.baseName || 'converted', tag, format);
       const t0 = Date.now();
       if (text) {
         if (plan.nonFinite) {
@@ -1813,9 +1830,15 @@
             (format === 'dat' ? ' (RMCProfile leaves points with I = 0 out of the fit).' : '.'), 'warn');
         }
         sink = await openTextSink(outName, format);
-        await run('Writing…', 'write', {}, { onChunk: chunk => sink.write(chunk) });
+        const written = await run('Writing…', 'write', {}, { onChunk: chunk => sink.write(chunk) });
         await sink.close();
         log(`Wrote ${outName} (${sink.how})`, 'ok');
+        const r = written && written.report;
+        if (r) {
+          log(`${fmtInt(r.written)} rows written` + (r.noSigma ? '; no uncertainties, so every sigma is 1' : '') +
+            (r.badSigma ? `; ${fmtInt(r.badSigma)} voxels without a positive sigma left out` : ''), r.noSigma || r.badSigma ? 'warn' : 'info');
+        }
+        if (written && written.snippet) log(`Grid for the ${params.hklTarget === 'scatty' ? 'Scatty' : 'Spinteract'} config:\n${written.snippet}`);
       } else {
         if (plan.estimate > 1.9 * 1073741824) {
           log('Warning: HDF5 files are assembled in memory, and Chrome/Edge cannot hold one above ' +
