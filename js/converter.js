@@ -166,13 +166,16 @@
     // Read a dataset slab by slab along its first dimension, so the HDF5
     // heap only ever holds one slab. Slabs follow the chunking when there is
     // one. onSlab(start, count, values) receives `count` planes in C order.
-    async function forEachSlab(ds, path, opts, onSlab) {
+    // box: [start, end) per dimension to read only that hyperslab; start
+    // then counts from the box's first plane.
+    async function forEachSlab(ds, path, opts, onSlab, box) {
         opts = opts || {};
         const shape = Array.from(ds.shape || []).map(Number);
         if (!shape.length) throw new Error(`${path} is a scalar, expected an array`);
         assertDecodable(ds, path);
-        const n0 = shape[0];
-        const planeLen = shape.slice(1).reduce((a, b) => a * b, 1);
+        const b = box || shape.map(n => [0, n]);
+        const n0 = b[0][1] - b[0][0];
+        const planeLen = b.slice(1).reduce((a, [lo, hi]) => a * (hi - lo), 1);
         const itemBytes = Math.max(1, Number((ds.metadata || {}).size) || 8);
         const chunks = (ds.metadata || {}).chunks;
         const chunk0 = chunks && chunks.length ? Number(chunks[0]) : 0;
@@ -180,7 +183,7 @@
         const planes = Math.min(n0, chunk0 > 0 && chunk0 <= fit ? chunk0 * Math.floor(fit / chunk0) : fit);
         for (let start = 0; start < n0; start += planes) {
             const count = Math.min(planes, n0 - start);
-            let values = ds.slice([[start, start + count]]);
+            let values = ds.slice(box ? [[b[0][0] + start, b[0][0] + start + count]].concat(b.slice(1)) : [[start, start + count]]);
             if (values instanceof BigInt64Array || values instanceof BigUint64Array) {
                 values = Float64Array.from(values, Number);
             }
@@ -190,9 +193,13 @@
         }
     }
 
+    // box: inclusive [lo, hi] index ranges per model axis (h, k, l), or null.
+    const boxDims = box => box.map(([lo, hi]) => hi - lo + 1);
+    const hyperslab = box => box.map(([lo, hi]) => [lo, hi + 1]);
+
     // Dataset in C order [nh,nk,nl] (l fastest) -> h-fastest values.
-    async function readLFastest(ds, path, dims, opts) {
-        const [nh, nk, nl] = dims;
+    async function readLFastest(ds, path, dims, opts, box) {
+        const [nh, nk, nl] = box ? boxDims(box) : dims;
         const out = allocFor(ds, nh * nk * nl);
         await forEachSlab(ds, path, opts, (h0, count, slab) => {
             for (let dh = 0; dh < count; dh++) {
@@ -202,29 +209,34 @@
                     for (let il = 0; il < nl; il++) out[(il * nk + ik) * nh + ih] = slab[src + il];
                 }
             }
-        });
+        }, box && hyperslab(box));
         return out;
     }
 
     // Dataset in C order [nl,nk,nh] (h fastest), or a lower-rank array in
     // the same flat order: slabs copy straight in.
-    async function readHFastest(ds, path, dims, opts) {
-        const out = allocFor(ds, dims[0] * dims[1] * dims[2]);
-        await forEachSlab(ds, path, opts, (start, count, slab) => out.set(slab, start * (slab.length / count)));
+    async function readHFastest(ds, path, dims, opts, box) {
+        const sub = box && ds.shape && ds.shape.length === 3;
+        const n = sub ? boxDims(box).reduce((a, b) => a * b, 1) : dims[0] * dims[1] * dims[2];
+        const out = allocFor(ds, n);
+        await forEachSlab(ds, path, opts, (start, count, slab) => out.set(slab, start * (slab.length / count)),
+            sub ? hyperslab([box[2], box[1], box[0]]) : null);
         return out;
     }
 
     // Any rank-1..3 dataset; axisOfDim[d] is the model axis (0 = abscissa)
     // of dataset dimension d in C order. Returns { values, dims }.
-    async function readPermuted(ds, path, axisOfDim, opts) {
+    async function readPermuted(ds, path, axisOfDim, opts, box) {
         const shape = Array.from(ds.shape || []).map(Number);
+        const rank = shape.length;
         while (shape.length < 3) shape.push(1);
+        const sub = box && rank === 3;
         const dims = [1, 1, 1];
-        axisOfDim.forEach((axis, d) => { dims[axis] = shape[d]; });
+        axisOfDim.forEach((axis, d) => { dims[axis] = sub ? box[axis][1] - box[axis][0] + 1 : shape[d]; });
         const stride = [1, dims[0], dims[0] * dims[1]];
         const s0 = stride[axisOfDim[0]], s1 = stride[axisOfDim[1]], s2 = stride[axisOfDim[2]];
         const out = allocFor(ds, dims[0] * dims[1] * dims[2]);
-        const n1 = shape[1], n2 = shape[2];
+        const n1 = dims[axisOfDim[1]], n2 = dims[axisOfDim[2]];
         await forEachSlab(ds, path, opts, (start, count, slab) => {
             let src = 0;
             for (let d0 = start; d0 < start + count; d0++) {
@@ -233,8 +245,58 @@
                     for (let d2 = 0; d2 < n2; d2++) out[base + d2 * s2] = slab[src++];
                 }
             }
-        });
+        }, sub ? hyperslab(axisOfDim.map(axis => box[axis])) : null);
         return { values: out, dims };
+    }
+
+    // opts.crop ({ h: [min, max], k: ..., l: ... }) as an index box on this
+    // grid, or null when nothing is cut or the crop cannot apply here (then
+    // with a note). The grid axes must run along h, k and l.
+    function readBox(dims, corner, vectors, opts, notes, axesType) {
+        const crop = opts && opts.crop;
+        if (!crop || !['h', 'k', 'l'].some(n => crop[n])) return null;
+        if (axesType && axesType !== 'hkl') {
+            notes.push('crop on read needs hkl axes; the whole grid was read');
+            return null;
+        }
+        const axisOf = [-1, -1, -1];
+        for (let a = 0; a < 3; a++) {
+            if (dims[a] <= 1) continue;
+            const v = vectors[a], big = Math.max(...v.map(Math.abs));
+            const nz = [0, 1, 2].filter(c => Math.abs(v[c]) > 1e-9 * big);
+            if (nz.length !== 1) {
+                notes.push('crop on read needs grid axes along h, k and l; the whole grid was read');
+                return null;
+            }
+            axisOf[nz[0]] = a;
+        }
+        const lo = [0, 0, 0], hi = dims.map(n => n - 1);
+        ['h', 'k', 'l'].forEach((name, c) => {
+            const r = crop[name];
+            if (!r || axisOf[c] < 0) return;
+            const a = axisOf[c], step = vectors[a][c];
+            let i0 = (r[0] - corner[c]) / step, i1 = (r[1] - corner[c]) / step;
+            if (step < 0) [i0, i1] = [i1, i0];
+            lo[a] = Math.max(lo[a], Math.ceil(i0 - 1e-6));
+            hi[a] = Math.min(hi[a], Math.floor(i1 + 1e-6));
+            if (lo[a] > hi[a]) throw new Error(`crop on read: no grid points with ${name} in ${r[0]}..${r[1]}`);
+        });
+        if (lo.every(x => x === 0) && hi.every((x, a) => x === dims[a] - 1)) return null;
+        const box = lo.map((x, a) => [x, hi[a]]);
+        notes.push(`cropped on read to ${boxDims(box).join(' x ')} of ${dims.join(' x ')}`);
+        return box;
+    }
+
+    // The grid of a box: its dims and corner, and the vectors of axes that
+    // keep more than one point.
+    function boxedGrid(box, dims, corner, vectors) {
+        if (!box) return { dims, corner, vectors };
+        const d = boxDims(box);
+        return {
+            dims: d,
+            corner: [0, 1, 2].map(c => corner[c] + box.reduce((acc, [lo], a) => acc + lo * vectors[a][c], 0)),
+            vectors: vectors.map((v, a) => (d[a] > 1 ? v.slice() : [0, 0, 0])),
+        };
     }
 
     function normalizeRadiation(value) {
@@ -605,11 +667,7 @@
         const notes = [];
         const names = axisNamesAttr(group);
         const layout = scatteringLayout(f, g, group, names, shape, notes);
-        const dims = layout === 'abs-fastest' ? [shape[2], shape[1], shape[0]] : shape.slice();
-        const values = layout === 'abs-fastest'
-            ? await readHFastest(ds, g + 'data', dims, opts)
-            : await readLFastest(ds, g + 'data', dims, opts);
-
+        const fullDims = layout === 'abs-fastest' ? [shape[2], shape[1], shape[0]] : shape.slice();
         let corner = numbersAt(f, g + 'lower_limits');
         const sv = numbersAt(f, g + 'step_vectors');
         let vectors;
@@ -617,9 +675,17 @@
             vectors = [0, 1, 2].map(axis => [0, 1, 2].map(comp =>
                 layout === 'abs-fastest' ? sv[axis * 3 + comp] : sv[comp * 3 + axis]));
         } else {
-            ({ corner, vectors } = gridFromCoordinates(f, g, names, dims));
+            ({ corner, vectors } = gridFromCoordinates(f, g, names, fullDims));
             notes.push(`no lower_limits/step_vectors: grid taken from the ${names.join('/')} coordinate arrays`);
         }
+        const contract = validateDataContract(f, group, attributeText(group, 'space') || 'reciprocal');
+        const box = readBox(fullDims, corner, vectors, opts, notes, contract.axesType);
+        const values = layout === 'abs-fastest'
+            ? await readHFastest(ds, g + 'data', fullDims, opts, box)
+            : await readLFastest(ds, g + 'data', fullDims, opts, box);
+        const grid = boxedGrid(box, fullDims, corner, vectors);
+        const dims = grid.dims;
+        ({ corner, vectors } = grid);
 
         let lengths = numbersAt(f, g + 'unit_cell_lengths');
         let angles = numbersAt(f, g + 'unit_cell_angles');
@@ -640,7 +706,6 @@
             (comps.every(c => c >= 0) && new Set(comps).size === 3 ? comps.map(c => c + 1) : pickAxes(vectors, dims));
         const radiation = normalizeRadiation(
             attributeText(group, 'radiation') || attributeText(group, 'scattering'));
-        const contract = validateDataContract(f, group, attributeText(group, 'space') || 'reciprocal');
         return Object.assign({
             dims, corner, vectors, values,
             cellLengths: lengths, cellAngles: angles, radiation, axes,
@@ -674,28 +739,31 @@
             reversed = true;
             notes.push('data_values is stored in reversed [nl,nk,nh] order; read accordingly');
         }
+        const iv = numbersAt(f, g + 'data_increment_vector', 'unified data');
+        const fullVectors = [0, 1, 2].map(axis => [0, 1, 2].map(comp =>
+            reversed ? iv[axis * 3 + comp] : iv[comp * 3 + axis]));
+        const fullCorner = numbersAt(f, g + 'data_corner', 'unified data');
+        const reciprocal = datasetText(f, g + 'data_type_reciprocal');
+        const contract = validateDataContract(f, f.get('entry/data'), reciprocal);
+        const box = reversed || shape.length === 3 ? readBox(dims, fullCorner, fullVectors, opts, notes, contract.axesType) : null;
         let values;
         if (reversed) {
-            values = await readHFastest(ds, g + 'data_values', dims, opts);
+            values = await readHFastest(ds, g + 'data_values', dims, opts, box);
         } else if (shape.length === 3) {
-            values = await readLFastest(ds, g + 'data_values', dims, opts);
+            values = await readLFastest(ds, g + 'data_values', dims, opts, box);
         } else {
             // Size-1 axes dropped from the stored shape: the C order is unchanged.
             const flat = readDataset(ds, g + 'data_values');
             values = lFastestToHFastest(flat, nh, nk, nl, isFloat32Dataset(ds));
         }
-        const corner = numbersAt(f, g + 'data_corner', 'unified data');
-        const iv = numbersAt(f, g + 'data_increment_vector', 'unified data');
-        const vectors = [0, 1, 2].map(axis => [0, 1, 2].map(comp =>
-            reversed ? iv[axis * 3 + comp] : iv[comp * 3 + axis]));
+        const grid = boxedGrid(box, dims, fullCorner, fullVectors);
+        const { corner, vectors } = grid;
         const lengths = numbersAt(f, g + 'unit_cell_lengths', 'unified data');
         const angles = numbersAt(f, g + 'unit_cell_angles', 'unified data');
         const axes = numbersAt(f, g + 'data_axes') || [1, 2, 3];
         const radiation = normalizeRadiation(datasetText(f, g + 'data_radiation'));
-        const reciprocal = datasetText(f, g + 'data_type_reciprocal');
-        const contract = validateDataContract(f, f.get('entry/data'), reciprocal);
         return Object.assign({
-            dims, corner, vectors, values,
+            dims: grid.dims, corner, vectors, values,
             cellLengths: lengths, cellAngles: angles, radiation, axes,
             axesType: contract.axesType, numberType: contract.numberType, notes,
         }, dataTypeMeta(contract.axesType, datasetText(f, g + 'data_type_content'),
@@ -743,8 +811,6 @@
         if (shape.length < 1 || shape.length > 3) throw new Error('Yell data must be rank 1, 2 or 3');
         const [nh, nk, nl] = pad3(shape, 1);
         if (shape.length < 3) notes.push(`${shape.length}-D data read as a ${nh} x ${nk} x ${nl} grid`);
-        // C [nh], [nh,nk] and [nh,nk,nl] share one flat order, so slabs work for all.
-        const values = await readLFastest(ds, 'data', [nh, nk, nl], opts);
         const corner = pad3(numbersAt(f, 'lower_limits', 'Yell file'), 0);
         let vectors;
         if (f.get('step_sizes_abs') && f.get('step_sizes_ord') && f.get('step_sizes_top')) {
@@ -761,8 +827,12 @@
             vectors = [[s[0], 0, 0], [0, s[1], 0], [0, 0, s[2]]];
         }
         const cell = numbersAt(f, 'unit_cell', 'Yell file');
+        // C [nh], [nh,nk] and [nh,nk,nl] share one flat order, so slabs work for all.
+        const box = shape.length === 3 ? readBox([nh, nk, nl], corner, vectors, opts, notes, direct ? 'uvw' : 'hkl') : null;
+        const values = await readLFastest(ds, 'data', [nh, nk, nl], opts, box);
+        const grid = boxedGrid(box, [nh, nk, nl], corner, vectors);
         return Object.assign({
-            dims: [nh, nk, nl], corner, vectors, values,
+            dims: grid.dims, corner: grid.corner, vectors: grid.vectors, values,
             cellLengths: cell.slice(0, 3), cellAngles: cell.slice(3, 6),
             radiation: 'unknown', axes: [1, 2, 3], notes,
         }, direct ? { axesType: 'uvw', content: '3d-delta-pdf' } : {});
@@ -892,8 +962,9 @@
         }
 
         const progress = opts.progress;
+        const box = shape.length === 3 ? readBox(dims, corner, vectors, opts, notes, 'hkl') : null;
         const values = await readHFastest(sig, g + 'signal', dims,
-            Object.assign({}, opts, { progress: progress && (x => progress(0.9 * x)) }));
+            Object.assign({}, opts, { progress: progress && (x => progress(0.9 * x)) }), box);
         let masked = 0, infinite = 0;
         const mask = f.get(g + 'mask');
         if (isDataset(mask) && sameShape(Array.from(mask.shape).map(Number), shape)) {
@@ -906,8 +977,9 @@
                             masked++;
                         }
                     }
-                });
+                }, box && hyperslab([box[2], box[1], box[0]]));
         }
+        const grid = boxedGrid(box, dims, corner, vectors);
         for (let i = 0; i < values.length; i++) {
             if (values[i] === Infinity || values[i] === -Infinity) {
                 values[i] = NaN;
@@ -936,8 +1008,8 @@
         }
         notes.push('radiation set to neutron (Mantid workspace); change it under Output if needed');
         return {
-            dims, corner, vectors, values, cellLengths: lengths, cellAngles: angles,
-            radiation: 'neutron', axes: pickAxes(vectors, dims), axesType: 'hkl', notes,
+            dims: grid.dims, corner: grid.corner, vectors: grid.vectors, values, cellLengths: lengths, cellAngles: angles,
+            radiation: 'neutron', axes: pickAxes(grid.vectors, grid.dims), axesType: 'hkl', notes,
         };
     }
 
@@ -1146,23 +1218,28 @@
             const free = [0, 1, 2].filter(a => !axisOfDim.includes(a));
             axisOfDim = axisOfDim.concat(free.slice(0, 3 - rank));
         }
-        const read = await readPermuted(sig, `${pick.path}/${pick.signal}`, axisOfDim, opts);
-        const values = read.values;
-        const dims = read.dims;
-        const corner = [0, 0, 0];
-        const vectors = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+        const padded = shape.slice();
+        while (padded.length < 3) padded.push(1);
+        const fullDims = [1, 1, 1];
+        axisOfDim.forEach((axis, d) => { fullDims[axis] = padded[d]; });
+        const fullCorner = [0, 0, 0];
+        const fullVectors = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
         axes.forEach((a, d) => {
             const axis = axisOfDim[d];
             for (let c = 0; c < 3; c++) {
-                corner[c] += a.dir[c] * a.first;
-                vectors[axis][c] = dims[axis] > 1 ? a.dir[c] * a.step : 0;
+                fullCorner[c] += a.dir[c] * a.first;
+                fullVectors[axis][c] = fullDims[axis] > 1 ? a.dir[c] * a.step : 0;
             }
         });
+        const box = rank === 3 ? readBox(fullDims, fullCorner, fullVectors, opts, notes, frame === 'Q' ? 'Q' : 'hkl') : null;
+        const read = await readPermuted(sig, `${pick.path}/${pick.signal}`, axisOfDim, opts, box);
+        const values = read.values;
+        const { dims, corner, vectors } = boxedGrid(box, fullDims, fullCorner, fullVectors);
         if (axes.some(a => a.edges)) notes.push('axes hold bin edges; grid points are the bin centres');
 
         const weights = group.get('weights');
         if (isDataset(weights) && sameShape(Array.from(weights.shape).map(Number), shape)) {
-            const w = (await readPermuted(weights, `${pick.path}/weights`, axisOfDim, { tick: opts.tick })).values;
+            const w = (await readPermuted(weights, `${pick.path}/weights`, axisOfDim, { tick: opts.tick }, box)).values;
             let zero = 0;
             for (let i = 0; i < values.length; i++) {
                 if (w[i] > 0) values[i] /= w[i];

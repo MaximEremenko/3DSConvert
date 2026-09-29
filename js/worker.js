@@ -319,7 +319,7 @@ function converterWorker(self, h5wasm, Converter, Processing, wgpuFftWeb) {
         // files: the selected data file, or a NeXus file plus the files its
         // external links point to; paths: their folder-relative paths (may be
         // empty); nexusPath: the NXdata group to read (default: @default).
-        async loadData({ files, paths, yellSpace, nexusPath }, ctx) {
+        async loadData({ files, paths, yellSpace, nexusPath, crop }, ctx) {
             state.data = null;
             state.plan = null;
             state.processed = null;
@@ -341,7 +341,7 @@ function converterWorker(self, h5wasm, Converter, Processing, wgpuFftWeb) {
                 if (main < 0) throw new Error(Converter.unsupportedKindMessage(kinds[0]) || 'no data file among the selection');
             }
             const file = files[main];
-            const opts = { size: file.size, tick: ctx.tick, progress: f => ctx.progress('Reading', f) };
+            const opts = { size: file.size, tick: ctx.tick, progress: f => ctx.progress('Reading', f), crop };
             if (!hdf5[main]) {
                 state.data = await readTextVolume(file, opts);
                 return { result: Object.assign(summarize(state.data), { main: file.name }) };

@@ -339,7 +339,7 @@
     try {
       const s = await run('Reading…', 'loadData', {
         files, paths: files.map(f => f.webkitRelativePath || ''),
-        yellSpace: $('yellSpace').value, nexusPath: nexusPath || null,
+        yellSpace: $('yellSpace').value, nexusPath: nexusPath || null, crop: readCrop(),
       });
       if (!s) return;
       s.baseName = s.main.replace(/\.(h5|hdf5|hdf|he5|nx|nxs|nx5|dat|txt|vtk)$/i, '');
@@ -390,6 +390,21 @@
       log('Error reading data file: ' + msg, 'err');
     }
     updateButton();
+  }
+
+  // The crop-on-read ranges that have both ends, or null.
+  function readCrop() {
+    const crop = {};
+    for (const axis of ['h', 'k', 'l']) {
+      const ends = [0, 1].map(e => $('cropRow').querySelector(`[data-axis="${axis}"][data-end="${e}"]`).value.trim());
+      if (ends.every(Boolean) && ends.every(x => isFinite(Number(x)))) crop[axis] = ends.map(Number).sort((a, b) => a - b);
+    }
+    return Object.keys(crop).length ? crop : null;
+  }
+  for (const input of $('cropRow').querySelectorAll('input')) {
+    input.addEventListener('change', () => {
+      if (state.dataFiles.length && !current) loadDataFile(state.data && state.data.nexusPath);
+    });
   }
 
   function useDataFiles(files) {

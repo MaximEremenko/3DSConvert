@@ -220,3 +220,39 @@ test('projectionVector parses Mantid dimension names', () => {
     assert.equal(Converter.projectionVector('H (r.l.u.)'), null);
     assert.equal(Converter.projectionVector('[0,0,0]'), null);
 });
+
+test('crop on read equals reading everything and cropping, for every HDF5 reader', async () => {
+    const Processing = require('../js/processing.js');
+    const { openH5 } = require('./helpers');
+    const crop = { h: [-0.5, 1], l: [0, 0.5] };
+    const nxdata = () => buildH5(file => {
+        const d = file.create_group('entry').create_group('data');
+        d.create_attribute('NX_class', 'NXdata');
+        d.create_attribute('signal', 'intensity');
+        d.create_attribute('axes', ['l', 'k', 'h'], [3], 'S1');
+        d.create_dataset({ name: 'intensity', data: fastestFirst(5, 4, 3), shape: [3, 4, 5], dtype: '<d' });
+        [['h', linspace(-1, 1, 5)], ['k', linspace(0, 1.5, 4)], ['l', linspace(-0.5, 0.5, 3)]].forEach(([name, a]) =>
+            d.create_dataset({ name, data: a, shape: [a.length], dtype: '<d' }));
+    });
+    const example = await Converter.readUnifiedData(await openH5('Examples/example_unified.h5'));
+    const cell = { lengths: example.cellLengths, angles: example.cellAngles };
+    const cases = [
+        ['unified /scattering/data', () => openH5('Examples/example_unified.h5'), (f, o) => Converter.readUnifiedData(f, o)],
+        ['unified /entry/data', () => buildH5(f => Converter.writeUnifiedData(f, example, cell, {}, { layout: 'entry' })),
+            (f, o) => Converter.readUnifiedData(f, o)],
+        ['Yell', () => openH5('Examples/example_yell.h5'), (f, o) => Converter.readYell(f, o)],
+        ['Mantid', () => mantidFile({}), (f, o) => Converter.readMantidMD(f, o)],
+        ['NXdata', nxdata, (f, o) => Converter.readNexusData(f, o)],
+    ];
+    for (const [name, open, read] of cases) {
+        const full = await read(await open(), {});
+        const part = await read(await open(), { crop });
+        const want = await Processing.applyRecipe(full, { steps: [Object.assign({ op: 'crop' }, crop)] }, {});
+        assert.deepEqual(part.dims, want.dims, name);
+        assert.ok(maxAbsDiff(part.corner, want.corner) < 1e-12, name + ' corner');
+        assert.ok(maxAbsDiff(part.vectors.flat(), want.vectors.flat()) < 1e-12, name + ' vectors');
+        assert.deepEqual(Array.from(part.values), Array.from(want.values), name + ' values');
+        assert.match(part.notes.join('\n'), /cropped on read to/, name);
+    }
+    await assert.rejects(Converter.readYell(await openH5('Examples/example_yell.h5'), { crop: { h: [5, 6] } }), /no grid points with h/);
+});

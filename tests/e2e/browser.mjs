@@ -343,6 +343,16 @@ const scenarios = [
             throw new Error('statuses:\n' + status);
         }
     }],
+    ['crop on read: only the chosen hkl box is read', async () => {
+        await evaluate(`(() => {
+            for (const [axis, end, v] of [['h', 0, -0.5], ['h', 1, 1], ['l', 0, 0], ['l', 1, 0.5]]) {
+                document.querySelector('#cropRow [data-axis="' + axis + '"][data-end="' + end + '"]').value = v;
+            }
+        })()`);
+        await setFile('#dataFile', path.join(ROOT, 'Examples/example_unified.h5'));
+        await waitLog(/Unified data format \| grid 4 x 5 x 2/);
+        await waitLog(/cropped on read to 4 x 5 x 2 of 5 x 5 x 5/);
+    }],
     ['NeXus entry + externally linked data file -> unified', async () => {
         await setFile('#dataFile', [path.join(work, 'wrapper.nxs'), path.join(work, 't.nxs')]);
         await waitLog(/linked files: t\.nxs as scan\/t\.nxs/);
