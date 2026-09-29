@@ -613,7 +613,8 @@
     clip: ['Replace low values', [['below', 'num', 'below'], ['to', 'clipTo', 'with (a number or nan)']]],
     symmetrize: ['Symmetrize', [['laue', Processing.LAUE_GROUPS, 'Laue group'],
       ['mode', ['average', 'fill'], 'average all, or fill empty voxels'], ['expand', 'bool', 'extend the grid']]],
-    deltaPdf: ['3D-ΔPDF', [['taper', 'num', 'Tukey taper (0–1)'], ['engine', ['cpu', 'gpu'], 'FFT on (CPU float64, GPU float32)']]],
+    deltaPdf: ['3D-ΔPDF', [['taper', 'num', 'Tukey taper (0–1)'], ['engine', ['cpu', 'gpu'], 'FFT on (CPU float64, GPU float32)'],
+      ['fill', 'num', 'fill holes, voxels deep (0 = count them as 0)']]],
   };
   const STEP_GROUPS = [
     ['Grid', ['crop', 'resample', 'rebin']], ['Masks', ['maskBragg', 'maskRings', 'maskRange']],
@@ -632,7 +633,7 @@
     scale: { factor: 1, offset: 0 }, backgroundFunction: { kind: 'constant', params: [0] },
     backgroundShells: { width: 0.05, percentile: 5, smooth: 1 }, combine: { operation: 'subtract', scale: 1 },
     clip: { below: 0, to: 0 }, symmetrize: { laue: 'm-3m', mode: 'average', expand: false },
-    deltaPdf: { taper: 0, engine: 'cpu' },
+    deltaPdf: { taper: 0, engine: 'cpu', fill: 0 },
   };
   const PRESETS = [
     { name: '3D-ΔPDF of a cubic crystal', note: 'm-3m symmetrize · Bragg mask · ΔPDF', steps: [

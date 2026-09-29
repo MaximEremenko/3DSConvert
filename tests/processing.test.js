@@ -276,6 +276,22 @@ test('3D-ΔPDF of a plane wave peaks at +-r0; 2-D grids work', async () => {
     assert.ok(Math.abs(value(p2, 4, 4, 0) - 81 * 0.25 ** 2) < 1e-9);
 });
 
+test('3D-ΔPDF punch and fill: holes next to data take their neighbours\' mean', async () => {
+    const m = grid(1, 0.25, () => 1);                                   // 9 x 9 x 9
+    m.values[(4 * 9 + 4) * 9 + 4] = NaN;                                // punch the centre voxel
+    m.values[(2 * 9 + 6) * 9 + 1] = NaN;
+    const zero = await run(m, [{ op: 'deltaPdf' }], { fft: cpuFft });
+    assert.ok(Math.abs(value(zero, 4, 4, 4) - 727 * 0.25 ** 3) < 1e-9, 'holes count as 0');
+    const logs = [];
+    const filled = await run(m, [{ op: 'deltaPdf', fill: 2 }], { fft: cpuFft, log: t => logs.push(t) });
+    assert.ok(Math.abs(value(filled, 4, 4, 4) - 729 * 0.25 ** 3) < 1e-9, 'filled like the constant');
+    assert.ok(Math.abs(value(filled, 5, 4, 4)) < 1e-9);
+    assert.match(logs.join('\n'), /2 empty voxels filled from their neighbours \(2 passes\)/);
+    assert.match(Processing.describeStep(Processing.normalizeRecipe({ steps: [{ op: 'deltaPdf', fill: 3 }] }).steps[0]),
+        /holes filled 3 voxels deep/);
+    assert.throws(() => Processing.normalizeRecipe({ steps: [{ op: 'deltaPdf', fill: 1.5 }] }), /fill/);
+});
+
 test('hkl-only steps refuse direct-space data; ΔPDF needs the FFT engine', async () => {
     const m = grid(1, 0.5, () => 1);
     const p = await run(m, [{ op: 'deltaPdf' }], { fft: cpuFft });

@@ -281,7 +281,7 @@
         combine: { scale: 1 },
         clip: { below: 0, to: 0 },
         symmetrize: { mode: 'average', expand: false },
-        deltaPdf: { taper: 0, engine: 'cpu' },
+        deltaPdf: { taper: 0, engine: 'cpu', fill: 0 },
     };
 
     function stepCrop(model, step) {
@@ -776,8 +776,69 @@
     // phase ramp on the input. NaN voxels (masked Bragg regions) count as 0.
     // ctx.fft(shape, data, 'inverse', engine) resolves to the transformed
     // interleaved complex array.
+    // "Punch and fill": NaN voxels next to data take the mean of their
+    // measured 6-neighbours, one layer per pass, `passes` layers deep (holes
+    // such as masked Bragg regions close; the far outside stays empty).
+    // Returns the filled copy of the values and how many voxels were filled.
+    function fillHoles(model, passes) {
+        const [nx, ny, nz] = model.dims, v = Float64Array.from(model.values);
+        const plane = nx * ny;
+        const around = (n, visit) => {
+            const i = n % nx, j = Math.floor(n / nx) % ny, k = Math.floor(n / plane);
+            if (i > 0) visit(n - 1);
+            if (i < nx - 1) visit(n + 1);
+            if (j > 0) visit(n - nx);
+            if (j < ny - 1) visit(n + nx);
+            if (k > 0) visit(n - plane);
+            if (k < nz - 1) visit(n + plane);
+        };
+        const queued = new Uint8Array(v.length);
+        let frontier = [];
+        for (let n = 0; n < v.length; n++) {
+            if (v[n] === v[n]) continue;
+            let edge = false;
+            around(n, m => { if (v[m] === v[m]) edge = true; });
+            if (edge) {
+                frontier.push(n);
+                queued[n] = 1;
+            }
+        }
+        let filled = 0;
+        for (let pass = 0; pass < passes && frontier.length; pass++) {
+            const next = new Float64Array(frontier.length);
+            frontier.forEach((n, t) => {
+                let sum = 0, cnt = 0;
+                around(n, m => {
+                    if (v[m] === v[m]) {
+                        sum += v[m];
+                        cnt++;
+                    }
+                });
+                next[t] = sum / cnt;
+            });
+            frontier.forEach((n, t) => { v[n] = next[t]; });
+            filled += frontier.length;
+            const after = [];
+            for (const n of frontier) {
+                around(n, m => {
+                    if (v[m] !== v[m] && !queued[m]) {
+                        queued[m] = 1;
+                        after.push(m);
+                    }
+                });
+            }
+            frontier = after;
+        }
+        return { values: v, filled };
+    }
+
     async function stepDeltaPdf(model, step, ctx) {
         if (!ctx.fft) throw new Error('the 3D-ΔPDF needs the FFT engine');
+        if (step.fill > 0) {
+            const { values, filled } = fillHoles(model, step.fill);
+            ctx.log(`${filled} empty voxels filled from their neighbours (${step.fill} passes)`);
+            model = Object.assign({}, model, { values });
+        }
         const dims = model.dims;
         const N = voxelCount(model);
         if (N > MAX_FFT_VOXELS) {
@@ -857,7 +918,7 @@
         combine: { run: stepCombine, fields: { operation: 'string', file: 'string', scale: 'number' } },
         clip: { run: stepClip, fields: { below: 'number', to: 'clipTo' } },
         symmetrize: { run: stepSymmetrize, fields: { laue: 'string', mode: 'string', expand: 'boolean' } },
-        deltaPdf: { run: stepDeltaPdf, fields: { taper: 'number', engine: 'engine' } },
+        deltaPdf: { run: stepDeltaPdf, fields: { taper: 'number', engine: 'engine', fill: 'passes' } },
     };
 
     function checkField(kind, value, where) {
@@ -874,6 +935,7 @@
             boolean: v => typeof v === 'boolean',
             clipTo: v => v === 'nan' || finite(v),
             engine: v => v === 'cpu' || v === 'gpu',
+            passes: v => Number.isInteger(v) && v >= 0 && v <= 50,
             any: v => v !== undefined,
         }[kind];
         if (!ok(value)) throw new Error(`${where}: invalid value ${JSON.stringify(value)}`);
@@ -915,6 +977,7 @@
             case 'clip': return `set values below ${step.below} to ${step.to}`;
             case 'symmetrize': return `symmetrize with Laue group ${step.laue} (${step.mode}${step.expand ? ', extend the grid' : ''})`;
             case 'deltaPdf': return `3D-ΔPDF by FFT on the ${step.engine === 'gpu' ? 'GPU (float32)' : 'CPU (float64)'}` +
+                (step.fill ? `, holes filled ${step.fill} voxel${step.fill === 1 ? '' : 's'} deep` : '') +
                 (step.taper ? `, Tukey taper ${step.taper}` : '');
             default: return step.op;
         }
