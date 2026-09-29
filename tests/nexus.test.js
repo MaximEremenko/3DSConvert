@@ -57,7 +57,7 @@ test('Mantid: 2-D workspaces pad to a single layer; Q frames and 4-D data are re
         /Q \(sample frame\) frame; only HKL workspaces/);
     await assert.rejects(Converter.readMantidMD(await mantidFile({
         n: [2, 2, 2, 2], edges: [[0, 1], [0, 1], [0, 1], [0, 1]], names: ['a', 'b', 'c', 'd'], values: new Float64Array(16),
-    })), /4 dimensions; bin it to three/);
+    })), /4 dimensions, and d \(2 bins\) is not integrated/);
 });
 
 test('other Mantid and raw NeXus files are recognised and explained', async () => {
@@ -277,4 +277,15 @@ test('uncertainties: Mantid errors_squared and NeXus errors are read on request'
     });
     const n = await Converter.readNexusData(f, { sigma: true });
     assert.deepEqual(Array.from(n.sigma), new Array(12).fill(0.25));             // divided by the weights too
+});
+
+test('Mantid: a fourth dimension integrated into one bin (DeltaE) leaves a volume; an open one is refused', async () => {
+    const names = ['[H,0,0]', '[0,K,0]', '[0,0,L]', 'DeltaE'];
+    const f = await mantidFile({ n: [4, 3, 2, 1], names, edges: [[-1, 1], [-3, 3], [0, 2], [-0.5, 0.5]] });
+    const m = await Converter.readMantidMD(f, {});
+    assert.deepEqual(m.dims, [4, 3, 2]);
+    assert.match(m.notes.join('\n'), /DeltaE integrated over -0\.5 to 0\.5/);
+    assert.equal(at(m, 3, 2, 1), code(3, 2, 1));
+    const cut = await mantidFile({ n: [4, 3, 2, 5], names, edges: [[-1, 1], [-3, 3], [0, 2], [-2, 2]], values: new Float64Array(120) });
+    await assert.rejects(Converter.readMantidMD(cut, {}), /DeltaE \(5 bins\) is not integrated/);
 });

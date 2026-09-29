@@ -1022,18 +1022,43 @@
             throw new Error('this MDHistoWorkspace was written by SaveMD version 1 (flat arrays); ' +
                 're-save it with SaveMD version 2');
         }
-        if (shape.length > 3) {
-            throw new Error(`the MDHistoWorkspace has ${shape.length} dimensions; bin it to three ` +
-                '(e.g. BinMD or MDNorm) before saving');
-        }
-        const nd = shape.length;
-        const expected = Array.from({ length: nd }, (_, i) => 'D' + (nd - 1 - i)).join(':');
+        const rank = shape.length;
+        const expected = Array.from({ length: rank }, (_, i) => 'D' + (rank - 1 - i)).join(':');
         const axesAttr = attributeText(sig, 'axes') || expected;
         if (axesAttr.split(/[:,]/).map(s => s.trim()).join(':') !== expected) {
-            throw new Error(`MDHistoWorkspace: unexpected signal axes "${axesAttr}"`);
+            const named = axesAttr.split(/[:,]/).map(s => s.trim()).reverse();
+            const frames = named.map(n => attributeText(f.get(g + n), 'frame')).filter(Boolean);
+            throw new Error(`the MDHistoWorkspace's dimensions are ${named.join(', ')}` +
+                (frames.length ? ` (${[...new Set(frames)].join('/')})` : '') + ', not an HKL grid; bin it in HKL ' +
+                '(e.g. with MDNorm) before saving');
         }
+        // Dimensions after the first three (DeltaE, a temperature ...) are
+        // fine when integrated into one bin: the first three hold a volume.
+        if (rank > 3) {
+            const extra = [];
+            for (let j = 3; j < rank; j++) {
+                const d = f.get(g + 'D' + j);
+                const edges = isDataset(d) ? numbersAt(f, g + 'D' + j) : null;
+                extra.push({
+                    name: (isDataset(d) && attributeText(d, 'long_name')) || 'D' + j, bins: shape[rank - 1 - j],
+                    range: edges && edges.length ? [edges[0], edges[edges.length - 1]] : null, units: isDataset(d) ? attributeText(d, 'units') : '',
+                });
+            }
+            const open = extra.filter(x => x.bins > 1);
+            if (open.length) {
+                throw new Error(`the MDHistoWorkspace has ${rank} dimensions, and ` +
+                    open.map(x => `${x.name} (${x.bins} bins)`).join(', ') + ' is not integrated - a cut or spectrum, ' +
+                    'not a volume; integrate it into one bin (e.g. IntegrateMDHistoWorkspace or BinMD) for a 3-D volume');
+            }
+            for (const x of extra) {
+                notes.push(`${x.name} integrated` + (x.range ? ` over ${x.range.map(v => +v.toPrecision(6)).join(' to ')}` : '') +
+                    (x.units && x.units !== x.name ? ` ${x.units}` : ''));
+            }
+            if (opts.crop) notes.push('crop on read does not apply to a workspace with more than three dimensions');
+        }
+        const nd = Math.min(rank, 3);
         const dims = [1, 1, 1];
-        for (let j = 0; j < nd; j++) dims[j] = shape[nd - 1 - j];
+        for (let j = 0; j < nd; j++) dims[j] = shape[rank - 1 - j];
 
         const system = firstNumber(f, 'MDHistoWorkspace/coordinate_system');
         const info = [];

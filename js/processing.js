@@ -1198,6 +1198,7 @@
             const step = steps[n];
             const log = text => ctx.log(`  ${text}`);
             ctx.log(`Step ${n + 1}: ${describeStep(step)}`);
+            const t0 = Date.now();
             try {
                 if (RECIPROCAL_ONLY.has(step.op) && current.axesType === 'uvw') {
                     throw new Error('needs reciprocal-space (hkl) data, but these are in direct space');
@@ -1210,6 +1211,7 @@
                 if (e && e.cancelled) throw e;
                 throw new Error(`step ${n + 1} (${step.op}): ${e.message}`);
             }
+            log(`done in ${((Date.now() - t0) / 1000).toFixed(2)} s`);
             current.axes = current.vectors.some((v, a) => current.dims[a] > 1 && v.some(Boolean))
                 ? pickAxesLike(current) : current.axes;
             if (ctx.progress) ctx.progress((n + 1) / steps.length);
