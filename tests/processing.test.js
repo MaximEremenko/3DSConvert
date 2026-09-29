@@ -167,6 +167,48 @@ test('symmetrize m-3m: average, fill, and extension of a half grid', async () =>
     assert.equal(value(full, 2, 2, 2), 1);
 });
 
+test('symmetrize sums down the subgroup chain exactly as over every operation', async () => {
+    let seed = 3;
+    const rnd = () => ((seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0) / 4294967296);
+    for (const laue of ['m-3m', 'm-3', '4/mmm', 'mmm', '-1']) {
+        const m = grid(1, 0.25, () => (rnd() < 0.2 ? NaN : rnd()));          // 9 x 9 x 9, holes
+        for (const mode of ['average', 'fill']) {
+            const chain = await run(m, [{ op: 'symmetrize', laue, mode }]);
+            const every = await run(m, [{ op: 'symmetrize', laue, mode }], { symmetrizeEveryOperation: true });
+            assert.equal(chain.values.length, every.values.length);
+            for (let i = 0; i < every.values.length; i++) {
+                const a = chain.values[i], b = every.values[i];
+                assert.ok(a === b || Math.abs(a - b) < 1e-12 || (a !== a && b !== b), `${laue} ${mode} voxel ${i}: ${a} vs ${b}`);
+            }
+        }
+    }
+    const hex = grid(1, 0.5, (h, k, l) => h + 2 * k + 3 * l, [5, 5, 5]);
+    for (const laue of ['6/mmm', '-3m1']) {
+        const a = await run(hex, [{ op: 'symmetrize', laue }]);
+        const b = await run(hex, [{ op: 'symmetrize', laue }], { symmetrizeEveryOperation: true });
+        assert.ok(maxAbsDiff(a.values, b.values) < 1e-12, laue);
+    }
+    assert.equal(Processing.laueChain('m-3m', 'reciprocal').reduce((s, r) => s + r.length, 0), 11);
+});
+
+test('symmetrize works on direct-space data with the operations on u, v, w', async () => {
+    // A 3D-ΔPDF of an intensity without the symmetry, then m-3m on it.
+    const m = grid(1, 0.25, (h, k, l) => 1 + h + 0.3 * k * k + 0.1 * l);
+    const p = await run(m, [{ op: 'deltaPdf' }, { op: 'symmetrize', laue: 'm-3m' }], { fft: cpuFft });
+    assert.equal(p.axesType, 'uvw');
+    assert.equal(p.laueGroup, 'm-3m');
+    for (const [i, j, k] of [[5, 3, 2], [6, 4, 1], [8, 0, 3]]) {
+        const v = value(p, i, j, k);
+        assert.ok(Math.abs(v - value(p, j, i, k)) < 1e-9 * Math.max(1, Math.abs(v)), 'u <-> v');
+        assert.ok(Math.abs(v - value(p, 8 - i, j, k)) < 1e-9 * Math.max(1, Math.abs(v)), 'u -> -u');
+    }
+    // The hexagonal groups act on u, v, w as R, not as R^T.
+    const ops = Processing.laueOperations('6/m', 'direct'), recip = Processing.laueOperations('6/m');
+    const six = ops.find(R => R[2][2] === 1 && R.flat().join() === '1,-1,0,1,0,0,0,0,1');
+    assert.ok(six, 'the direct-space 6-fold');
+    assert.ok(recip.some(R => R.flat().join() === '1,1,0,-1,0,0,0,0,1'), 'its transpose acts on hkl');
+});
+
 test('symmetrize on a hexagonal grid uses the 3-fold axis', async () => {
     const m = grid(1, 0.5, (h, k) => h - k, [5, 5, 1]);
     m.corner[2] = 0;

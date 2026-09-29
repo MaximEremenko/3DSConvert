@@ -213,21 +213,19 @@
     };
     const LAUE_GROUPS = Object.keys(LAUE_GENERATORS);
 
-    // The operations of a Laue group acting on hkl: R^T for every direct-space
-    // operation R (the reciprocal action R^-T runs over the same set).
-    function laueOperations(name) {
-        const gens = LAUE_GENERATORS[name];
-        if (!gens) throw new Error(`unknown Laue group ${name} (use one of ${LAUE_GROUPS.join(', ')})`);
-        const all = gens.concat([[[-1, 0, 0], [0, -1, 0], [0, 0, -1]]]);
-        const key = M => M.flat().join(',');
-        const found = new Map([[key([[1, 0, 0], [0, 1, 0], [0, 0, 1]]), [[1, 0, 0], [0, 1, 0], [0, 0, 1]]]]);
-        let frontier = [...found.values()];
+    const IDENTITY = [[1, 0, 0], [0, 1, 0], [0, 0, 1]];
+    const INVERSION = [[-1, 0, 0], [0, -1, 0], [0, 0, -1]];
+    const matrixKey = M => M.flat().join(',');
+
+    // Every product of the generators.
+    function closure(gens) {
+        const found = new Map([[matrixKey(IDENTITY), IDENTITY]]);
+        let frontier = [IDENTITY];
         while (frontier.length) {
             const next = [];
             for (const A of frontier) {
-                for (const G of all) {
-                    const P = mulMM(A, G);
-                    const k = key(P);
+                for (const G of gens) {
+                    const P = mulMM(A, G), k = matrixKey(P);
                     if (!found.has(k)) {
                         found.set(k, P);
                         next.push(P);
@@ -236,7 +234,41 @@
             }
             frontier = next;
         }
-        return [...found.values()].map(transpose);
+        return [...found.values()];
+    }
+
+    // The generators acting on hkl (space 'reciprocal': R^T for every
+    // direct-space operation R; R^-T runs over the same set) or on direct-
+    // space coordinates such as the u, v, w of a 3D-ΔPDF ('direct': R).
+    function laueGenerators(name, space) {
+        const gens = LAUE_GENERATORS[name];
+        if (!gens) throw new Error(`unknown Laue group ${name} (use one of ${LAUE_GROUPS.join(', ')})`);
+        return gens.concat([INVERSION]).map(g => (space === 'direct' ? g : transpose(g)));
+    }
+
+    function laueOperations(name, space) {
+        return closure(laueGenerators(name, space));
+    }
+
+    // Right-coset transversals down the chain of subgroups made by adding one
+    // generator at a time: every operation is t1 t2 ... tm, one t from each
+    // list, in exactly one way, so sums over the group can run level by level.
+    function laueChain(name, space) {
+        const gens = laueGenerators(name, space);
+        const chain = [];
+        let H = [IDENTITY];
+        for (let k = 1; k <= gens.length; k++) {
+            const next = closure(gens.slice(0, k));
+            if (next.length === H.length) continue;
+            const inH = new Set(H.map(matrixKey));
+            const reps = [];
+            for (const x of next) {
+                if (!reps.some(t => inH.has(matrixKey(mulMM(x, invert3(t).map(r => r.map(Math.round))))))) reps.push(x);
+            }
+            chain.push(reps);
+            H = next;
+        }
+        return chain;
     }
 
     // ------------------------------------------------------------------ steps
@@ -543,11 +575,45 @@
         return withValues(model, values);
     }
 
+    // For each row (jk, jl) of a target grid, fn(n0, n1, idx, stride) over
+    // the jh range whose source index A j + T lies inside the source grid:
+    // n0..n1 are target indices, idx the source index at n0 and stride its
+    // step along jh. The inner loops then need no bounds checks.
+    function forEachMappedRow(sdims, tdims, A, T, fn) {
+        const [sh, sk] = sdims, [th, tk, tl] = tdims;
+        const d = [A[0][0], A[1][0], A[2][0]];
+        const stride = (d[2] * sk + d[1]) * sh + d[0];
+        const b = [0, 0, 0];
+        let row = 0;
+        for (let jl = 0; jl < tl; jl++) {
+            for (let jk = 0; jk < tk; jk++, row += th) {
+                let lo = 0, hi = th - 1;
+                for (let a = 0; a < 3; a++) {
+                    b[a] = T[a] + A[a][1] * jk + A[a][2] * jl;
+                    if (d[a] > 0) {
+                        lo = Math.max(lo, Math.ceil(-b[a] / d[a]));
+                        hi = Math.min(hi, Math.floor((sdims[a] - 1 - b[a]) / d[a]));
+                    } else if (d[a] < 0) {
+                        lo = Math.max(lo, Math.ceil((sdims[a] - 1 - b[a]) / d[a]));
+                        hi = Math.min(hi, Math.floor(-b[a] / d[a]));
+                    } else if (b[a] < 0 || b[a] >= sdims[a]) {
+                        hi = -1;
+                    }
+                }
+                if (lo <= hi) fn(row + lo, row + hi, ((b[2] + d[2] * lo) * sk + (b[1] + d[1] * lo)) * sh + (b[0] + d[0] * lo), stride);
+            }
+        }
+    }
+
     // Average over the Laue-equivalent grid points (NaN-aware). mode 'fill'
     // keeps measured values and fills only NaN voxels. expand extends the
     // grid to the symmetric images of its range (e.g. a half volume).
+    // Direct-space data (a 3D-ΔPDF) use the operations on u, v, w. When every
+    // operation maps the grid onto itself, the sums run level by level down
+    // a subgroup chain (e.g. 11 passes instead of 48 for m-3m), exactly.
     async function stepSymmetrize(model, step, ctx) {
-        const ops = laueOperations(step.laue);
+        const space = model.axesType === 'uvw' ? 'direct' : 'reciprocal';
+        const ops = laueOperations(step.laue, space);
         const M = gridMatrix(model);
         const Minv = invert3(M);
         const near = x => Math.abs(x - Math.round(x)) < 1e-6;
@@ -591,36 +657,69 @@
         const [sh, sk, sl] = model.dims;
         const [th, tk, tl] = target.dims;
         const src = model.values;
-        const sum = new Float64Array(th * tk * tl), cnt = new Int32Array(th * tk * tl);
-        for (let g = 0; g < ops.length; g++) {
-            const A = aligned[g];
-            if (!A) continue;
-            const G = ops[g];
-            // source index of target index j: i = Minv (G (corner_t + M j) - corner_s) = A j + t
-            const t = mulMV(Minv, mulMV(G, target.corner).map((x, c) => x - model.corner[c]));
-            if (!t.every(near)) continue;
-            const T = t.map(Math.round);
-            let n = 0;
-            for (let jl = 0; jl < tl; jl++) {
-                for (let jk = 0; jk < tk; jk++) {
-                    let i0 = T[0] + A[0][1] * jk + A[0][2] * jl;
-                    let i1 = T[1] + A[1][1] * jk + A[1][2] * jl;
-                    let i2 = T[2] + A[2][1] * jk + A[2][2] * jl;
-                    for (let jh = 0; jh < th; jh++, n++) {
-                        if (i0 >= 0 && i0 < sh && i1 >= 0 && i1 < sk && i2 >= 0 && i2 < sl) {
-                            const x = src[(i2 * sk + i1) * sh + i0];
-                            if (x === x) {
-                                sum[n] += x;
-                                cnt[n]++;
-                            }
-                        }
-                        i0 += A[0][0];
-                        i1 += A[1][0];
-                        i2 += A[2][0];
-                    }
+        // Index map of an operation onto this same grid, if it is one.
+        const selfMap = G => {
+            const A = mulMM(Minv, mulMM(G, M));
+            const t = mulMV(Minv, mulMV(G, model.corner).map((x, c) => x - model.corner[c]));
+            if (!A.every(r => r.every(near)) || !t.every(near)) return null;
+            const map = { A: A.map(r => r.map(Math.round)), T: t.map(Math.round) };
+            for (let a = 0; a < 8; a++) {
+                const j = [a & 1, (a >> 1) & 1, (a >> 2) & 1].map((bit, k) => bit * (model.dims[k] - 1));
+                const i = mulMV(map.A, j).map((x, k) => x + map.T[k]);
+                if (i.some((x, k) => x < 0 || x > model.dims[k] - 1)) return null;
+            }
+            return map;
+        };
+        const closed = !step.expand && !ctx.symmetrizeEveryOperation && ops.every(G => selfMap(G));
+        let sum, cnt;
+        if (closed) {
+            const chain = laueChain(step.laue, space), N = sh * sk * sl;
+            let S = new Float64Array(N), C = new Uint8Array(N), S2 = new Float64Array(N), C2 = new Uint8Array(N);
+            for (let i = 0; i < N; i++) {
+                const x = src[i];
+                if (x === x) {
+                    S[i] = x;
+                    C[i] = 1;
                 }
             }
-            if (ctx.tick) await ctx.tick();
+            for (const reps of chain) {
+                S2.fill(0);
+                C2.fill(0);
+                for (const G of reps) {
+                    const m = selfMap(G);
+                    forEachMappedRow(model.dims, model.dims, m.A, m.T, (n, end, idx, stride) => {
+                        for (; n <= end; n++, idx += stride) {
+                            S2[n] += S[idx];
+                            C2[n] += C[idx];
+                        }
+                    });
+                    if (ctx.tick) await ctx.tick();
+                }
+                [S, S2] = [S2, S];
+                [C, C2] = [C2, C];
+            }
+            sum = S;
+            cnt = C;
+        } else {
+            sum = new Float64Array(th * tk * tl);
+            cnt = new Int32Array(th * tk * tl);
+            for (let g = 0; g < ops.length; g++) {
+                const A = aligned[g];
+                if (!A) continue;
+                // source index of target index j: i = Minv (G (corner_t + M j) - corner_s) = A j + t
+                const t = mulMV(Minv, mulMV(ops[g], target.corner).map((x, c) => x - model.corner[c]));
+                if (!t.every(near)) continue;
+                forEachMappedRow(model.dims, target.dims, A, t.map(Math.round), (n, end, idx, stride) => {
+                    for (; n <= end; n++, idx += stride) {
+                        const x = src[idx];
+                        if (x === x) {
+                            sum[n] += x;
+                            cnt[n]++;
+                        }
+                    }
+                });
+                if (ctx.tick) await ctx.tick();
+            }
         }
         const out = newValues(model, th * tk * tl);
         const keep = step.mode === 'fill';
@@ -743,8 +842,7 @@
     // ------------------------------------------------------------------ recipe
 
     // Steps that act on hkl / |Q| and so need reciprocal-space data.
-    const RECIPROCAL_ONLY = new Set(['maskBragg', 'maskRings', 'backgroundFunction', 'backgroundShells',
-        'symmetrize', 'deltaPdf']);
+    const RECIPROCAL_ONLY = new Set(['maskBragg', 'maskRings', 'backgroundFunction', 'backgroundShells', 'deltaPdf']);
 
     const STEPS = {
         crop: { run: stepCrop, fields: { h: 'range?', k: 'range?', l: 'range?' } },
@@ -909,7 +1007,8 @@
     }
 
     return {
-        LAUE_GROUPS, laueOperations, normalizeRecipe, describeStep, applyRecipe, writeProfileChunks, profileShells,
+        LAUE_GROUPS, RECIPROCAL_ONLY: [...RECIPROCAL_ONLY], laueOperations, laueChain, normalizeRecipe, describeStep,
+        applyRecipe, writeProfileChunks, profileShells,
         sampler, gridMatrix,
     };
 }));
