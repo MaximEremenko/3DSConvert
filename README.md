@@ -14,7 +14,7 @@ No installation, no server, and no upload: files never leave your computer.
 | Unified data format (HDF5) | yes | yes | RMCProfile, DiffuseCode/DISCUS |
 | Yell 1.0 (HDF5) | yes | yes | DISCUS, Yell, Meerkat |
 | RMCProfile old text format (`.dat`) | yes | yes | RMCProfile Diffuse3D |
-| Scatty VTK (`.vtk`) | yes | yes | Scatty; also loads in ParaView |
+| VTK `STRUCTURED_POINTS` (`.vtk`) | yes | yes | Scatty, Spinteract, 3DSCalculator; also loads in ParaView |
 
 Any format can be converted to any other. The input format is detected
 automatically from the file content.
@@ -32,23 +32,59 @@ automatically from the file content.
   unsupported axes/number type instead of silently treating it as HKL data.
   Three-dimensional `Q` axes are converted to HKL using the real parent
   cell; scalar or direct-space axis types are outside this diffuse converter.
+  Dataset shapes are checked against `data_dimension` and the `h`/`k`/`l`
+  coordinate arrays. Files in the transposed `/scattering/data` layout of the
+  `write_diffuse_scattering.py` reference writer (C order `[nh,nk,nl]`, one
+  `step_vectors` column per axis) are read when the shape or the NeXus
+  `h_indices`/`k_indices`/`l_indices` attributes tell the order apart. This
+  includes legacy "Disorder scattering 1.0" files (`.nx5`) that keep the grid
+  only in the `h`/`k`/`l` arrays and the cell in `unit_cell`. When `h` and `l`
+  have equal lengths the shape cannot tell the layouts apart, so this
+  converter's layout is assumed, with a log note for files that do not look
+  like RMCProfile or 3DSConvert output.
 - **Yell 1.0**: the flat layout with `/data`, `/lower_limits`, `/step_sizes`,
   and `/unit_cell` datasets (the general step vectors
   `step_sizes_abs/ord/top` are used when present). Files that store the unit
   metric (`unit_cell = 1 1 1 90 90 90`) are interpreted as hkl grids in
   reciprocal lattice units of the parent cell; written files always store the
-  real cell when one is known.
+  real cell when one is known. 1-D and 2-D `data` are read as grids with one
+  point along the missing axes, and `step_size` is accepted in place of
+  `step_sizes`. Direct-space files (`is_direct = 1`, e.g. 3D-ΔPDF maps) are
+  refused. An `is_direct` value that is neither 0 nor 1 is reported as a
+  corrupted flag; set *Yell data space* to *reciprocal space* to read such a
+  file anyway.
 - **RMCProfile old text format**: an `npoints nsec` header followed by
   `i j k qx qy qz intensity` rows. Q is cartesian in 1/Angstrom with the
   2*pi convention, `q = 2*pi * B * hkl`, where `B` is the reciprocal basis
   of the parent cell. Files with several symmetry sections are read using
-  the section 1 coordinates.
-- **Scatty VTK**: ASCII `STRUCTURED_POINTS` as written by Scatty. `ORIGIN`
-  and `SPACING` are cartesian Q in 1/Angstrom (2*pi convention, the same as
-  the old text format); values run x fastest, z slowest. Writing VTK
-  requires the Q grid to be axis-aligned and ascending, because
-  `STRUCTURED_POINTS` cannot express rotated or non-orthogonal grids
-  (Scatty itself has the same restriction).
+  the section 1 coordinates. RMCProfile's `*_calc.dat` output adds
+  `scale offset` to the header; they are logged and the intensities are
+  kept as stored. Fortran `D` exponents are accepted. On output, NaN or
+  infinite intensities are written as 0.0, which RMCProfile treats as a
+  masked point (points with I = 0 are left out of the fit).
+- **VTK**: ASCII `STRUCTURED_POINTS`. In Scatty (`*_sc.vtk`) and Spinteract
+  (`*_img_NN.vtk`) output, `ORIGIN` and `SPACING` are cartesian Q in
+  1/Angstrom (2*pi convention, the same as the old text format); values run
+  x fastest, z slowest. The format stores no axis directions: Scatty and
+  Spinteract write `ORIGIN` as the cartesian corner but `SPACING` only as
+  step lengths along their grid axes, which may be any mutually orthogonal
+  hkl directions (e.g. `X_AXIS 6 6 0`). Without more information the axes
+  are assumed to lie along cartesian x, y and z. For rotated grids, load the
+  program's config file as the *grid config*: it gives the exact hkl corner
+  and steps (Scatty: `CENTRE` and half-extent axes with 2p+1 points;
+  Spinteract: `ORIGIN` and full-extent axes with n points, one grid per data
+  set), and the VTK header is cross-checked against it at the chosen cell.
+  3DSCalculator's "(HKL grid)" export and Scatty's `*_sc_supercell.vtk`
+  store `ORIGIN`/`SPACING` in reciprocal-lattice units; they are recognised
+  by their title line and need no cell to read. Writing VTK requires the Q
+  grid to be axis-aligned and ascending, because `STRUCTURED_POINTS` cannot
+  express other grids; NaN or infinite values are written as 0, since legacy
+  VTK readers do not parse NaN.
+- **HDF5 compression**: the browser HDF5 engine decodes gzip/deflate,
+  shuffle, szip, fletcher32, n-bit and scale-offset. Datasets compressed
+  with plugin filters (LZF, Blosc, LZ4, bitshuffle, Zstandard, ...) are
+  refused with a message that names the filter; re-save such files with
+  gzip, e.g. `h5repack -f GZIP=4 in.h5 out.h5`.
 
 ## Getting started
 
@@ -68,8 +104,10 @@ then browse to `http://localhost:8000/`.
 
 ## Usage
 
-1. **Data file**: select the diffuse data file (`.h5`, `.dat`, or `.vtk`).
-   The format, grid size, and stored cell are reported in the log.
+1. **Data file**: select the diffuse data file (`.h5`, `.nx5`, `.dat`, or
+   `.vtk`). The format, grid size, and stored cell are reported in the log.
+   For a Scatty or Spinteract VTK whose grid axes are not along a*, b*, c*,
+   also load the program's config file as the grid config.
 2. **Unit cell**: some conversions need the parent (crystallographic) unit
    cell, because the text and VTK formats do not store one, and some Yell
    files store only the unit metric. Provide either
@@ -95,7 +133,8 @@ then browse to `http://localhost:8000/`.
 | Yell `.h5` with a real cell | no |
 | Yell `.h5` with unit metric | yes (for `.dat`/`.vtk` output; passed through for HDF5 output) |
 | Old text `.dat` | yes, always |
-| Scatty `.vtk` | yes, always |
+| Q-space `.vtk` (Scatty, Spinteract) | yes, always |
+| r.l.u. `.vtk` (3DSCalculator, Scatty supercell) | yes (for `.dat`/`.vtk` output; passed through for HDF5 output) |
 
 ## Examples
 
@@ -127,6 +166,7 @@ in all files, so results are easy to compare.
   (see Provenance).
 - `js/h5wasm.js` — vendored h5wasm bundle (see Third-party code).
 - `Examples/` — the example dataset described above.
+- `tests/` — Node.js regression tests (see Validation).
 
 ## Validation
 
@@ -147,6 +187,17 @@ The conversion core was verified against real files from each producer:
 RMCProfile (built with `RMC_ENABLE_HDF5=ON`) provides Fortran command-line
 equivalents for the unified/old-text conversions: `unified_to_diffuse3d`
 and `diffuse3d_to_unified`.
+
+The regression tests run the converter and the vendored HDF5 engine under
+Node.js 22 or later, with nothing to install:
+
+```
+npm test
+```
+
+They round-trip the examples through every format and cover the reader
+edge cases described under Format notes. GitHub Actions runs them on every
+push.
 
 ## Third-party code
 
