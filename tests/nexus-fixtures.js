@@ -44,6 +44,8 @@ function mantidFile(o) {
         sig.create_attribute('signal', 1, [], '<i');
         sig.create_attribute('axes', Array.from({ length: nd }, (_, i) => 'D' + (nd - 1 - i)).join(':'));
         d.create_dataset({ name: 'mask', data: o.mask || new Int8Array(values.length), shape, dtype: '<b' });
+        // variance = 4 * signal, so sigma = 2 sqrt(signal)
+        d.create_dataset({ name: 'errors_squared', data: Float64Array.from(values, v => 4 * Math.abs(v)), shape, dtype: '<d' });
         const ol = ws.create_group('experiment0').create_group('sample').create_group('oriented_lattice');
         [['a', 4.05], ['b', 4.05], ['c', 4.05], ['alpha', 90], ['beta', 90], ['gamma', 90]].forEach(([k, v]) =>
             ol.create_dataset({ name: 'unit_cell_' + k, data: [v], shape: [1], dtype: '<d' }));

@@ -219,18 +219,20 @@ function converterWorker(self, h5wasm, Converter, Processing, wgpuFftWeb) {
         return state.processed;
     }
 
-    // The extra volumes a recipe's combine steps name, on hkl grids.
+    // The extra volumes a recipe's steps name (combine, normalize), on hkl grids.
     function recipeExtras(recipe, params) {
         const extras = {};
-        for (const step of recipe.steps) {
-            if (step.op !== 'combine' || extras[step.file]) continue;
-            const x = state.extras[step.file];
+        const names = recipe.steps.flatMap(step => (step.op === 'combine' ? [step.file]
+            : step.op === 'normalize' ? [step.norm, step.background, step.backgroundNorm] : []));
+        for (const name of names) {
+            if (!name || extras[name]) continue;
+            const x = state.extras[name];
             if (!x) continue;                 // the step reports the missing volume
             try {
-                extras[step.file] = Converter.planConversion(x.grid ? { grid: x.grid } : { model: x.model },
-                    { format: 'unified', structure: state.struct, manual: params.manual }).model;
+                extras[name] = Converter.planConversion(x.grid ? { grid: x.grid } : { model: x.model },
+                    { format: 'unified', structure: state.struct, manual: params.manual, cellPrefer: params.cellPrefer }).model;
             } catch (e) {
-                throw new Error(`volume "${step.file}": ${e.message}`);
+                throw new Error(`volume "${name}": ${e.message}`);
             }
         }
         return extras;
@@ -243,7 +245,7 @@ function converterWorker(self, h5wasm, Converter, Processing, wgpuFftWeb) {
             const m = data.model;
             return Object.assign(common, {
                 kind: data.kind, dims: m.dims, cellLengths: m.cellLengths, cellAngles: m.cellAngles,
-                axesType: m.axesType, content: m.content || null, legacyContract: !!m.legacyContract,
+                axesType: m.axesType, content: m.content || null, legacyContract: !!m.legacyContract, hasSigma: !!m.sigma,
                 notes: m.notes || [], precision: m.values instanceof Float32Array ? 'float32' : 'float64',
             });
         }
@@ -319,7 +321,7 @@ function converterWorker(self, h5wasm, Converter, Processing, wgpuFftWeb) {
         // files: the selected data file, or a NeXus file plus the files its
         // external links point to; paths: their folder-relative paths (may be
         // empty); nexusPath: the NXdata group to read (default: @default).
-        async loadData({ files, paths, yellSpace, nexusPath, crop }, ctx) {
+        async loadData({ files, paths, yellSpace, nexusPath, crop, readSigma }, ctx) {
             state.data = null;
             state.plan = null;
             state.processed = null;
@@ -341,7 +343,7 @@ function converterWorker(self, h5wasm, Converter, Processing, wgpuFftWeb) {
                 if (main < 0) throw new Error(Converter.unsupportedKindMessage(kinds[0]) || 'no data file among the selection');
             }
             const file = files[main];
-            const opts = { size: file.size, tick: ctx.tick, progress: f => ctx.progress('Reading', f), crop };
+            const opts = { size: file.size, tick: ctx.tick, progress: f => ctx.progress('Reading', f), crop, sigma: !!readSigma };
             if (!hdf5[main]) {
                 state.data = await readTextVolume(file, opts);
                 return { result: Object.assign(summarize(state.data), { main: file.name }) };
@@ -419,14 +421,14 @@ function converterWorker(self, h5wasm, Converter, Processing, wgpuFftWeb) {
         // Volumes for the recipe's combine steps, named by their file names.
         // They are read whole and kept; Q-space text grids get their hkl
         // axes from the parent cell when a recipe uses them.
-        async loadExtras({ files }, ctx) {
+        async loadExtras({ files, readSigma }, ctx) {
             state.extras = {};
             state.extrasVersion++;
             state.files.extras = (files || []).filter(Boolean);
             mountFiles();
             const out = [];
             for (const [i, file] of state.files.extras.entries()) {
-                const opts = { size: file.size, tick: ctx.tick, progress: f => ctx.progress(`Reading ${file.name}`, f) };
+                const opts = { size: file.size, tick: ctx.tick, progress: f => ctx.progress(`Reading ${file.name}`, f), sigma: !!readSigma };
                 let volume;
                 if (!(await isHdf5(file))) {
                     volume = await readTextVolume(file, opts);

@@ -343,6 +343,25 @@ const scenarios = [
             throw new Error('statuses:\n' + status);
         }
     }],
+    ['normalize: data over a norm volume, summed over m-3m', async () => {
+        await setFile('#dataFile', path.join(ROOT, 'Examples/example_unified.h5'));
+        await waitLog(/Unified data format \| grid 5 x 5 x 5/);
+        await setFile('#extraFiles', path.join(ROOT, 'Examples/example_yell.h5'));
+        await waitLog(/Volume "example_yell\.h5": grid 5 x 5 x 5/);
+        await setValue('stepOp', 'normalize');
+        await evaluate('document.getElementById("addStep").click()');
+        const status = await evaluate('document.querySelector("#steps .step .hint").textContent');
+        if (status !== 'Σdata/Σnorm with "example_yell.h5"') throw new Error('step reads ' + status);
+        await evaluate(`(() => {
+            const sel = Array.from(document.querySelectorAll('#steps .step select')).find(s => s.value === 'none');
+            sel.value = 'm-3m';
+            sel.dispatchEvent(new Event('change'));
+        })()`);
+        await setValue('outFormat', 'yell');
+        const out = await H.Converter.readYell(await H.openH5Bytes(fs.readFileSync(await convert('example_unified_processed_yell.h5'))));
+        if (out.values.some(x => Math.abs(x - 1) > 1e-12)) throw new Error('data / identical norm is not 1');
+        if (!/summed over m-3m/.test(await logText())) throw new Error('no symmetry in the log');
+    }],
     ['crop on read: only the chosen hkl box is read', async () => {
         await evaluate(`(() => {
             for (const [axis, end, v] of [['h', 0, -0.5], ['h', 1, 1], ['l', 0, 0], ['l', 1, 0.5]]) {

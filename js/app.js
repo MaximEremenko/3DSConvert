@@ -310,7 +310,7 @@
       : r.map(x => (x.n > 1 ? `${x.name} ${fmtNum(x.from)} … ${fmtNum(x.to)}` : `${x.name} = ${fmtNum(x.from)}`)).join(' · ');
     const steps = [...new Set(r.filter(x => x.n > 1).map(x => fmtNum(x.step, 4)))].join(' / ');
     $('fileStats').replaceChildren(stat('Grid', s.dims.join(' × ')), stat('Range', range),
-      stat('Step · type', `${steps || '–'} · ${s.precision}`));
+      stat('Step · type', `${steps || '–'} · ${s.precision}${s.hasSigma ? ' · σ' : ''}`));
     const total = s.dims[0] * s.dims[1] * s.dims[2];
     const measured = total ? 1 - (s.nonFinite || 0) / total : 1;
     $('fileMeter').hidden = false;
@@ -339,7 +339,7 @@
     try {
       const s = await run('Reading…', 'loadData', {
         files, paths: files.map(f => f.webkitRelativePath || ''),
-        yellSpace: $('yellSpace').value, nexusPath: nexusPath || null, crop: readCrop(),
+        yellSpace: $('yellSpace').value, nexusPath: nexusPath || null, crop: readCrop(), readSigma: $('readSigma').checked,
       });
       if (!s) return;
       s.baseName = s.main.replace(/\.(h5|hdf5|hdf|he5|nx|nxs|nx5|dat|txt|vtk)$/i, '');
@@ -401,6 +401,10 @@
     }
     return Object.keys(crop).length ? crop : null;
   }
+  $('readSigma').addEventListener('change', () => {
+    if (state.dataFiles.length && !current) loadDataFile(state.data && state.data.nexusPath);
+    if (state.extraFiles.length && !current) loadExtras(state.extraFiles);
+  });
   for (const input of $('cropRow').querySelectorAll('input')) {
     input.addEventListener('change', () => {
       if (state.dataFiles.length && !current) loadDataFile(state.data && state.data.nexusPath);
@@ -608,6 +612,9 @@
       ['params', 'json', 'parameters: [c], [a, b] for a + bQ, [a, b, c] for a − b c^Q, or [[Q, B], …]']]],
     backgroundShells: ['Background from |Q| shells', [['width', 'num', 'shell width (Å⁻¹)'],
       ['percentile', 'num', 'percentile per shell (0 = minimum)'], ['smooth', 'num', 'smooth over ± shells']]],
+    normalize: ['Normalize by Mantid norms', [['norm', 'extra', 'norm volume'], ['background', 'extra?', 'background data'],
+      ['backgroundNorm', 'extra?', 'background norm'], ['scale', 'num', 'background times'],
+      ['laue', ['none'].concat(Processing.LAUE_GROUPS), 'sum over the Laue group']]],
     combine: ['Combine with a volume', [['operation', ['subtract', 'add', 'multiply', 'divide'], 'operation'],
       ['file', 'extra', 'volume'], ['scale', 'num', 'times']]],
     clip: ['Replace low values', [['below', 'num', 'below'], ['to', 'clipTo', 'with (a number or nan)']]],
@@ -618,12 +625,12 @@
   };
   const STEP_GROUPS = [
     ['Grid', ['crop', 'resample', 'rebin']], ['Masks', ['maskBragg', 'maskRings', 'maskRange']],
-    ['Background', ['backgroundShells', 'backgroundFunction', 'combine']], ['Values', ['scale', 'clip']],
+    ['Background', ['normalize', 'backgroundShells', 'backgroundFunction', 'combine']], ['Values', ['scale', 'clip']],
     ['Symmetry', ['symmetrize']], ['Transform', ['deltaPdf']],
   ];
   const STEP_ICON = {
     crop: 'crop', resample: 'grid', rebin: 'grid', maskBragg: 'mask', maskRings: 'rings', maskRange: 'sliders',
-    scale: 'sliders', backgroundFunction: 'curve', backgroundShells: 'curve', combine: 'layers', clip: 'sliders',
+    scale: 'sliders', backgroundFunction: 'curve', backgroundShells: 'curve', combine: 'layers', normalize: 'layers', clip: 'sliders',
     symmetrize: 'sym', deltaPdf: 'wave',
   };
   // Starting values of a new step.
@@ -634,6 +641,7 @@
     backgroundShells: { width: 0.05, percentile: 5, smooth: 1 }, combine: { operation: 'subtract', scale: 1 },
     clip: { below: 0, to: 0 }, symmetrize: { laue: 'm-3m', mode: 'average', expand: false },
     deltaPdf: { taper: 0, engine: 'cpu', fill: 0 },
+    normalize: { background: '', backgroundNorm: '', scale: 1, laue: 'none' },
   };
   const PRESETS = [
     { name: '3D-ΔPDF of a cubic crystal', note: 'm-3m symmetrize · Bragg mask · ΔPDF', steps: [
@@ -731,9 +739,10 @@
       const e = input(value === undefined ? '' : String(value));
       return { node, read: () => (e.value.trim().toLowerCase() === 'nan' ? 'nan' : numberIn(e.value)) };
     }
-    // 'extra': the loaded volumes, and a recipe's name that is not loaded
-    const names = state.extraNames.slice();
-    const labels = names.slice();
+    // 'extra' / 'extra?': the loaded volumes, and a recipe's name that is not loaded
+    const optional = type === 'extra?';
+    const names = (optional ? [''] : []).concat(state.extraNames);
+    const labels = (optional ? ['(none)'] : []).concat(state.extraNames);
     if (value && !names.includes(value)) {
       names.push(value);
       labels.push(value + ' (not loaded)');
@@ -961,8 +970,10 @@
   function addSteps(steps) {
     remember();
     for (const s of steps) {
-      const step = JSON.parse(JSON.stringify(s));
+      // every field starts from its default, so presets name only what differs
+      const step = JSON.parse(JSON.stringify(Object.assign({}, STEP_START[s.op] || {}, s)));
       if (step.op === 'combine' && !step.file && state.extraNames.length) step.file = state.extraNames[0];
+      if (step.op === 'normalize' && !step.norm && state.extraNames.length) step.norm = state.extraNames[0];
       state.recipe.push(step);
     }
     openStep = state.recipe.length - 1;
@@ -1094,7 +1105,7 @@
     state.extraNames = [];
     renderExtras();
     try {
-      const list = await run('Reading volumes…', 'loadExtras', { files });
+      const list = await run('Reading volumes…', 'loadExtras', { files, readSigma: $('readSigma').checked });
       state.extraNames = list.map(x => x.name);
       for (const x of list) {
         log(`Volume "${x.name}": grid ${x.dims.join(' x ')}` + (x.frame === 'q' ? ' in Q' : ''), 'ok');

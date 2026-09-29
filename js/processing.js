@@ -7,6 +7,8 @@
  *   { "version": 1, "steps": [ { "op": "crop", "h": [-6, 6] }, ... ] }
  *
  * Steps never modify their input model; NaN marks masked or missing voxels.
+ * model.sigma, when present, holds the standard uncertainty of each value;
+ * steps propagate it (or drop it where it has no meaning, e.g. a 3D-ΔPDF).
  * |Q| is Cartesian in 1/Angstrom with the 2*pi convention, q = 2*pi * B * hkl.
  */
 (function (root, factory) {
@@ -128,16 +130,22 @@
     function subgrid(model, lo, hi) {
         const dims = [0, 1, 2].map(a => hi[a] - lo[a] + 1);
         const [nh, nk] = model.dims;
-        const out = newValues(model, dims[0] * dims[1] * dims[2]);
-        let n = 0;
-        for (let il = lo[2]; il <= hi[2]; il++)
-            for (let ik = lo[1]; ik <= hi[1]; ik++) {
-                const base = (il * nk + ik) * nh;
-                for (let ih = lo[0]; ih <= hi[0]; ih++) out[n++] = model.values[base + ih];
-            }
+        const cut = src => {
+            const out = newValues(model, dims[0] * dims[1] * dims[2]);
+            let n = 0;
+            for (let il = lo[2]; il <= hi[2]; il++)
+                for (let ik = lo[1]; ik <= hi[1]; ik++) {
+                    const base = (il * nk + ik) * nh;
+                    for (let ih = lo[0]; ih <= hi[0]; ih++) out[n++] = src[base + ih];
+                }
+            return out;
+        };
         const corner = [0, 1, 2].map(c => model.corner[c] + lo[0] * model.vectors[0][c] +
             lo[1] * model.vectors[1][c] + lo[2] * model.vectors[2][c]);
-        return withValues(model, out, { dims, corner, vectors: model.vectors.map((v, a) => (dims[a] > 1 ? v.slice() : [0, 0, 0])) });
+        return withValues(model, cut(model.values), {
+            dims, corner, vectors: model.vectors.map((v, a) => (dims[a] > 1 ? v.slice() : [0, 0, 0])),
+            sigma: model.sigma ? cut(model.sigma) : undefined,
+        });
     }
 
     // NaN-aware trilinear sampling of `model` at hkl points. Returns a
@@ -282,6 +290,7 @@
         clip: { below: 0, to: 0 },
         symmetrize: { mode: 'average', expand: false },
         deltaPdf: { taper: 0, engine: 'cpu', fill: 0 },
+        normalize: { background: '', backgroundNorm: '', scale: 1, laue: 'none' },
     };
 
     function stepCrop(model, step) {
@@ -327,18 +336,24 @@
         });
         const dims = axes.map(a => a.n);
         const sample = sampler(model);
+        const sampleSigma = model.sigma ? sampler(Object.assign({}, model, { values: model.sigma })) : null;
         const out = newValues(model, dims[0] * dims[1] * dims[2]);
+        const sig = sampleSigma ? newValues(model, out.length) : undefined;
         let n = 0;
         for (let il = 0; il < dims[2]; il++) {
             const l = axes[2].min + il * axes[2].size;
             for (let ik = 0; ik < dims[1]; ik++) {
                 const k = axes[1].min + ik * axes[1].size;
-                for (let ih = 0; ih < dims[0]; ih++) out[n++] = sample(axes[0].min + ih * axes[0].size, k, l);
+                for (let ih = 0; ih < dims[0]; ih++, n++) {
+                    const h = axes[0].min + ih * axes[0].size;
+                    out[n] = sample(h, k, l);
+                    if (sig) sig[n] = sampleSigma(h, k, l);
+                }
             }
             if (ctx.tick) await ctx.tick();
         }
         const vectors = [[axes[0].size, 0, 0], [0, axes[1].size, 0], [0, 0, axes[2].size]];
-        return withValues(model, out, { dims, corner: axes.map(a => a.min), vectors, axes: [1, 2, 3] });
+        return withValues(model, out, { dims, corner: axes.map(a => a.min), vectors, axes: [1, 2, 3], sigma: sig });
     }
 
     function stepRebin(model, step) {
@@ -346,27 +361,31 @@
         const dims = model.dims.map((n, a) => Math.max(1, Math.floor(n / f[a])));
         const [nh, nk] = model.dims;
         const out = newValues(model, dims[0] * dims[1] * dims[2]);
+        const sig = model.sigma ? newValues(model, out.length) : undefined;
         let n = 0;
         for (let bl = 0; bl < dims[2]; bl++)
             for (let bk = 0; bk < dims[1]; bk++)
-                for (let bh = 0; bh < dims[0]; bh++) {
-                    let sum = 0, cnt = 0;
+                for (let bh = 0; bh < dims[0]; bh++, n++) {
+                    let sum = 0, cnt = 0, var2 = 0;
                     for (let il = bl * f[2]; il < (bl + 1) * f[2] && il < model.dims[2]; il++)
                         for (let ik = bk * f[1]; ik < (bk + 1) * f[1] && ik < nk; ik++)
                             for (let ih = bh * f[0]; ih < (bh + 1) * f[0] && ih < nh; ih++) {
-                                const x = model.values[(il * nk + ik) * nh + ih];
+                                const at = (il * nk + ik) * nh + ih, x = model.values[at];
                                 if (x === x) {
                                     sum += x;
                                     cnt++;
+                                    if (sig) var2 += model.sigma[at] * model.sigma[at];
                                 }
                             }
-                    out[n++] = cnt ? sum / cnt : NaN;
+                    out[n] = cnt ? sum / cnt : NaN;
+                    if (sig) sig[n] = cnt ? Math.sqrt(var2) / cnt : NaN;
                 }
         const shift = [0, 1, 2].map(c => model.vectors.reduce((s, v, a) => s + (f[a] - 1) / 2 * v[c], 0));
         return withValues(model, out, {
             dims,
             corner: model.corner.map((x, c) => x + shift[c]),
             vectors: model.vectors.map((v, a) => (dims[a] > 1 ? v.map(x => x * f[a]) : [0, 0, 0])),
+            sigma: sig,
         });
     }
 
@@ -452,7 +471,13 @@
     function stepScale(model, step) {
         const values = copyValues(model);
         for (let i = 0; i < values.length; i++) values[i] = values[i] * step.factor + step.offset;
-        return withValues(model, values);
+        let sigma = model.sigma;
+        if (sigma) {
+            sigma = model.sigma.slice();
+            const f = Math.abs(step.factor);
+            for (let i = 0; i < sigma.length; i++) sigma[i] *= f;
+        }
+        return withValues(model, values, { sigma });
     }
 
     // B(|Q|) as a function: constant [c], linear [a, b] (a + b Q),
@@ -538,14 +563,20 @@
         const other = ctx.extras && ctx.extras[step.file];
         if (!other) throw new Error(`combine: no loaded volume named "${step.file}"`);
         const values = copyValues(model);
-        let get;
+        let get, getSigma = null;
         if (sameGrid(model, other)) {
             get = i => other.values[i];
+            if (other.sigma) getSigma = i => other.sigma[i];
         } else {
-            const sample = sampler(other);
-            const at = new Float64Array(values.length);
-            forEachHkl(model, (i, h, k, l) => { at[i] = sample(h, k, l); });
+            const onGrid = src => {
+                const sample = sampler(Object.assign({}, other, { values: src }));
+                const at = new Float64Array(values.length);
+                forEachHkl(model, (i, h, k, l) => { at[i] = sample(h, k, l); });
+                return at;
+            };
+            const at = onGrid(other.values), atSigma = other.sigma ? onGrid(other.sigma) : null;
             get = i => at[i];
+            if (atSigma) getSigma = i => atSigma[i];
             ctx.log(`"${step.file}" is on a different grid; sampled trilinearly onto this one`);
         }
         const s = step.scale;
@@ -555,10 +586,25 @@
             multiply: (x, y) => x * s * y,
             divide: (x, y) => (y !== 0 ? x / (s * y) : NaN),
         };
+        // Standard uncertainties in quadrature, the other volume's too.
+        const spread = {
+            subtract: (x, y, sx, sy) => Math.hypot(sx, s * sy),
+            add: (x, y, sx, sy) => Math.hypot(sx, s * sy),
+            multiply: (x, y, sx, sy) => Math.abs(s) * Math.hypot(sx * y, x * sy),
+            divide: (x, y, sx, sy) => (y !== 0 ? Math.hypot(sx / (s * y), x * sy / (s * y * y)) : NaN),
+        };
         const op = ops[step.operation];
         if (!op) throw new Error(`combine: operation must be subtract, add, multiply or divide`);
+        let sigma = model.sigma;
+        if (model.sigma || getSigma) {
+            sigma = newValues(model, values.length);
+            const f = spread[step.operation];
+            for (let i = 0; i < values.length; i++) {
+                sigma[i] = f(model.values[i], get(i), model.sigma ? model.sigma[i] : 0, getSigma ? getSigma(i) : 0);
+            }
+        }
         for (let i = 0; i < values.length; i++) values[i] = op(values[i], get(i));
-        return withValues(model, values);
+        return withValues(model, values, { sigma });
     }
 
     function stepClip(model, step, ctx) {
@@ -605,45 +651,170 @@
         }
     }
 
+    // Index-space action of an operation G on a grid: the voxel j maps to
+    // the source index A j + T (integers when G maps grid points onto grid
+    // points), and whether every voxel lands inside the grid.
+    function gridAction(model, G, M, Minv, target) {
+        const near = x => Math.abs(x - Math.round(x)) < 1e-6;
+        const t = target || model;
+        const A = mulMM(Minv, mulMM(G, M));
+        const T = mulMV(Minv, mulMV(G, t.corner).map((x, c) => x - model.corner[c]));
+        if (!A.every(r => r.every(near)) || !T.every(near)) return null;
+        const map = { A: A.map(r => r.map(Math.round)), T: T.map(Math.round), closed: true };
+        for (let a = 0; a < 8; a++) {
+            const j = [a & 1, (a >> 1) & 1, (a >> 2) & 1].map((bit, k) => bit * (t.dims[k] - 1));
+            const i = mulMV(map.A, j).map((x, k) => x + map.T[k]);
+            if (i.some((x, k) => x < 0 || x > model.dims[k] - 1)) map.closed = false;
+        }
+        return map;
+    }
+
+    // How many operations of the group fix each voxel: 1 at a general
+    // position, more on mirror planes and axes. Sums over the whole group
+    // meet each distinct image of such a voxel that many times, which an
+    // uncertainty has to undo: sigma of the mean = sqrt(m sum sigma^2) / count.
+    // Per grid row an operation fixes every voxel, one voxel or none.
+    function stabilizerCounts(model, laue, space) {
+        const ops = laueOperations(laue, space);
+        const M = gridMatrix(model), Minv = invert3(M);
+        const [nh, nk, nl] = model.dims;
+        const m = new Uint8Array(nh * nk * nl);
+        // voxels jh in [lo, hi] with a * jh = r
+        const solve = (a, r, range) => {
+            if (a === 0) {
+                if (r !== 0) range[1] = -1;
+            } else if (r % a !== 0) {
+                range[1] = -1;
+            } else {
+                const x = r / a;
+                range[0] = Math.max(range[0], x);
+                range[1] = Math.min(range[1], x);
+            }
+        };
+        for (const G of ops) {
+            const map = gridAction(model, G, M, Minv);
+            if (!map) continue;
+            const { A, T } = map;
+            let row = 0;
+            for (let jl = 0; jl < nl; jl++) {
+                for (let jk = 0; jk < nk; jk++, row += nh) {
+                    const range = [0, nh - 1];
+                    solve(A[0][0] - 1, -(T[0] + A[0][1] * jk + A[0][2] * jl), range);
+                    solve(A[1][0], jk - (T[1] + A[1][1] * jk + A[1][2] * jl), range);
+                    solve(A[2][0], jl - (T[2] + A[2][1] * jk + A[2][2] * jl), range);
+                    for (let jh = range[0]; jh <= range[1]; jh++) m[row + jh]++;
+                }
+            }
+        }
+        return m;
+    }
+
+    // Sums of each array over the images g.x of every voxel x under a Laue
+    // group, on the model's own grid; images outside the grid add nothing.
+    // When every operation maps the grid onto itself the sums run level by
+    // level down the subgroup chain (11 passes instead of 48 for m-3m), else
+    // operation by operation. The arrays are used as buffers and overwritten.
+    // Returns { sums, skipped }.
+    async function groupSums(model, laue, space, arrays, ctx, everyOperation) {
+        const ops = laueOperations(laue, space);
+        const M = gridMatrix(model), Minv = invert3(M);
+        const maps = ops.map(G => gridAction(model, G, M, Minv));
+        const skipped = maps.filter(m => !m).length;
+        // dst[k][n] += src[k][idx] along a row; the common two and three
+        // array cases get their own loops so each stays monomorphic.
+        const adder = (dst, src) => {
+            if (dst.length === 2) {
+                const [d0, d1] = dst, [s0, s1] = src;
+                return (n, end, idx, stride) => {
+                    for (; n <= end; n++, idx += stride) {
+                        d0[n] += s0[idx];
+                        d1[n] += s1[idx];
+                    }
+                };
+            }
+            if (dst.length === 3) {
+                const [d0, d1, d2] = dst, [s0, s1, s2] = src;
+                return (n, end, idx, stride) => {
+                    for (; n <= end; n++, idx += stride) {
+                        d0[n] += s0[idx];
+                        d1[n] += s1[idx];
+                        d2[n] += s2[idx];
+                    }
+                };
+            }
+            return (n, end, idx, stride) => {
+                for (let k = 0; k < dst.length; k++) {
+                    const d = dst[k], sk = src[k];
+                    for (let i = n, j = idx; i <= end; i++, j += stride) d[i] += sk[j];
+                }
+            };
+        };
+        if (!everyOperation && maps.every(m => m && m.closed)) {
+            let cur = arrays, nxt = arrays.map(a => new a.constructor(a.length));
+            for (const reps of laueChain(laue, space)) {
+                for (const a of nxt) a.fill(0);
+                const add = adder(nxt, cur);
+                for (const G of reps) {
+                    const m = gridAction(model, G, M, Minv);
+                    forEachMappedRow(model.dims, model.dims, m.A, m.T, add);
+                    if (ctx.tick) await ctx.tick();
+                }
+                [cur, nxt] = [nxt, cur];
+            }
+            return { sums: cur, skipped };
+        }
+        const sums = arrays.map(a => new a.constructor(a.length));
+        const add = adder(sums, arrays);
+        for (const m of maps) {
+            if (!m) continue;
+            forEachMappedRow(model.dims, model.dims, m.A, m.T, add);
+            if (ctx.tick) await ctx.tick();
+        }
+        return { sums, skipped };
+    }
+
     // Average over the Laue-equivalent grid points (NaN-aware). mode 'fill'
     // keeps measured values and fills only NaN voxels. expand extends the
     // grid to the symmetric images of its range (e.g. a half volume).
-    // Direct-space data (a 3D-ΔPDF) use the operations on u, v, w. When every
-    // operation maps the grid onto itself, the sums run level by level down
-    // a subgroup chain (e.g. 11 passes instead of 48 for m-3m), exactly.
+    // Direct-space data (a 3D-ΔPDF) use the operations on u, v, w. sigma
+    // becomes that of the mean, sqrt(sum sigma^2) / n.
     async function stepSymmetrize(model, step, ctx) {
         const space = model.axesType === 'uvw' ? 'direct' : 'reciprocal';
-        const ops = laueOperations(step.laue, space);
-        const M = gridMatrix(model);
-        const Minv = invert3(M);
-        const near = x => Math.abs(x - Math.round(x)) < 1e-6;
-        // Index-space action of an operation: i' = A i + t (integers when the
-        // operation maps the grid onto itself).
-        const cornerIdx = (target) => mulMV(Minv, target.map((x, c) => x - model.corner[c]));
-        const aligned = ops.map(G => {
-            const A = mulMM(Minv, mulMM(G, M));
-            return A.every(r => r.every(near)) ? A.map(r => r.map(Math.round)) : null;
-        });
-        const usable = aligned.filter(Boolean).length;
-        if (usable < ops.length) {
-            ctx.log(`${ops.length - usable} of the ${ops.length} operations do not map the grid onto itself and are skipped`);
-        }
-        let target = model;
-        if (step.expand) {
+        const src = model.values, sg = model.sigma;
+        const N0 = src.length;
+        let target = model, sum, cnt, q;
+        if (!step.expand) {
+            const x0 = new Float64Array(N0), c0 = new Uint8Array(N0), q0 = sg ? new Float64Array(N0) : null;
+            for (let i = 0; i < N0; i++) {
+                const x = src[i];
+                if (x === x) {
+                    x0[i] = x;
+                    c0[i] = 1;
+                    if (q0) q0[i] = sg[i] * sg[i];
+                }
+            }
+            const { sums, skipped } = await groupSums(model, step.laue, space, q0 ? [x0, c0, q0] : [x0, c0], ctx,
+                ctx.symmetrizeEveryOperation);
+            if (skipped) ctx.log(`${skipped} of the operations do not map the grid onto itself and are skipped`);
+            [sum, cnt, q] = sums;
+        } else {
+            const ops = laueOperations(step.laue, space);
+            const M = gridMatrix(model), Minv = invert3(M);
+            const maps0 = ops.map(G => gridAction(model, G, M, Minv));
+            const usable = maps0.filter(Boolean).length;
+            if (usable < ops.length) {
+                ctx.log(`${ops.length - usable} of the ${ops.length} operations do not map the grid onto itself and are skipped`);
+            }
             // Bounding box (in grid indices) of the images of the grid corners.
             const lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
-            const corners = [];
-            for (let a = 0; a < 2; a++) for (let b = 0; b < 2; b++) for (let c = 0; c < 2; c++) {
-                corners.push([a * (model.dims[0] - 1), b * (model.dims[1] - 1), c * (model.dims[2] - 1)]);
-            }
             ops.forEach((G, g) => {
-                if (!aligned[g]) return;
-                for (const idx of corners) {
+                if (!maps0[g]) return;
+                for (let a = 0; a < 8; a++) {
+                    const idx = [a & 1, (a >> 1) & 1, (a >> 2) & 1].map((bit, k) => bit * (model.dims[k] - 1));
                     const p = mulMV(M, idx).map((x, c) => x + model.corner[c]);
-                    const f = cornerIdx(mulMV(G, p));
-                    f.forEach((x, a) => {
-                        lo[a] = Math.min(lo[a], Math.round(x));
-                        hi[a] = Math.max(hi[a], Math.round(x));
+                    mulMV(Minv, mulMV(G, p).map((x, c) => x - model.corner[c])).forEach((x, k) => {
+                        lo[k] = Math.min(lo[k], Math.round(x));
+                        hi[k] = Math.max(hi[k], Math.round(x));
                     });
                 }
             });
@@ -653,94 +824,115 @@
                 lo[1] * M[c][1] * (model.dims[1] > 1 ? 1 : 0) + lo[2] * M[c][2] * (model.dims[2] > 1 ? 1 : 0));
             target = Object.assign({}, model, { dims, corner });
             ctx.log(`grid extended from ${model.dims.join(' x ')} to ${dims.join(' x ')}`);
-        }
-        const [sh, sk, sl] = model.dims;
-        const [th, tk, tl] = target.dims;
-        const src = model.values;
-        // Index map of an operation onto this same grid, if it is one.
-        const selfMap = G => {
-            const A = mulMM(Minv, mulMM(G, M));
-            const t = mulMV(Minv, mulMV(G, model.corner).map((x, c) => x - model.corner[c]));
-            if (!A.every(r => r.every(near)) || !t.every(near)) return null;
-            const map = { A: A.map(r => r.map(Math.round)), T: t.map(Math.round) };
-            for (let a = 0; a < 8; a++) {
-                const j = [a & 1, (a >> 1) & 1, (a >> 2) & 1].map((bit, k) => bit * (model.dims[k] - 1));
-                const i = mulMV(map.A, j).map((x, k) => x + map.T[k]);
-                if (i.some((x, k) => x < 0 || x > model.dims[k] - 1)) return null;
-            }
-            return map;
-        };
-        const closed = !step.expand && !ctx.symmetrizeEveryOperation && ops.every(G => selfMap(G));
-        let sum, cnt;
-        if (closed) {
-            const chain = laueChain(step.laue, space), N = sh * sk * sl;
-            let S = new Float64Array(N), C = new Uint8Array(N), S2 = new Float64Array(N), C2 = new Uint8Array(N);
-            for (let i = 0; i < N; i++) {
-                const x = src[i];
-                if (x === x) {
-                    S[i] = x;
-                    C[i] = 1;
-                }
-            }
-            for (const reps of chain) {
-                S2.fill(0);
-                C2.fill(0);
-                for (const G of reps) {
-                    const m = selfMap(G);
-                    forEachMappedRow(model.dims, model.dims, m.A, m.T, (n, end, idx, stride) => {
-                        for (; n <= end; n++, idx += stride) {
-                            S2[n] += S[idx];
-                            C2[n] += C[idx];
-                        }
-                    });
-                    if (ctx.tick) await ctx.tick();
-                }
-                [S, S2] = [S2, S];
-                [C, C2] = [C2, C];
-            }
-            sum = S;
-            cnt = C;
-        } else {
-            sum = new Float64Array(th * tk * tl);
-            cnt = new Int32Array(th * tk * tl);
-            for (let g = 0; g < ops.length; g++) {
-                const A = aligned[g];
-                if (!A) continue;
-                // source index of target index j: i = Minv (G (corner_t + M j) - corner_s) = A j + t
-                const t = mulMV(Minv, mulMV(ops[g], target.corner).map((x, c) => x - model.corner[c]));
-                if (!t.every(near)) continue;
-                forEachMappedRow(model.dims, target.dims, A, t.map(Math.round), (n, end, idx, stride) => {
+            const Nt = dims[0] * dims[1] * dims[2];
+            sum = new Float64Array(Nt);
+            cnt = new Int32Array(Nt);
+            q = sg ? new Float64Array(Nt) : null;
+            for (const G of ops) {
+                const m = gridAction(model, G, M, Minv, target);
+                if (!m) continue;
+                forEachMappedRow(model.dims, target.dims, m.A, m.T, (n, end, idx, stride) => {
                     for (; n <= end; n++, idx += stride) {
                         const x = src[idx];
                         if (x === x) {
                             sum[n] += x;
                             cnt[n]++;
+                            if (q) q[n] += sg[idx] * sg[idx];
                         }
                     }
                 });
                 if (ctx.tick) await ctx.tick();
             }
         }
+        const [sh, sk, sl] = model.dims;
+        const [th, tk, tl] = target.dims;
         const out = newValues(model, th * tk * tl);
+        const outSigma = sg ? newValues(model, out.length) : undefined;
+        const mult = sg ? stabilizerCounts(target, step.laue, space) : null;
         const keep = step.mode === 'fill';
+        const M = gridMatrix(model), Minv = invert3(M);
         const oi = keep ? mulMV(Minv, target.corner.map((x, c) => x - model.corner[c])).map(Math.round) : null;
         let n = 0, filled = 0;
         for (let jl = 0; jl < tl; jl++)
             for (let jk = 0; jk < tk; jk++)
                 for (let jh = 0; jh < th; jh++, n++) {
-                    let own = NaN;
+                    let own = NaN, at = -1;
                     if (keep) {
                         const i0 = oi[0] + jh, i1 = oi[1] + jk, i2 = oi[2] + jl;
-                        if (i0 >= 0 && i0 < sh && i1 >= 0 && i1 < sk && i2 >= 0 && i2 < sl) own = src[(i2 * sk + i1) * sh + i0];
+                        if (i0 >= 0 && i0 < sh && i1 >= 0 && i1 < sk && i2 >= 0 && i2 < sl) {
+                            at = (i2 * sk + i1) * sh + i0;
+                            own = src[at];
+                        }
                     }
-                    if (own === own) out[n] = own;
-                    else {
+                    if (own === own) {
+                        out[n] = own;
+                        if (outSigma) outSigma[n] = sg[at];
+                    } else {
                         out[n] = cnt[n] ? sum[n] / cnt[n] : NaN;
+                        if (outSigma) outSigma[n] = cnt[n] ? Math.sqrt(q[n] * mult[n]) / cnt[n] : NaN;
                         if (cnt[n]) filled++;
                     }
                 }
         if (keep) ctx.log(`${filled} empty voxels filled`);
-        return withValues(target, out, { symmetrized: 'laue', laueGroup: step.laue });
+        return withValues(target, out, { symmetrized: 'laue', laueGroup: step.laue, sigma: outSigma });
+    }
+
+    // Sigma(data)/Sigma(norm) - scale * Sigma(background)/Sigma(background norm)
+    // from Mantid's component volumes (MDNorm's _data, _norm, _bkg_data,
+    // _bkg_norm), the sums running over the Laue-equivalent voxels when a
+    // group is given, as MDNorm symmetrizes. Empty voxels count as 0 in every
+    // sum; a voxel without norm is NaN. The norm sums are kept as weights, so
+    // a |Q| profile averages as Sigma data / Sigma norm too.
+    async function stepNormalize(model, step, ctx) {
+        const volume = name => {
+            const v = ctx.extras && ctx.extras[name];
+            if (!v) throw new Error(`normalize: no loaded volume named "${name}"`);
+            if (!sameGrid(model, v)) throw new Error(`normalize: "${name}" is not on the grid of the data`);
+            return v;
+        };
+        const N = voxelCount(model);
+        const zeroed = a => {
+            const out = new Float64Array(N);
+            for (let i = 0; i < N; i++) out[i] = a[i] === a[i] ? a[i] : 0;
+            return out;
+        };
+        const squared = a => {
+            const out = new Float64Array(N);
+            for (let i = 0; i < N; i++) out[i] = a[i] === a[i] ? a[i] * a[i] : 0;
+            return out;
+        };
+        const parts = [model, volume(step.norm)];
+        if (step.background) parts.push(volume(step.background), volume(step.backgroundNorm));
+        const arrays = parts.map(v => zeroed(v.values));
+        const sigmaOf = [0, 2].filter(k => parts[k] && parts[k].sigma);
+        for (const k of sigmaOf) arrays.push(squared(parts[k].sigma));
+        let sums = arrays, mult = null;
+        if (step.laue !== 'none') {
+            const space = model.axesType === 'uvw' ? 'direct' : 'reciprocal';
+            const r = await groupSums(model, step.laue, space, arrays, ctx);
+            if (r.skipped) ctx.log(`${r.skipped} of the operations do not map the grid onto itself and are skipped`);
+            sums = r.sums;
+            if (sigmaOf.length) mult = stabilizerCounts(model, step.laue, space);
+        }
+        const values = new Float64Array(N);
+        const sigma = sigmaOf.length ? new Float64Array(N) : undefined;
+        let empty = 0;
+        for (let i = 0; i < N; i++) {
+            const n = sums[1][i];
+            let v = n > 0 ? sums[0][i] / n : NaN, var2 = n > 0 && sigmaOf.includes(0) ? sums[4][i] / (n * n) : 0;
+            if (step.background) {
+                const bn = sums[3][i];
+                v = bn > 0 ? v - step.scale * sums[2][i] / bn : NaN;
+                if (sigmaOf.includes(2) && bn > 0) var2 += step.scale * step.scale * sums[4 + sigmaOf.indexOf(2)][i] / (bn * bn);
+            }
+            if (v !== v) empty++;
+            values[i] = v;
+            if (sigma) sigma[i] = v === v ? Math.sqrt(var2 * (mult ? mult[i] : 1)) : NaN;
+        }
+        ctx.log(`${empty} voxels without norm are empty`);
+        const changes = { weights: sums[1], sigma };
+        if (step.laue !== 'none') Object.assign(changes, { symmetrized: 'laue', laueGroup: step.laue });
+        return withValues(model, values, changes);
     }
 
     // ------------------------------------------------------------------ 3D-ΔPDF
@@ -894,7 +1086,7 @@
         const corner = mulMV(W, s.map(x => -x));
         const vectors = [0, 1, 2].map(a => (dims[a] > 1 ? [W[0][a], W[1][a], W[2][a]] : [0, 0, 0]));
         const result = withValues(model, values, {
-            dims: dims.slice(), corner, vectors, axesType: 'uvw', content: '3d-delta-pdf',
+            dims: dims.slice(), corner, vectors, axesType: 'uvw', content: '3d-delta-pdf', sigma: undefined, weights: undefined,
         });
         result.axes = pickAxesLike(result);
         return result;
@@ -919,6 +1111,10 @@
         clip: { run: stepClip, fields: { below: 'number', to: 'clipTo' } },
         symmetrize: { run: stepSymmetrize, fields: { laue: 'string', mode: 'string', expand: 'boolean' } },
         deltaPdf: { run: stepDeltaPdf, fields: { taper: 'number', engine: 'engine', fill: 'passes' } },
+        normalize: {
+            run: stepNormalize,
+            fields: { norm: 'string', background: 'string?', backgroundNorm: 'string?', scale: 'number', laue: 'laue?' },
+        },
     };
 
     function checkField(kind, value, where) {
@@ -936,6 +1132,8 @@
             clipTo: v => v === 'nan' || finite(v),
             engine: v => v === 'cpu' || v === 'gpu',
             passes: v => Number.isInteger(v) && v >= 0 && v <= 50,
+            'string?': v => v === undefined || v === null || typeof v === 'string',
+            'laue?': v => v === 'none' || LAUE_GROUPS.includes(v),
             any: v => v !== undefined,
         }[kind];
         if (!ok(value)) throw new Error(`${where}: invalid value ${JSON.stringify(value)}`);
@@ -955,6 +1153,9 @@
                     checkField(kind, step[key], `recipe step ${n + 1} (${raw.op}) ${key}`);
                 }
                 if (raw.op === 'symmetrize') laueOperations(step.laue);
+                if (raw.op === 'normalize' && step.background && !step.backgroundNorm) {
+                    throw new Error(`recipe step ${n + 1} (normalize): a background volume needs its norm volume`);
+                }
                 if (raw.op === 'backgroundFunction') backgroundCurve(step.kind, step.params);
                 return step;
             }),
@@ -976,6 +1177,9 @@
             case 'combine': return `${step.operation} "${step.file}"${step.scale !== 1 ? ' x ' + step.scale : ''}`;
             case 'clip': return `set values below ${step.below} to ${step.to}`;
             case 'symmetrize': return `symmetrize with Laue group ${step.laue} (${step.mode}${step.expand ? ', extend the grid' : ''})`;
+            case 'normalize': return `Σdata/Σnorm with "${step.norm}"` +
+                (step.background ? ` − ${step.scale} × Σ"${step.background}"/Σ"${step.backgroundNorm}"` : '') +
+                (step.laue !== 'none' ? `, summed over ${step.laue}` : '');
             case 'deltaPdf': return `3D-ΔPDF by FFT on the ${step.engine === 'gpu' ? 'GPU (float32)' : 'CPU (float64)'}` +
                 (step.fill ? `, holes filled ${step.fill} voxel${step.fill === 1 ? '' : 's'} deep` : '') +
                 (step.taper ? `, Tukey taper ${step.taper}` : '');
@@ -999,6 +1203,9 @@
                     throw new Error('needs reciprocal-space (hkl) data, but these are in direct space');
                 }
                 current = await STEPS[step.op].run(current, step, Object.assign({}, ctx, { log }));
+                for (const key of ['sigma', 'weights']) {
+                    if (current[key] && current[key].length !== current.values.length) current = Object.assign({}, current, { [key]: undefined });
+                }
             } catch (e) {
                 if (e && e.cancelled) throw e;
                 throw new Error(`step ${n + 1} (${step.op}): ${e.message}`);
@@ -1032,23 +1239,31 @@
         if (model.axesType === 'uvw') throw new Error('a |Q| profile needs reciprocal-space data');
         needCell(cell, 'a |Q| profile');
         if (!(width > 0)) throw new Error('|Q| profile: the shell width must be positive');
-        const sums = [], sq = [], cnt = [];
+        // With norm weights w (from a normalize step), the shell mean is
+        // sum(w I) / sum(w) = sum(data) / sum(norm) over the shell.
+        const w = model.weights && model.weights.length === model.values.length ? model.weights : null;
+        const sw = [], sx = [], sxx = [], sww = [], cnt = [];
         forEachQ(model, cell, (i, q) => {
             const x = model.values[i];
             if (x !== x) return;
+            const wi = w ? w[i] : 1;
+            if (!(wi > 0)) return;
             const s = Math.floor(q / width);
-            sums[s] = (sums[s] || 0) + x;
-            sq[s] = (sq[s] || 0) + x * x;
+            sw[s] = (sw[s] || 0) + wi;
+            sx[s] = (sx[s] || 0) + wi * x;
+            sxx[s] = (sxx[s] || 0) + wi * x * x;
+            sww[s] = (sww[s] || 0) + wi * wi;
             cnt[s] = (cnt[s] || 0) + 1;
         });
-        const out = { q: [], mean: [], sigma: [], n: [] };
+        const out = { q: [], mean: [], sigma: [], n: [], weighted: !!w };
         for (let s = 0; s < cnt.length; s++) {
             if (!cnt[s]) continue;
-            const n = cnt[s], mean = sums[s] / n;
-            const variance = n > 1 ? Math.max(0, (sq[s] - n * mean * mean) / (n - 1)) : 0;
+            const n = cnt[s], mean = sx[s] / sw[s];
+            // standard error with the effective number of weighted samples
+            const variance = Math.max(0, sxx[s] / sw[s] - mean * mean), nEff = sw[s] * sw[s] / sww[s];
             out.q.push((s + 0.5) * width);
             out.mean.push(mean);
-            out.sigma.push(Math.sqrt(variance / n));
+            out.sigma.push(nEff > 1 ? Math.sqrt(variance * nEff / (nEff - 1) / nEff) : 0);
             out.n.push(n);
         }
         return out;

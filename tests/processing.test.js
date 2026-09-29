@@ -292,6 +292,48 @@ test('3D-ΔPDF punch and fill: holes next to data take their neighbours\' mean',
     assert.throws(() => Processing.normalizeRecipe({ steps: [{ op: 'deltaPdf', fill: 1.5 }] }), /fill/);
 });
 
+test('normalize: Σdata/Σnorm − s Σbkg/Σbkgnorm, summed over the Laue group like MDNorm', async () => {
+    const data = grid(1, 0.5, h => 2 + h);                                   // 5 x 5 x 5, h, k, l from -1
+    const norm = grid(1, 0.5, h => 1 + 0.5 * (h + 1));
+    const extras = { norm, bkg: grid(1, 0.5, () => 3), bkgNorm: grid(1, 0.5, () => 2) };
+    const plain = Object.assign({}, norm, { values: Float64Array.from(norm.values) });
+    plain.values[0] = 0;                                                     // no norm there
+    const steps = laue => [{ op: 'normalize', norm: 'norm', background: 'bkg', backgroundNorm: 'bkgNorm', scale: 0.5, laue }];
+    const p = await run(data, steps('none'), { extras: Object.assign({}, extras, { norm: plain }) });
+    assert.ok(Math.abs(value(p, 3, 2, 2) - ((2 + 0.5) / (1 + 0.5 * 1.5) - 0.5 * 3 / 2)) < 1e-12);  // (0.5, 0, 0)
+    assert.ok(Number.isNaN(p.values[0]));
+    assert.ok(p.weights && p.weights[1] === plain.values[1]);
+    // m-3m: the orbit of (1, 0, 0) is the six axis points; data 3 + 1 + 2 x 4 = 12, norm 2 + 1 + 1.5 x 4 = 9
+    const s = await run(data, steps('m-3m'), { extras });
+    assert.ok(Math.abs(value(s, 4, 2, 2) - (12 / 9 - 0.5 * 18 / 12)) < 1e-12);
+    assert.equal(s.laueGroup, 'm-3m');
+    // the |Q| profile of normalized data averages as Σdata / Σnorm
+    const prof = Processing.profileShells(p, cubic(4), 10);
+    assert.equal(prof.weighted, true);
+    assert.throws(() => Processing.normalizeRecipe({ steps: [{ op: 'normalize', norm: 'n', background: 'b' }] }), /needs its norm/);
+    assert.match(Processing.describeStep(Processing.normalizeRecipe({ steps: steps('m-3m') }).steps[0]),
+        /Σdata\/Σnorm with "norm" − 0.5 × Σ"bkg"\/Σ"bkgNorm", summed over m-3m/);
+});
+
+test('sigma propagates through scale, combine, rebin and symmetrize, and the ΔPDF drops it', async () => {
+    const m = grid(1, 0.5, h => 10 + h);
+    m.sigma = new Float64Array(125).fill(2);
+    const other = grid(1, 0.5, () => 1);
+    other.sigma = new Float64Array(125).fill(1.5);
+    const scaled = await run(m, [{ op: 'scale', factor: -3, offset: 1 }]);
+    assert.equal(scaled.sigma[7], 6);
+    const diff = await run(m, [{ op: 'combine', operation: 'subtract', file: 'o', scale: 2 }], { extras: { o: other } });
+    assert.ok(Math.abs(diff.sigma[7] - Math.hypot(2, 3)) < 1e-12);
+    const rebinned = await run(m, [{ op: 'rebin', factors: [5, 1, 1] }]);
+    assert.ok(Math.abs(rebinned.sigma[0] - Math.sqrt(5 * 4) / 5) < 1e-12);
+    const sym = await run(m, [{ op: 'symmetrize', laue: 'm-3m' }]);
+    assert.ok(Math.abs(sym.sigma[(2 * 5 + 2) * 5 + 4] - Math.sqrt(6 * 4) / 6) < 1e-12);  // (1,0,0): 6 members
+    const cropped = await run(m, [{ op: 'crop', h: [0, 1] }]);
+    assert.equal(cropped.sigma.length, cropped.values.length);
+    const pdf = await run(m, [{ op: 'deltaPdf' }], { fft: cpuFft });
+    assert.equal(pdf.sigma, undefined);
+});
+
 test('hkl-only steps refuse direct-space data; ΔPDF needs the FFT engine', async () => {
     const m = grid(1, 0.5, () => 1);
     const p = await run(m, [{ op: 'deltaPdf' }], { fft: cpuFft });

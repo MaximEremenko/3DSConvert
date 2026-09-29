@@ -980,6 +980,14 @@
                 }, box && hyperslab([box[2], box[1], box[0]]));
         }
         const grid = boxedGrid(box, dims, corner, vectors);
+        // opts.sigma: also read the uncertainties (errors_squared is a variance).
+        let sigma;
+        const errors = f.get(g + 'errors_squared');
+        if (opts.sigma && isDataset(errors) && sameShape(Array.from(errors.shape).map(Number), shape)) {
+            sigma = await readHFastest(errors, g + 'errors_squared', dims, { tick: opts.tick }, box);
+            for (let i = 0; i < sigma.length; i++) sigma[i] = values[i] === values[i] ? Math.sqrt(sigma[i]) : NaN;
+            notes.push('uncertainties read from errors_squared');
+        }
         for (let i = 0; i < values.length; i++) {
             if (values[i] === Infinity || values[i] === -Infinity) {
                 values[i] = NaN;
@@ -1008,7 +1016,7 @@
         }
         notes.push('radiation set to neutron (Mantid workspace); change it under Output if needed');
         return {
-            dims: grid.dims, corner: grid.corner, vectors: grid.vectors, values, cellLengths: lengths, cellAngles: angles,
+            dims: grid.dims, corner: grid.corner, vectors: grid.vectors, values, sigma, cellLengths: lengths, cellAngles: angles,
             radiation: 'neutron', axes: pickAxes(grid.vectors, grid.dims), axesType: 'hkl', notes,
         };
     }
@@ -1237,13 +1245,26 @@
         const { dims, corner, vectors } = boxedGrid(box, fullDims, fullCorner, fullVectors);
         if (axes.some(a => a.edges)) notes.push('axes hold bin edges; grid points are the bin centres');
 
+        // opts.sigma: the uncertainties, NeXus style ("errors" or "<signal>_errors").
+        let sigma;
+        const errorName = ['errors', `${pick.signal}_errors`].find(n => isDataset(group.get(n)) &&
+            sameShape(Array.from(group.get(n).shape).map(Number), shape));
+        if (opts.sigma && errorName) {
+            sigma = (await readPermuted(group.get(errorName), `${pick.path}/${errorName}`, axisOfDim, { tick: opts.tick }, box)).values;
+            notes.push(`uncertainties read from "${errorName}"`);
+        }
         const weights = group.get('weights');
         if (isDataset(weights) && sameShape(Array.from(weights.shape).map(Number), shape)) {
             const w = (await readPermuted(weights, `${pick.path}/weights`, axisOfDim, { tick: opts.tick }, box)).values;
             let zero = 0;
             for (let i = 0; i < values.length; i++) {
-                if (w[i] > 0) values[i] /= w[i];
-                else { values[i] = NaN; zero++; }
+                if (w[i] > 0) {
+                    values[i] /= w[i];
+                    if (sigma) sigma[i] /= w[i];
+                } else {
+                    values[i] = NaN;
+                    zero++;
+                }
             }
             notes.push('signal divided by "weights"' + (zero ? `; ${zero} voxels with zero weight set to NaN` : ''));
         }
@@ -1263,7 +1284,7 @@
         const missing = countNonFinite(values);
         if (missing) notes.push(`${missing} of ${values.length} voxels hold no data (NaN)`);
         return {
-            dims, corner, vectors, values, cellLengths: lengths, cellAngles: angles,
+            dims, corner, vectors, values, sigma, cellLengths: lengths, cellAngles: angles,
             radiation: meta.radiation || 'unknown', axes: pickAxes(vectors, dims),
             axesType: frame === 'Q' ? 'Q' : 'hkl', notes, nexusPath: pick.path,
         };

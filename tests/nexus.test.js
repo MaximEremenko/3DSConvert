@@ -256,3 +256,25 @@ test('crop on read equals reading everything and cropping, for every HDF5 reader
     }
     await assert.rejects(Converter.readYell(await openH5('Examples/example_yell.h5'), { crop: { h: [5, 6] } }), /no grid points with h/);
 });
+
+test('uncertainties: Mantid errors_squared and NeXus errors are read on request', async () => {
+    const plain = await Converter.readMantidMD(await mantidFile({}), {});
+    assert.equal(plain.sigma, undefined);
+    const m = await Converter.readMantidMD(await mantidFile({}), { sigma: true, crop: { h: [-0.5, 0.5] } });
+    assert.equal(m.sigma.length, m.values.length);
+    for (let i = 0; i < m.values.length; i++) assert.ok(Math.abs(m.sigma[i] - 2 * Math.sqrt(Math.abs(m.values[i]))) < 1e-12);
+    assert.match(m.notes.join(String.fromCharCode(10)), /uncertainties read from errors_squared/);
+    const f = await buildH5(file => {
+        const d = file.create_group('entry').create_group('data');
+        d.create_attribute('NX_class', 'NXdata');
+        d.create_attribute('signal', 'counts');
+        d.create_attribute('axes', ['l', 'k', 'h'], [3], 'S1');
+        d.create_dataset({ name: 'counts', data: fastestFirst(3, 2, 2), shape: [2, 2, 3], dtype: '<d' });
+        d.create_dataset({ name: 'counts_errors', data: new Float64Array(12).fill(0.5), shape: [2, 2, 3], dtype: '<d' });
+        d.create_dataset({ name: 'weights', data: new Float64Array(12).fill(2), shape: [2, 2, 3], dtype: '<d' });
+        [['h', linspace(0, 1, 3)], ['k', linspace(0, 1, 2)], ['l', linspace(0, 1, 2)]].forEach(([name, a]) =>
+            d.create_dataset({ name, data: a, shape: [a.length], dtype: '<d' }));
+    });
+    const n = await Converter.readNexusData(f, { sigma: true });
+    assert.deepEqual(Array.from(n.sigma), new Array(12).fill(0.25));             // divided by the weights too
+});
