@@ -41,7 +41,7 @@ test('rejects an unrecognized header line', () => {
 });
 
 test('writes NaN and infinite intensities as 0 (RMCProfile mask value)', async () => {
-    const model = Converter.readUnifiedData(await openH5('Examples/example_unified.h5'));
+    const model = await Converter.readUnifiedData(await openH5('Examples/example_unified.h5'));
     const values = Float64Array.from(model.values);
     values[0] = NaN;
     values[1] = Infinity;

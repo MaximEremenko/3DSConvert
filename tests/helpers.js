@@ -12,12 +12,12 @@ const Converter = require(path.join(ROOT, 'js', 'converter.js'));
 let h5Ready = null;
 let seq = 0;
 
-// js/h5wasm.js is a browser IIFE that declares a global `h5wasm`; wrapping
-// the source in a function evaluates it in Node without a bundler.
+// js/h5wasm.js defines h5wasmModule(), which builds the vendored browser
+// bundle; evaluating the source in a function runs it in Node.
 function loadH5wasm() {
     if (!h5Ready) {
         const src = fs.readFileSync(path.join(ROOT, 'js', 'h5wasm.js'), 'utf8');
-        const h5wasm = new Function('require', src + '\nreturn h5wasm;')(require);
+        const h5wasm = new Function('require', src + '\nreturn h5wasmModule();')(require);
         h5Ready = h5wasm.ready.then(() => {
             h5wasm.Module.activate_throwing_error_handler();   // as index.html does
             return h5wasm;
@@ -26,17 +26,26 @@ function loadH5wasm() {
     return h5Ready;
 }
 
-// Create a file with build(file), close it, and reopen it read-only.
+// Create a file with (async) build(file), close it, and reopen it read-only.
 async function buildH5(build) {
     const h5wasm = await loadH5wasm();
     const name = `test_${seq++}.h5`;
     const file = new h5wasm.File(name, 'w');
     try {
-        build(file);
+        await build(file);
     } finally {
         file.close();
     }
     return new h5wasm.File(name, 'r');
+}
+
+// A Blob holding a text or a file, for the stream readers.
+function textBlob(text) {
+    return new Blob([text]);
+}
+
+function fileBlob(relPath) {
+    return fs.openAsBlob(path.isAbsolute(relPath) ? relPath : path.join(ROOT, relPath));
 }
 
 async function openH5Bytes(bytes) {
@@ -73,4 +82,5 @@ function vtkText(title, dims, origin, spacing, values) {
 
 module.exports = {
     ROOT, Converter, loadH5wasm, buildH5, openH5, openH5Bytes, readText, maxAbsDiff, vtkText,
+    textBlob, fileBlob,
 };

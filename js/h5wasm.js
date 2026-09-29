@@ -1,3 +1,6 @@
+// 3DSConvert: the vendored h5wasm 0.10.3 bundle is wrapped in h5wasmModule() so
+// index.html can start it inside a Web Worker from this function's source text.
+function h5wasmModule() {
 var h5wasm = (() => {
   var __defProp = Object.defineProperty;
   var __getOwnPropDesc = Object.getOwnPropertyDescriptor;
@@ -30839,3 +30842,5 @@ ${e}`);
   var hdf5_hl_default = h5wasm;
   return __toCommonJS(hdf5_hl_exports);
 })();
+return h5wasm;
+}

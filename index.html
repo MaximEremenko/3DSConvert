@@ -48,6 +48,14 @@
   }
   button:hover { background: var(--accent2); }
   button:disabled { opacity: .45; cursor: default; }
+  button.secondary {
+    margin-top: 0; padding: .3rem 1rem; color: var(--text); background: transparent;
+    border: 1px solid var(--line);
+  }
+  button.secondary:hover { background: var(--bg); }
+  .busy { display: flex; align-items: center; gap: .75rem; margin-top: .75rem; }
+  .busy[hidden] { display: none; }
+  .busy progress { flex: 1 1 auto; height: .9rem; }
   #log {
     white-space: pre-wrap; font-family: ui-monospace, Consolas, monospace; font-size: .85rem;
     background: var(--bg); border: 1px solid var(--line); border-radius: 6px;
@@ -137,7 +145,36 @@
         </select>
       </div>
     </div>
+    <div class="row">
+      <div>
+        <label>HDF5 precision <span class="hint">(data array)</span></label>
+        <select id="precision">
+          <option value="same">same as the input</option>
+          <option value="float64">float64</option>
+          <option value="float32">float32 (half the size)</option>
+        </select>
+      </div>
+      <div>
+        <label>Unified layout</label>
+        <select id="layout">
+          <option value="both">/scattering/data and /entry/data</option>
+          <option value="entry">/entry/data only (half the size)</option>
+        </select>
+      </div>
+      <div>
+        <label>HDF5 compression</label>
+        <select id="compression">
+          <option value="0">none</option>
+          <option value="4">gzip (smaller, slower to write)</option>
+        </select>
+      </div>
+    </div>
     <button id="convertBtn" disabled>Convert &amp; download</button>
+    <div id="busy" class="busy" hidden>
+      <progress id="progressBar" max="1" value="0"></progress>
+      <span id="progressText" class="hint"></span>
+      <button id="cancelBtn" type="button" class="secondary">Cancel</button>
+    </div>
   </div>
 
   <div class="panel">
@@ -148,12 +185,12 @@
 
 <script src="js/h5wasm.js"></script>
 <script src="js/converter.js"></script>
+<script src="js/worker.js"></script>
 <script>
 'use strict';
 (async function () {
   const $ = id => document.getElementById(id);
   const logEl = $('log');
-  let seq = 0;
 
   function log(msg, cls) {
     const line = document.createElement('div');
@@ -164,104 +201,181 @@
   }
   function clearLog() { logEl.textContent = ''; }
 
-  await h5wasm.ready;
-  const FS = h5wasm.FS;
-  // Raise HDF5 read errors (e.g. a missing filter plugin) instead of letting
-  // h5wasm return undecoded bytes.
-  if (h5wasm.Module && typeof h5wasm.Module.activate_throwing_error_handler === 'function') {
-    h5wasm.Module.activate_throwing_error_handler();
-  }
-  logEl.textContent = 'Ready.';
-
-  const state = { data: null, struct: null, dataFile: null, gridConfig: null };
-
   function fmtCell(c) {
     return c.lengths.map(x => x.toPrecision(6)).join(' ') + ' / ' +
            c.angles.map(x => x.toPrecision(4)).join(' ');
   }
 
-  function openH5(bytes) {
-    const name = 'mem_' + (seq++) + '.h5';
-    FS.writeFile(name, new Uint8Array(bytes));
-    return { file: new h5wasm.File(name, 'r'), name };
+  function fmtBytes(n) {
+    return n >= 1073741824 ? (n / 1073741824).toFixed(2) + ' GB'
+         : n >= 1048576 ? (n / 1048576).toFixed(1) + ' MB' : Math.max(1, Math.round(n / 1024)) + ' kB';
   }
 
-  function isHdf5(bytes) {
-    const u = new Uint8Array(bytes.slice(0, 8));
-    return u[0] === 0x89 && u[1] === 0x48 && u[2] === 0x44 && u[3] === 0x46;
+  // ------------------------------------------------------------ worker
+  // All reading, conversion and HDF5 writing run in a Web Worker built from
+  // the source of h5wasmModule, ConverterFactory and converterWorker, so the
+  // page stays responsive and works from file:// without fetching anything.
+  function createClient() {
+    const source = [
+      'var h5wasm = (' + h5wasmModule.toString() + ')();',
+      'var Converter = (' + ConverterFactory.toString() + ')();',
+      '(' + converterWorker.toString() + ')(self, h5wasm, Converter);',
+    ].join('\n');
+    const url = URL.createObjectURL(new Blob([source], { type: 'text/javascript' }));
+    const worker = new Worker(url);
+    const pending = new Map();
+    let seq = 0;
+    const fail = err => {
+      for (const call of pending.values()) call.reject(err);
+      pending.clear();
+    };
+    worker.onmessage = async ev => {
+      const msg = ev.data;
+      const call = pending.get(msg.id);
+      if (!call) return;
+      if (msg.type === 'progress') {
+        if (call.onProgress) call.onProgress(msg.phase, msg.fraction);
+      } else if (msg.type === 'chunk') {
+        try {
+          await call.onChunk(msg.chunk);
+          worker.postMessage({ type: 'ack', id: msg.id });
+        } catch (e) {
+          call.sinkError = e;
+          worker.postMessage({ type: 'cancel', id: msg.id });
+        }
+      } else if (msg.type === 'result') {
+        pending.delete(msg.id);
+        call.resolve(msg.result);
+      } else if (msg.type === 'error') {
+        pending.delete(msg.id);
+        call.reject(call.sinkError || Object.assign(new Error(msg.message), { cancelled: msg.cancelled }));
+      }
+    };
+    worker.onerror = ev => {
+      ev.preventDefault();
+      fail(new Error(ev.message || 'the conversion worker failed'));
+    };
+    return {
+      call(method, args, hooks) {
+        const id = ++seq;
+        const promise = new Promise((resolve, reject) =>
+          pending.set(id, Object.assign({ resolve, reject }, hooks)));
+        worker.postMessage({ type: 'call', id, method, args });
+        return { id, promise };
+      },
+      cancel(id) { worker.postMessage({ type: 'cancel', id }); },
+      terminate() {
+        worker.terminate();
+        URL.revokeObjectURL(url);
+        fail(Object.assign(new Error('cancelled'), { cancelled: true }));
+      },
+    };
   }
 
-  function decodeText(bytes) {
+  const state = { data: null, struct: null, dataFile: null, gridConfig: null };
+  let client, current = null, hardCancelTimer = null;
+
+  try {
+    client = createClient();
+    await client.call('ping').promise;
+    logEl.textContent = 'Ready.';
+  } catch (e) {
+    logEl.textContent = '';
+    log('Could not start the conversion worker: ' + e.message, 'err');
+    return;
+  }
+
+  function updateButton() {
+    $('convertBtn').disabled = !state.data || !!current;
+  }
+
+  function setBusy(label) {
+    const on = !!label;
+    $('busy').hidden = !on;
+    $('progressBar').removeAttribute('value');   // indeterminate until the first report
+    $('progressText').textContent = label || '';
+    for (const id of ['dataFile', 'structFile', 'gridConfigFile', 'yellSpace']) $(id).disabled = on;
+    updateButton();
+  }
+
+  function showProgress(phase, fraction) {
+    $('progressBar').value = fraction;
+    $('progressText').textContent = `${phase} ${Math.round(100 * fraction)}%`;
+  }
+
+  // Run one worker call with the progress bar and Cancel button.
+  async function run(label, method, args, hooks) {
+    const call = client.call(method, args, Object.assign({ onProgress: showProgress }, hooks));
+    current = call;
+    setBusy(label);
     try {
-      return new TextDecoder().decode(bytes);
-    } catch (e) {
-      throw new Error(`the file (${(bytes.byteLength / 1048576).toFixed(0)} MB) is larger than this ` +
-        'browser can hold as one text string (about 512 MB in Chrome/Edge, 1 GB in Firefox)');
+      return await call.promise;
+    } finally {
+      current = null;
+      clearTimeout(hardCancelTimer);
+      setBusy(null);
     }
   }
 
-  function logNotes(model) {
-    for (const note of (model && model.notes) || []) log('Note: ' + note);
+  $('cancelBtn').addEventListener('click', () => {
+    if (!current) return;
+    client.cancel(current.id);
+    $('progressText').textContent = 'Cancelling…';
+    // A single long HDF5 call cannot yield; restart the worker if it does not stop.
+    hardCancelTimer = setTimeout(() => {
+      if (!current) return;
+      client.terminate();
+      client = createClient();
+      state.data = null;
+      state.struct = null;
+      for (const id of ['dataFile', 'structFile']) $(id).value = '';
+      $('dataInfo').textContent = '';
+      $('structInfo').textContent = '';
+      log('The worker did not stop in time and was restarted; select the files again.', 'err');
+    }, 5000);
+  });
+
+  function logNotes(notes) {
+    for (const note of notes || []) log('Note: ' + note);
   }
 
+  // ------------------------------------------------------------ inputs
   async function loadDataFile() {
-    const fileObj = state.dataFile;
-    if (!fileObj) return;
+    const file = state.dataFile;
     $('dataInfo').textContent = '';
     state.data = null;
+    updateButton();
     try {
-      const bytes = await fileObj.arrayBuffer();
-      if (isHdf5(bytes)) {
-        const { file, name } = openH5(bytes);
-        try {
-          const kind = Converter.detectH5Kind(file);
-          if (kind === 'yell') {
-            state.data = { kind, model: Converter.readYell(file, { space: $('yellSpace').value }) };
-          } else if (kind === 'unified') {
-            state.data = { kind, model: Converter.readUnifiedData(file) };
-          } else if (kind === 'structure') {
-            throw new Error('this is a structure file - load it in section 2');
-          } else {
-            throw new Error('unrecognized HDF5 layout');
-          }
-        } finally {
-          file.close(); FS.unlink(name);
-        }
-      } else {
-        const text = decodeText(bytes);
-        if (!Converter.isVtk(text)) {
-          state.data = { kind: 'dat', text };
-        } else if (Converter.vtkFrame(text) === 'hkl') {
-          state.data = { kind: 'vtk-hkl', model: Converter.parseVtk(text, null, { frame: 'hkl' }) };
-        } else {
-          state.data = { kind: 'vtk', text };
-        }
-      }
-      state.data.baseName = fileObj.name.replace(/\.(h5|hdf5|hdf|he5|nx|nxs|nx5|dat|txt|vtk)$/i, '');
+      const s = await run('Reading…', 'loadData', { file, yellSpace: $('yellSpace').value });
+      if (!s) return;
+      s.baseName = file.name.replace(/\.(h5|hdf5|hdf|he5|nx|nxs|nx5|dat|txt|vtk)$/i, '');
+      state.data = s;
       let info;
-      if (state.data.kind === 'dat') {
-        info = 'RMCProfile old text format (grid parsed on convert)';
-      } else if (state.data.kind === 'vtk') {
-        info = 'VTK STRUCTURED_POINTS in Q (grid parsed on convert)';
+      if (s.kind === 'dat') {
+        info = `RMCProfile old text format | grid ${s.dims.join(' x ')} in Q`;
+      } else if (s.kind === 'vtk') {
+        info = `VTK STRUCTURED_POINTS in Q | grid ${s.dims.join(' x ')}`;
+      } else if (s.kind === 'vtk-hkl') {
+        info = `VTK STRUCTURED_POINTS in r.l.u. ("${s.title}") | grid ${s.dims.join(' x ')}`;
       } else {
-        const m = state.data.model;
-        const label = { yell: 'Yell 1.0', unified: 'Unified data format',
-                        'vtk-hkl': 'VTK STRUCTURED_POINTS in r.l.u.' }[state.data.kind];
-        info = label + ` | grid ${m.dims.join(' x ')}` +
-               (state.data.kind === 'unified' ? ` | axes ${m.axesType || 'hkl'}` : '') +
-               ` | stored cell: ${m.cellLengths.map(x => x.toPrecision(6)).join(' ')} / ` +
-               m.cellAngles.map(x => x.toPrecision(4)).join(' ') +
-               (Converter.isUnitMetric(m.cellLengths, m.cellAngles) ? '  (unit metric)' : '');
+        info = (s.kind === 'yell' ? 'Yell 1.0' : 'Unified data format') +
+               ` | grid ${s.dims.join(' x ')}` +
+               (s.kind === 'unified' ? ` | axes ${s.axesType || 'hkl'}` : '') +
+               ` | ${s.precision}` +
+               ` | stored cell: ${s.cellLengths.map(x => x.toPrecision(6)).join(' ')} / ` +
+               s.cellAngles.map(x => x.toPrecision(4)).join(' ') +
+               (Converter.isUnitMetric(s.cellLengths, s.cellAngles) ? '  (unit metric)' : '');
       }
       $('dataInfo').textContent = info;
-      log(`Data file "${fileObj.name}": ${info}`);
-      logNotes(state.data.model);
-      if(state.data.model && state.data.model.legacyContract) {
+      log(`Data file "${file.name}": ${info}`);
+      logNotes(s.notes);
+      if (s.legacyContract) {
         log('Legacy unified metadata accepted; new unified output will write the mandatory current contract.');
       }
     } catch (e) {
-      $('dataInfo').textContent = 'Error: ' + e.message;
-      log('Error reading data file: ' + e.message, 'err');
+      const msg = e.cancelled ? 'reading cancelled' : e.message;
+      $('dataInfo').textContent = 'Error: ' + msg;
+      log('Error reading data file: ' + msg, 'err');
     }
     updateButton();
   }
@@ -305,25 +419,18 @@
   }
 
   $('structFile').addEventListener('change', async ev => {
-    const fileObj = ev.target.files[0];
-    if (!fileObj) return;
+    const file = ev.target.files[0] || null;
     $('structInfo').textContent = '';
     state.struct = null;
     try {
-      const bytes = await fileObj.arrayBuffer();
-      let parent;
-      if (isHdf5(bytes)) {
-        const { file, name } = openH5(bytes);
-        parent = Converter.readUnifiedStructure(file);
-        file.close(); FS.unlink(name);
-      } else {
-        parent = Converter.parseRmc6f(new TextDecoder().decode(bytes));
+      const parent = await run('Reading structure…', 'loadStructure', { file });
+      if (parent) {
+        state.struct = parent;
+        const info = `parent cell ${fmtCell(parent)}` +
+          (parent.supercell ? ` (supercell ${parent.supercell.join(' x ')})` : '');
+        $('structInfo').textContent = info;
+        log(`Structure "${file.name}": ${info}`);
       }
-      state.struct = parent;
-      const info = `parent cell ${fmtCell(parent)}` +
-        (parent.supercell ? ` (supercell ${parent.supercell.join(' x ')})` : '');
-      $('structInfo').textContent = info;
-      log(`Structure "${fileObj.name}": ${info}`);
     } catch (e) {
       $('structInfo').textContent = 'Error: ' + e.message;
       log('Error reading structure file: ' + e.message, 'err');
@@ -339,22 +446,7 @@
     return { lengths: vals.slice(0, 3), angles: vals.slice(3, 6) };
   }
 
-  function updateButton() {
-    $('convertBtn').disabled = !state.data;
-  }
-
-  function resolveCell(model) {
-    // Preference: cell stored with the data (unless unit metric) > structure file > manual entry.
-    const manual = manualCell();
-    if (model && model.cellLengths &&
-        !Converter.isUnitMetric(model.cellLengths, model.cellAngles)) {
-      return { cell: { lengths: model.cellLengths, angles: model.cellAngles }, source: 'data file' };
-    }
-    if (state.struct) return { cell: state.struct, source: 'structure file' };
-    if (manual) return { cell: manual, source: 'manual entry' };
-    return null;
-  }
-
+  // ------------------------------------------------------------ output
   function download(bytes, filename, mime) {
     const blob = new Blob(Array.isArray(bytes) ? bytes : [bytes], { type: mime });
     const a = document.createElement('a');
@@ -364,130 +456,95 @@
     setTimeout(() => URL.revokeObjectURL(a.href), 5000);
   }
 
-  async function downloadTextChunks(chunks, filename) {
+  // Where text output goes: straight to disk through the File System Access
+  // API (Chromium), else a chunked in-memory download (separate strings avoid
+  // the maximum string length, but the Blob still has to fit in memory).
+  async function openTextSink(filename, format) {
     if ('showSaveFilePicker' in window) {
-      const handle = await window.showSaveFilePicker({
-        suggestedName: filename,
-        types: [{
-          description: 'RMCProfile old diffuse text format',
-          accept: { 'text/plain': ['.dat'] },
-        }],
-      });
-      const writable = await handle.createWritable();
       try {
-        for (const chunk of chunks) await writable.write(chunk);
-        await writable.close();
+        const handle = await window.showSaveFilePicker({
+          suggestedName: filename,
+          types: [{
+            description: format === 'dat' ? 'RMCProfile old diffuse text format' : 'VTK legacy file',
+            accept: { 'text/plain': ['.' + format] },
+          }],
+        });
+        const writable = await handle.createWritable();
+        return {
+          how: 'streamed directly to disk',
+          write: chunk => writable.write(chunk),
+          close: () => writable.close(),
+          abort: () => writable.abort().catch(() => {}),
+        };
       } catch (e) {
-        try { await writable.abort(); } catch (_) {}
-        throw e;
+        if (e.name === 'AbortError') throw Object.assign(new Error('cancelled'), { cancelled: true });
+        log(`No save dialog (${e.message}); building the download in memory instead.`);
       }
-      return 'streamed directly to disk';
+    } else {
+      log('Direct file streaming is unavailable in this browser; building a chunked download in memory.');
     }
-
-    // Firefox/Safari fallback: separate strings avoid the maximum string
-    // length failure, although the completed Blob still has to fit in memory.
-    log('Direct file streaming is unavailable in this browser; building a chunked download in memory.');
     const parts = [];
-    for (const chunk of chunks) parts.push(chunk);
-    download(parts, filename, 'text/plain');
-    return 'prepared as a chunked browser download';
+    return {
+      how: 'prepared as a chunked browser download',
+      write: chunk => { parts.push(chunk); },
+      close: () => download(parts, filename, 'text/plain'),
+      abort: () => {},
+    };
   }
 
   $('convertBtn').addEventListener('click', async () => {
     clearLog();
+    const format = $('outFormat').value;
+    const text = format === 'dat' || format === 'vtk';
+    const params = {
+      format,
+      radiation: $('radiation').value,
+      manual: manualCell(),
+      precision: $('precision').value,
+      layout: $('layout').value,
+      compression: Number($('compression').value),
+    };
+    if (state.gridConfig && state.data.kind === 'vtk') {
+      const index = pickGrid(state.gridConfig, state.dataFile && state.dataFile.name);
+      params.grid = state.gridConfig.grids[index];
+      params.customFrame = state.gridConfig.customFrame;
+      if (state.gridConfig.grids.length > 1) {
+        log(`Using grid ${index + 1} of ${state.gridConfig.grids.length} from the config.`);
+      }
+    }
+    const suffix = { unified: '_unified.h5', yell: '_yell.h5', dat: '_diffuse3d.dat', vtk: '_diffuse.vtk' }[format];
+    const outName = (state.data.baseName || 'converted') + suffix;
+    let sink = null;
     try {
-      const outFmt = $('outFormat').value;
-      let model, resolved;
-
-      if (state.data.kind === 'dat' || state.data.kind === 'vtk') {
-        const manual = manualCell();
-        const parent = state.struct || manual;
-        if (!parent) {
-          throw new Error((state.data.kind === 'vtk' ? 'Scatty VTK' : 'old-format .dat') +
-            ' input needs a structure file or a manual parent cell');
+      const plan = await run('Preparing…', 'prepare', params);
+      for (const line of plan.logs) log(line);
+      logNotes(plan.notes);
+      log(`Grid ${plan.dims.join(' x ')} (${plan.dims[0] * plan.dims[1] * plan.dims[2]} points)`);
+      log(`Cell for hkl <-> Q: ${fmtCell(plan.cell)}  [from ${plan.cellSource}]`);
+      log(`Output: about ${fmtBytes(plan.estimate)}` +
+          (!text && params.compression ? ' before compression' : '') + '.');
+      if (text) {
+        if (plan.nonFinite) {
+          log(`${plan.nonFinite} NaN/infinite voxels written as 0` +
+              (format === 'dat' ? ' (RMCProfile leaves points with I = 0 out of the fit).' : '.'));
         }
-        if (state.data.kind === 'vtk') {
-          const opts = {};
-          if (state.gridConfig) {
-            const index = pickGrid(state.gridConfig, state.dataFile && state.dataFile.name);
-            opts.grid = state.gridConfig.grids[index];
-            opts.customFrame = state.gridConfig.customFrame;
-            if (state.gridConfig.grids.length > 1) {
-              log(`Using grid ${index + 1} of ${state.gridConfig.grids.length} from the config.`);
-            }
-          }
-          model = Converter.parseVtk(state.data.text, parent, opts);
-        } else {
-          model = Converter.parseOldDat(state.data.text, parent);
-          if (model.nsecOriginal > 1) {
-            log(`Note: input has ${model.nsecOriginal} symmetry sections; section 1 Q coordinates used.`);
-          }
-        }
-        logNotes(model);
-        resolved = { cell: parent, source: state.struct ? 'structure file' : 'manual entry' };
+        sink = await openTextSink(outName, format);
+        await run('Writing…', 'write', {}, { onChunk: chunk => sink.write(chunk) });
+        await sink.close();
+        log(`Wrote ${outName} (${sink.how})`, 'ok');
       } else {
-        model = state.data.model;
-        logNotes(model);
-        resolved = resolveCell(model);
-        if (!resolved) {
-          if (outFmt === 'dat' || outFmt === 'vtk') {
-            throw new Error('data file stores the unit metric - supply a structure file or a manual parent cell');
-          }
-          // pass the unit metric through for h5 -> h5 conversions
-          resolved = { cell: { lengths: model.cellLengths, angles: model.cellAngles }, source: 'data file (unit metric, passed through)' };
+        if (plan.estimate > 1.9 * 1073741824) {
+          log('Warning: HDF5 files are assembled in memory, and Chrome/Edge cannot hold one above ' +
+              'about 2 GB; float32, the /entry/data-only layout or compression reduce the size.', 'err');
         }
-      }
-
-      const radSel = $('radiation').value;
-      if (radSel) model.radiation = radSel;
-
-      if(model.axesType === 'Q') {
-        if(Converter.isUnitMetric(resolved.cell.lengths, resolved.cell.angles)) {
-          throw new Error('Q-axis unified data needs a real parent cell to convert Q to hkl');
-        }
-        model = Converter.modelAxesToHkl(model, resolved.cell);
-        log('Converted unified Cartesian Q axes to hkl using the selected parent cell.');
-      }
-
-      log(`Grid ${model.dims.join(' x ')} (${model.dims[0] * model.dims[1] * model.dims[2]} points)`);
-      log(`Cell for hkl <-> Q: ${fmtCell(resolved.cell)}  [from ${resolved.source}]`);
-
-      const base = state.data.baseName || 'converted';
-      if (outFmt === 'dat' || outFmt === 'vtk') {
-        if (Converter.isUnitMetric(resolved.cell.lengths, resolved.cell.angles)) {
-          throw new Error('cannot write ' + outFmt + ' with a unit-metric cell - supply a structure file or a manual parent cell');
-        }
-        const nonFinite = Converter.countNonFinite(model.values);
-        if (nonFinite) {
-          log(`${nonFinite} NaN/infinite voxels written as 0` +
-              (outFmt === 'dat' ? ' (RMCProfile leaves points with I = 0 out of the fit).' : '.'));
-        }
-        const outName = base + (outFmt === 'dat' ? '_diffuse3d.dat' : '_diffuse.vtk');
-        if (outFmt === 'dat') {
-          const result = await downloadTextChunks(
-            Converter.writeOldDatChunks(model, resolved.cell), outName);
-          log('Wrote ' + outName + ' (' + result + ')', 'ok');
-        } else {
-          download(Converter.writeVtk(model, resolved.cell), outName, 'text/plain');
-          log('Wrote ' + outName, 'ok');
-        }
-      } else {
-        const name = 'out_' + (seq++) + '.h5';
-        const f = new h5wasm.File(name, 'w');
-        if (outFmt === 'unified') {
-          Converter.writeUnifiedData(f, model, resolved.cell, {});
-        } else {
-          Converter.writeYell(f, model, resolved.cell);
-        }
-        f.flush(); f.close();
-        const bytes = FS.readFile(name);
-        FS.unlink(name);
-        const suffix = outFmt === 'unified' ? '_unified.h5' : '_yell.h5';
-        download(bytes, base + suffix, 'application/x-hdf5');
-        log('Wrote ' + base + suffix, 'ok');
+        const result = await run('Writing…', 'write', {});
+        download(result.bytes, outName, 'application/x-hdf5');
+        log(`Wrote ${outName}`, 'ok');
       }
     } catch (e) {
-      log('Error: ' + e.message, 'err');
+      if (sink) await sink.abort();
+      if (e.cancelled) log('Cancelled.');
+      else log('Error: ' + e.message, 'err');
     }
   });
 })();

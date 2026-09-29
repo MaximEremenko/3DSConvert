@@ -12,8 +12,19 @@
  *   dims    [nh, nk, nl]
  *   corner  hkl of pixel (1,1,1)
  *   vectors vectors[axis][component] hkl increment per pixel step
- *   values  Float64Array, h fastest: idx = (il*nk + ik)*nh + ih
+ *   values  Float32Array (float32 sources) or Float64Array, h fastest:
+ *           idx = (il*nk + ik)*nh + ih; NaN marks a missing/masked voxel
  *   cellLengths/cellAngles: cell stored with the data (may be unit metric)
+ *   notes   assumptions the reader made, for the log
+ *
+ * Large files: HDF5 readers are async and read the data array in slabs
+ * along its slowest axis (opts.tick is awaited between slabs, so a caller
+ * can yield and cancel; opts.progress gets the fraction done). Text formats
+ * are parsed line by line, from a string or a byte stream, into a grid in
+ * the file's own frame (Cartesian Q for .dat and Scatty VTK); toHklModel
+ * applies the parent cell later, so a cell change needs no re-parse. HDF5
+ * writers stream plane by plane into chunked datasets when the data are
+ * large or compressed.
  *
  * Axis-order conventions (verified against files produced by the Fortran
  * writers and by DISCUS):
@@ -43,6 +54,8 @@
         module.exports = factory();
     } else {
         root.Converter = factory();
+        // index.html rebuilds the module inside its Web Worker from this source.
+        root.ConverterFactory = factory;
     }
 }(typeof self !== 'undefined' ? self : this, function () {
     'use strict';
@@ -102,7 +115,7 @@
         return value;
     }
 
-    function readDataset(ds, path) {
+    function assertDecodable(ds, path) {
         let filters = [];
         try { filters = ds.filters || []; } catch (_) { filters = []; }
         const missing = filters.filter(x => !BUILTIN_FILTERS.has(Number(x.id)));
@@ -113,6 +126,10 @@
                 'decode (it reads gzip/deflate, shuffle, szip, fletcher32, n-bit and scale-offset); ' +
                 're-save the file without it, e.g. h5repack -f GZIP=4 in.h5 out.h5');
         }
+    }
+
+    function readDataset(ds, path) {
+        assertDecodable(ds, path);
         const value = ds.value;
         if (value instanceof BigInt64Array || value instanceof BigUint64Array) {
             return Float64Array.from(value, Number);
@@ -133,6 +150,70 @@
         return list.map(Number);
     }
 
+    // -------------------------------------------------------- slab-wise reads
+
+    const SLAB_BYTES = 32 * 1048576;
+
+    function isFloat32Dataset(ds) {
+        const m = ds.metadata || {};
+        return m.type === 1 && Number(m.size) === 4;       // H5T_FLOAT, 4 bytes
+    }
+
+    function allocFor(ds, n) {
+        return isFloat32Dataset(ds) ? new Float32Array(n) : new Float64Array(n);
+    }
+
+    // Read a dataset slab by slab along its first dimension, so the HDF5
+    // heap only ever holds one slab. Slabs follow the chunking when there is
+    // one. onSlab(start, count, values) receives `count` planes in C order.
+    async function forEachSlab(ds, path, opts, onSlab) {
+        opts = opts || {};
+        const shape = Array.from(ds.shape || []).map(Number);
+        if (!shape.length) throw new Error(`${path} is a scalar, expected an array`);
+        assertDecodable(ds, path);
+        const n0 = shape[0];
+        const planeLen = shape.slice(1).reduce((a, b) => a * b, 1);
+        const itemBytes = Math.max(1, Number((ds.metadata || {}).size) || 8);
+        const chunks = (ds.metadata || {}).chunks;
+        const chunk0 = chunks && chunks.length ? Number(chunks[0]) : 0;
+        const fit = Math.max(1, Math.floor((opts.slabBytes || SLAB_BYTES) / (planeLen * itemBytes)));
+        const planes = Math.min(n0, chunk0 > 0 && chunk0 <= fit ? chunk0 * Math.floor(fit / chunk0) : fit);
+        for (let start = 0; start < n0; start += planes) {
+            const count = Math.min(planes, n0 - start);
+            let values = ds.slice([[start, start + count]]);
+            if (values instanceof BigInt64Array || values instanceof BigUint64Array) {
+                values = Float64Array.from(values, Number);
+            }
+            onSlab(start, count, values);
+            if (opts.progress) opts.progress((start + count) / n0);
+            if (opts.tick) await opts.tick();
+        }
+    }
+
+    // Dataset in C order [nh,nk,nl] (l fastest) -> h-fastest values.
+    async function readLFastest(ds, path, dims, opts) {
+        const [nh, nk, nl] = dims;
+        const out = allocFor(ds, nh * nk * nl);
+        await forEachSlab(ds, path, opts, (h0, count, slab) => {
+            for (let dh = 0; dh < count; dh++) {
+                const ih = h0 + dh;
+                for (let ik = 0; ik < nk; ik++) {
+                    const src = (dh * nk + ik) * nl;
+                    for (let il = 0; il < nl; il++) out[(il * nk + ik) * nh + ih] = slab[src + il];
+                }
+            }
+        });
+        return out;
+    }
+
+    // Dataset in C order [nl,nk,nh] (h fastest): slabs copy straight in.
+    async function readHFastest(ds, path, dims, opts) {
+        const [nh, nk, nl] = dims;
+        const out = allocFor(ds, nh * nk * nl);
+        await forEachSlab(ds, path, opts, (l0, count, slab) => out.set(slab, l0 * nk * nh));
+        return out;
+    }
+
     function normalizeRadiation(value) {
         const text = String(value || '').trim().toLowerCase();
         if (!text) return 'unknown';
@@ -143,8 +224,8 @@
     }
 
     // C-order [nh,nk,nl] (l fastest) -> internal h-fastest layout.
-    function lFastestToHFastest(flat, nh, nk, nl) {
-        const values = new Float64Array(nh * nk * nl);
+    function lFastestToHFastest(flat, nh, nk, nl, float32) {
+        const values = float32 ? new Float32Array(nh * nk * nl) : new Float64Array(nh * nk * nl);
         for (let il = 0; il < nl; il++)
             for (let ik = 0; ik < nk; ik++)
                 for (let ih = 0; ih < nh; ih++)
@@ -358,11 +439,12 @@
         return 'unknown';
     }
 
-    function readUnifiedData(f) {
+    // opts: { tick, progress, slabBytes } (see forEachSlab).
+    async function readUnifiedData(f, opts) {
         const identity = validateUnifiedDictionary(f, 'data');
         let model = null;
-        if (f.get('scattering/data/data')) model = readScatteringGroup(f);
-        else if (f.get('entry/data/data_values')) model = readEntryGroup(f);
+        if (f.get('scattering/data/data')) model = await readScatteringGroup(f, opts);
+        else if (f.get('entry/data/data_values')) model = await readEntryGroup(f, opts);
         if (model) {
             model.dictionary = identity.dictionary || UNIFIED_DATA_DICTIONARY;
             model.legacyContract = identity.legacy;
@@ -446,7 +528,7 @@
         return { corner, vectors };
     }
 
-    function readScatteringGroup(f) {
+    async function readScatteringGroup(f, opts) {
         const g = 'scattering/data/';
         const group = f.get('scattering/data');
         const ds = f.get(g + 'data');
@@ -456,9 +538,9 @@
         const names = axisNamesAttr(group);
         const layout = scatteringLayout(f, g, group, names, shape, notes);
         const dims = layout === 'abs-fastest' ? [shape[2], shape[1], shape[0]] : shape.slice();
-        const [nh, nk, nl] = dims;
-        const raw = readDataset(ds, g + 'data');
-        const values = layout === 'abs-fastest' ? Float64Array.from(raw) : lFastestToHFastest(raw, nh, nk, nl);
+        const values = layout === 'abs-fastest'
+            ? await readHFastest(ds, g + 'data', dims, opts)
+            : await readLFastest(ds, g + 'data', dims, opts);
 
         let corner = numbersAt(f, g + 'lower_limits');
         const sv = numbersAt(f, g + 'step_vectors');
@@ -502,7 +584,7 @@
         return a.length === b.length && a.every((x, i) => x === b[i]);
     }
 
-    function readEntryGroup(f) {
+    async function readEntryGroup(f, opts) {
         const g = 'entry/data/';
         const dims = numbersAt(f, g + 'data_dimension', 'unified data');   // [nh,nk,nl]
         if (dims.length !== 3 || dims.some(d => !(Number.isInteger(d) && d >= 1))) {
@@ -523,8 +605,16 @@
             reversed = true;
             notes.push('data_values is stored in reversed [nl,nk,nh] order; read accordingly');
         }
-        const flat = readDataset(ds, g + 'data_values');
-        const values = reversed ? Float64Array.from(flat) : lFastestToHFastest(flat, nh, nk, nl);
+        let values;
+        if (reversed) {
+            values = await readHFastest(ds, g + 'data_values', dims, opts);
+        } else if (shape.length === 3) {
+            values = await readLFastest(ds, g + 'data_values', dims, opts);
+        } else {
+            // Size-1 axes dropped from the stored shape: the C order is unchanged.
+            const flat = readDataset(ds, g + 'data_values');
+            values = lFastestToHFastest(flat, nh, nk, nl, isFloat32Dataset(ds));
+        }
         const corner = numbersAt(f, g + 'data_corner', 'unified data');
         const iv = numbersAt(f, g + 'data_increment_vector', 'unified data');
         const vectors = [0, 1, 2].map(axis => [0, 1, 2].map(comp =>
@@ -559,8 +649,8 @@
     }
 
     // opts.space: 'auto' (default) trusts is_direct; 'reciprocal' overrides an
-    // is_direct value that is neither 0 nor 1.
-    function readYell(f, opts) {
+    // is_direct value that is neither 0 nor 1. Also takes the slab options.
+    async function readYell(f, opts) {
         opts = opts || {};
         const notes = [];
         const flag = yellDirectFlag(f);
@@ -583,7 +673,8 @@
         if (shape.length < 1 || shape.length > 3) throw new Error('Yell data must be rank 1, 2 or 3');
         const [nh, nk, nl] = pad3(shape, 1);
         if (shape.length < 3) notes.push(`${shape.length}-D data read as a ${nh} x ${nk} x ${nl} grid`);
-        const values = lFastestToHFastest(readDataset(ds, 'data'), nh, nk, nl);
+        // C [nh], [nh,nk] and [nh,nk,nl] share one flat order, so slabs work for all.
+        const values = await readLFastest(ds, 'data', [nh, nk, nl], opts);
         const corner = pad3(numbersAt(f, 'lower_limits', 'Yell file'), 0);
         let vectors;
         if (f.get('step_sizes_abs') && f.get('step_sizes_ord') && f.get('step_sizes_top')) {
@@ -609,90 +700,206 @@
 
     // ------------------------------------------------------------- old text .dat
 
-    function firstLineTokens(text) {
+    // Text readers are line-driven so the same parser takes a whole string or a
+    // byte stream. onLine may return false to stop early.
+    function forEachTextLine(text, onLine) {
         let start = 0;
         while (start < text.length) {
             let end = text.indexOf('\n', start);
             if (end < 0) end = text.length;
-            const line = text.slice(start, end).trim();
-            if (line) return line.split(/\s+/);
+            if (onLine(text.slice(start, end)) === false) return;
             start = end + 1;
         }
-        return [];
+    }
+
+    // opts: { size (bytes, for progress), progress, tick } as for HDF5 reads.
+    async function forEachStreamLine(stream, opts, onLine) {
+        opts = opts || {};
+        const reader = stream.getReader();
+        const decoder = new TextDecoder();
+        let carry = '', bytes = 0;
+        try {
+            for (;;) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                bytes += value.byteLength;
+                const text = carry + decoder.decode(value, { stream: true });
+                let start = 0, end;
+                while ((end = text.indexOf('\n', start)) >= 0) {
+                    if (onLine(text.slice(start, end)) === false) {
+                        await reader.cancel();
+                        return;
+                    }
+                    start = end + 1;
+                }
+                carry = text.slice(start);
+                if (opts.progress && opts.size) opts.progress(Math.min(1, bytes / opts.size));
+                if (opts.tick) await opts.tick();
+            }
+            const rest = carry + decoder.decode();
+            if (rest) onLine(rest);
+        } catch (e) {
+            try {
+                await reader.cancel();
+            } catch (_) {
+                // already closed
+            }
+            throw e;
+        } finally {
+            reader.releaseLock();
+        }
+    }
+
+    // Solve M x = R for x (M is m x m, R is m x c) by Gauss-Jordan elimination.
+    function solveLinear(M, R) {
+        const m = M.length;
+        const A = M.map((row, i) => row.concat(R[i]));
+        for (let col = 0; col < m; col++) {
+            let piv = col;
+            for (let r = col + 1; r < m; r++) if (Math.abs(A[r][col]) > Math.abs(A[piv][col])) piv = r;
+            if (!(Math.abs(A[piv][col]) > 0)) return null;
+            [A[col], A[piv]] = [A[piv], A[col]];
+            for (let r = 0; r < m; r++) {
+                if (r === col) continue;
+                const factor = A[r][col] / A[col][col];
+                for (let c = col; c < A[r].length; c++) A[r][c] -= factor * A[col][c];
+            }
+        }
+        return A.map((row, i) => row.slice(m).map(x => x / row[i]));
     }
 
     // Header "npoints nsec" (experimental input) or "npoints nsec scale offset"
-    // (RMCProfile *_calc.dat output). Values are kept as stored.
-    function parseOldDat(text, parentCell) {
-        const A = cellToLattice(parentCell.lengths, parentCell.angles);
-        const header = firstLineTokens(text);
-        if (header.length < 2 || header.length > 4 || header.some(t => !Number.isFinite(num(t)))) {
-            throw new Error('old-format .dat: unrecognized header line (expected "npoints nsec" ' +
-                'or "npoints nsec scale offset")');
-        }
-        const tokens = text.trim().split(/\s+/);
-        let p = header.length;
-        const npoints = parseInt(header[0], 10);
-        const nsec = parseInt(header[1], 10);
-        if (!(npoints > 0) || !(nsec >= 1)) throw new Error('bad npoints/nsec header');
+    // (RMCProfile *_calc.dat output), then rows "i j k (qx qy qz)*nsec I".
+    // Rows are read as a token stream, so a row may wrap over lines. The
+    // result keeps the geometry in cartesian Q: qCorner is Q at pixel
+    // (1,1,1) and qVectors[axis] the Q step per pixel; toHklModel applies
+    // the cell. Pixels missing from the file become NaN.
+    function datParser() {
+        let header = null, npoints = 0, perRow = 0, nsec = 0, nrows = 0;
+        let pix = null, vals = null, row = [];
+        const dims = [0, 0, 0];
+        const special = [null, null, null, null];     // Q at (1,1,1) (2,1,1) (1,2,1) (1,1,2)
+        const xx = new Float64Array(16), xq = new Float64Array(12);   // least-squares sums
         const notes = [];
         let datHeader = null;
-        if (header.length > 2) {
-            datHeader = { scale: num(header[2]), offset: header.length > 3 ? num(header[3]) : 0 };
-            notes.push(`RMCProfile calculation header: scale = ${datHeader.scale}, offset = ` +
-                `${datHeader.offset}; intensities are kept as stored`);
-        }
-        const perRow = 3 + 3 * nsec + 1;
-        if (tokens.length < p + npoints * perRow) throw new Error('old-format data file is truncated');
 
-        const pix = new Int32Array(3 * npoints);
-        const hklAll = new Float64Array(3 * npoints);
-        const vals = new Float64Array(npoints);
-        let dims = [0, 0, 0];
-        for (let n = 0; n < npoints; n++) {
-            const i = parseInt(tokens[p], 10), j = parseInt(tokens[p + 1], 10), k = parseInt(tokens[p + 2], 10);
-            const q = [num(tokens[p + 3]), num(tokens[p + 4]), num(tokens[p + 5])];
-            vals[n] = num(tokens[p + perRow - 1]);
-            p += perRow;
+        function takeRow(tok) {
+            if (nrows >= npoints) return;
+            const i = parseInt(tok[0], 10), j = parseInt(tok[1], 10), k = parseInt(tok[2], 10);
             if (!(i >= 1 && j >= 1 && k >= 1)) throw new Error('pixel coordinates must be positive');
-            pix[3 * n] = i; pix[3 * n + 1] = j; pix[3 * n + 2] = k;
-            const hkl = qToHkl(A, q);
-            hklAll[3 * n] = hkl[0]; hklAll[3 * n + 1] = hkl[1]; hklAll[3 * n + 2] = hkl[2];
+            const qx = num(tok[3]), qy = num(tok[4]), qz = num(tok[5]);
+            pix[3 * nrows] = i; pix[3 * nrows + 1] = j; pix[3 * nrows + 2] = k;
+            vals[nrows++] = num(tok[perRow - 1]);
             if (i > dims[0]) dims[0] = i;
             if (j > dims[1]) dims[1] = j;
             if (k > dims[2]) dims[2] = k;
-        }
-        if (dims[0] * dims[1] * dims[2] !== npoints) {
-            throw new Error('old-format data does not cover a full pixel grid');
-        }
-        const [nh, nk, nl] = dims;
-        const values = new Float64Array(npoints);
-        let corner = null;
-        const stepPix = [null, null, null];
-        for (let n = 0; n < npoints; n++) {
-            const i = pix[3 * n], j = pix[3 * n + 1], k = pix[3 * n + 2];
-            values[((k - 1) * nk + (j - 1)) * nh + (i - 1)] = vals[n];
-            const hkl = [hklAll[3 * n], hklAll[3 * n + 1], hklAll[3 * n + 2]];
-            if (i === 1 && j === 1 && k === 1) corner = hkl;
-            if (i === 2 && j === 1 && k === 1) stepPix[0] = hkl;
-            if (i === 1 && j === 2 && k === 1) stepPix[1] = hkl;
-            if (i === 1 && j === 1 && k === 2) stepPix[2] = hkl;
-        }
-        if (!corner) throw new Error('pixel (1,1,1) is missing');
-        const vectors = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
-        for (let axis = 0; axis < 3; axis++) {
-            if (dims[axis] > 1 && stepPix[axis]) {
-                vectors[axis] = stepPix[axis].map((x, comp) => x - corner[comp]);
+            if (i + j + k <= 4) {
+                const slot = i === 1 && j === 1 && k === 1 ? 0 : i === 2 ? 1 : j === 2 ? 2 : k === 2 ? 3 : -1;
+                if (slot >= 0) special[slot] = [qx, qy, qz];
+            }
+            const x = [i - 1, j - 1, k - 1, 1], q = [qx, qy, qz];
+            for (let a = 0; a < 4; a++) {
+                for (let b = 0; b < 4; b++) xx[a * 4 + b] += x[a] * x[b];
+                for (let c = 0; c < 3; c++) xq[a * 3 + c] += x[a] * q[c];
             }
         }
-        return {
-            dims, corner, vectors, values,
-            cellLengths: parentCell.lengths.slice(), cellAngles: parentCell.angles.slice(),
-            radiation: 'unknown',
-            axes: pickAxes(vectors, dims),
-            nsecOriginal: nsec,
-            datHeader, notes,
-        };
+
+        function line(text) {
+            const t = text.trim();
+            if (!t) return;
+            const tokens = t.split(/\s+/);
+            if (!header) {
+                if (tokens.length < 2 || tokens.length > 4 || tokens.some(s => !Number.isFinite(num(s)))) {
+                    throw new Error('old-format .dat: unrecognized header line (expected "npoints nsec" ' +
+                        'or "npoints nsec scale offset")');
+                }
+                header = tokens;
+                npoints = parseInt(tokens[0], 10);
+                nsec = parseInt(tokens[1], 10);
+                if (!(npoints > 0) || !(nsec >= 1)) throw new Error('bad npoints/nsec header');
+                perRow = 3 + 3 * nsec + 1;
+                pix = new Int32Array(3 * npoints);
+                vals = new Float64Array(npoints);
+                if (tokens.length > 2) {
+                    datHeader = { scale: num(tokens[2]), offset: tokens.length > 3 ? num(tokens[3]) : 0 };
+                    notes.push(`RMCProfile calculation header: scale = ${datHeader.scale}, offset = ` +
+                        `${datHeader.offset}; intensities are kept as stored`);
+                }
+                return;
+            }
+            if (!row.length && tokens.length === perRow) {
+                takeRow(tokens);
+                return;
+            }
+            for (const s of tokens) {
+                row.push(s);
+                if (row.length === perRow) {
+                    takeRow(row);
+                    row = [];
+                }
+            }
+        }
+
+        function geometry() {
+            const need = [0, 1, 2].filter(a => dims[a] > 1);
+            if (special[0] && need.every(a => special[a + 1])) {
+                return {
+                    qCorner: special[0],
+                    qVectors: [0, 1, 2].map(a => dims[a] > 1
+                        ? special[a + 1].map((x, c) => x - special[0][c]) : [0, 0, 0]),
+                };
+            }
+            // Q is affine in the pixel indices: fit it to every row.
+            const idx = need.concat([3]);
+            const M = idx.map(a => idx.map(b => xx[a * 4 + b]));
+            const R = idx.map(a => [0, 1, 2].map(c => xq[a * 3 + c]));
+            const sol = solveLinear(M, R);
+            if (!sol) throw new Error('old-format .dat: the rows do not define a 3-D grid');
+            const qVectors = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+            need.forEach((a, n) => { qVectors[a] = sol[n]; });
+            notes.push('pixel (1,1,1) or a neighbour is missing; grid geometry fitted to all rows');
+            return { qCorner: sol[sol.length - 1], qVectors };
+        }
+
+        function finish() {
+            if (!header) throw new Error('old-format .dat: empty file');
+            if (nrows < npoints) {
+                throw new Error(`old-format data file is truncated (${nrows} of ${npoints} rows)`);
+            }
+            const [nh, nk, nl] = dims;
+            const total = nh * nk * nl;
+            if (total < npoints) throw new Error('old-format .dat: some pixels appear more than once');
+            const values = new Float64Array(total);
+            if (total > npoints) {
+                values.fill(NaN);
+                notes.push(`${total - npoints} of the ${total} grid points are missing from the file; set to NaN`);
+            }
+            for (let n = 0; n < npoints; n++) {
+                values[((pix[3 * n + 2] - 1) * nk + (pix[3 * n + 1] - 1)) * nh + (pix[3 * n] - 1)] = vals[n];
+            }
+            const g = geometry();
+            return {
+                frame: 'q', source: 'dat', dims: dims.slice(), values,
+                qCorner: g.qCorner, qVectors: g.qVectors,
+                nsecOriginal: nsec, datHeader, notes,
+            };
+        }
+
+        return { line, finish };
+    }
+
+    // Parse an old-format .dat text; returns an hkl model with the parent cell.
+    function parseOldDat(text, parentCell) {
+        const parser = datParser();
+        forEachTextLine(text, parser.line);
+        return toHklModel(parser.finish(), parentCell);
+    }
+
+    // Stream an old-format .dat; returns the grid in Q (see datParser).
+    async function readOldDatStream(stream, opts) {
+        const parser = datParser();
+        await forEachStreamLine(stream, opts, parser.line);
+        return parser.finish();
     }
 
     // Mirrors set_axes_from_increment_vectors.
@@ -822,19 +1029,33 @@
         return { program, grids, customFrame };
     }
 
-    // opts.frame: 'q' | 'hkl' (default: from the title line).
-    // opts.grid:  { dims, corner, vectors } from parseGridConfig, for Q-space
-    //             files whose grid axes are not along cartesian x, y, z.
-    // opts.customFrame: the config redefines the cartesian frame (HKL_TO_X...).
-    function parseVtk(text, parentCell, opts) {
-        opts = opts || {};
-        const frame = opts.frame || vtkFrame(text);
-        const lines = text.split(/\r?\n/);
-        if (!/^#\s*vtk/i.test((lines[0] || '').trim())) throw new Error('not a VTK file');
-        let dims = null, origin = null, spacing = null, dataStart = -1;
-        // line 1 is the version comment, line 2 is a free-text title
-        for (let i = 2; i < lines.length; i++) {
-            const tok = lines[i].trim().split(/\s+/);
+    // Legacy ASCII STRUCTURED_POINTS: line 1 "# vtk ...", line 2 a free-text
+    // title, then keywords up to LOOKUP_TABLE and the values, x fastest (the
+    // internal h-fastest order). Returns the grid in the file's own frame.
+    function vtkParser() {
+        let lineNo = 0, title = '', dims = null, origin = null, spacing = null;
+        let values = null, n = 0, npoints = 0;
+
+        function line(text) {
+            if (values) {
+                const t = text.trim();
+                if (!t) return;
+                for (const s of t.split(/\s+/)) {
+                    if (n >= npoints) return false;
+                    values[n++] = num(s);
+                }
+                return n < npoints;
+            }
+            lineNo++;
+            if (lineNo === 1) {
+                if (!/^#\s*vtk/i.test(text.trim())) throw new Error('not a VTK file');
+                return;
+            }
+            if (lineNo === 2) {
+                title = text.trim();
+                return;
+            }
+            const tok = text.trim().split(/\s+/);
             const key = (tok[0] || '').toUpperCase();
             if (key === 'BINARY') throw new Error('binary VTK is not supported (Scatty writes ASCII)');
             if (key === 'DATASET' && (tok[1] || '').toUpperCase() !== 'STRUCTURED_POINTS') {
@@ -843,50 +1064,80 @@
             if (key === 'DIMENSIONS') dims = tok.slice(1, 4).map(Number);
             if (key === 'ORIGIN') origin = tok.slice(1, 4).map(Number);
             if (key === 'SPACING' || key === 'ASPECT_RATIO') spacing = tok.slice(1, 4).map(Number);
-            if (key === 'LOOKUP_TABLE') { dataStart = i + 1; break; }
-        }
-        if (!dims || !origin || !spacing || dataStart < 0) {
-            throw new Error('VTK header is missing DIMENSIONS/ORIGIN/SPACING/LOOKUP_TABLE');
-        }
-        if (dims.some(d => !(d >= 1))) throw new Error('bad VTK dimensions');
-        const [nh, nk, nl] = dims;
-        const npoints = nh * nk * nl;
-        const values = new Float64Array(npoints);
-        let n = 0;
-        for (let r = dataStart; r < lines.length && n < npoints; r++) {
-            const t = lines[r].trim();
-            if (t === '') continue;
-            for (const s of t.split(/\s+/)) {
-                if (n >= npoints) break;
-                values[n++] = num(s);
+            if (key === 'LOOKUP_TABLE') {
+                if (!dims || !origin || !spacing) {
+                    throw new Error('VTK header is missing DIMENSIONS/ORIGIN/SPACING/LOOKUP_TABLE');
+                }
+                if (dims.some(d => !(d >= 1))) throw new Error('bad VTK dimensions');
+                npoints = dims[0] * dims[1] * dims[2];
+                values = new Float64Array(npoints);
             }
         }
-        if (n < npoints) throw new Error(`VTK data is truncated (${n} of ${npoints} values)`);
-        // VTK x-fastest point order equals the internal h-fastest layout, so
-        // values copy through.
-        const notes = [];
+
+        function finish() {
+            if (!values) throw new Error('VTK header is missing DIMENSIONS/ORIGIN/SPACING/LOOKUP_TABLE');
+            if (n < npoints) throw new Error(`VTK data is truncated (${n} of ${npoints} values)`);
+            return {
+                frame: /\(HKL grid\)|supercell Bragg peaks/i.test(title) ? 'hkl' : 'q',
+                source: 'vtk', title, dims, values, origin, spacing, notes: [],
+            };
+        }
+
+        return { line, finish };
+    }
+
+    async function readVtkStream(stream, opts) {
+        const parser = vtkParser();
+        await forEachStreamLine(stream, opts, parser.line);
+        return parser.finish();
+    }
+
+    // opts.frame: 'q' | 'hkl' (default: from the title line).
+    // opts.grid:  { dims, corner, vectors } from parseGridConfig, for Q-space
+    //             files whose grid axes are not along cartesian x, y, z.
+    // opts.customFrame: the config redefines the cartesian frame (HKL_TO_X...).
+    function parseVtk(text, parentCell, opts) {
+        const parser = vtkParser();
+        forEachTextLine(text, parser.line);
+        const grid = parser.finish();
+        if (opts && opts.frame) grid.frame = opts.frame;
+        return toHklModel(grid, parentCell, opts);
+    }
+
+    // Turn a grid from datParser/vtkParser into an hkl model. Q-frame grids
+    // need the parent cell; opts as for parseVtk.
+    function toHklModel(grid, parentCell, opts) {
+        opts = opts || {};
+        const dims = grid.dims;
+        const notes = (grid.notes || []).slice();
+        const diagonal = step => [0, 1, 2].map(axis => {
+            const v = [0, 0, 0];
+            if (dims[axis] > 1) v[axis] = step[axis];
+            return v;
+        });
         let corner, vectors;
-        if (frame === 'hkl') {
-            corner = origin.slice();
-            vectors = [0, 1, 2].map(axis => {
-                const v = [0, 0, 0];
-                if (dims[axis] > 1) v[axis] = spacing[axis];
-                return v;
-            });
-            notes.push(`VTK "${vtkTitle(text)}" stores ORIGIN/SPACING in reciprocal-lattice units; ` +
+        if (grid.frame === 'hkl') {
+            corner = grid.origin.slice();
+            vectors = diagonal(grid.spacing);
+            notes.push(`VTK "${grid.title}" stores ORIGIN/SPACING in reciprocal-lattice units; ` +
                 'read without a Q conversion');
         } else {
-            if (!parentCell) throw new Error('Q-space VTK input needs the parent cell');
-            // ORIGIN/SPACING are cartesian Q (2*pi/Angstrom).
+            if (!parentCell) {
+                throw new Error(grid.source === 'vtk' ? 'Q-space VTK input needs the parent cell'
+                    : 'old-format .dat input needs the parent cell');
+            }
             const A = cellToLattice(parentCell.lengths, parentCell.angles);
-            if (opts.grid) {
-                const grid = opts.grid;
-                if (grid.dims.some((d, i) => d !== dims[i])) {
-                    throw new Error(`grid config describes ${grid.dims.join(' x ')} points but the VTK ` +
+            if (grid.source === 'dat') {
+                corner = qToHkl(A, grid.qCorner);
+                vectors = grid.qVectors.map(v => qToHkl(A, v));
+            } else if (opts.grid) {
+                const cfg = opts.grid;
+                if (cfg.dims.some((d, i) => d !== dims[i])) {
+                    throw new Error(`grid config describes ${cfg.dims.join(' x ')} points but the VTK ` +
                         `has ${dims.join(' x ')}`);
                 }
-                corner = grid.corner.slice();
-                vectors = grid.vectors.map(v => v.slice());
+                corner = cfg.corner.slice();
+                vectors = cfg.vectors.map(v => v.slice());
                 if (opts.customFrame) {
                     notes.push('the config redefines the cartesian frame (HKL_TO_X/Y/Z); ' +
                         'VTK ORIGIN/SPACING were not cross-checked');
@@ -896,37 +1147,36 @@
                     const off = (a, b) => Math.abs(a - b) > 5e-6 + 2e-5 * Math.abs(b);
                     const q0 = hklToQ(B, corner);
                     const qStep = vectors.map(v => Math.hypot(...hklToQ(B, v)));
-                    if (q0.some((x, i) => off(x, origin[i])) ||
-                        qStep.some((x, i) => dims[i] > 1 && off(x, spacing[i]))) {
+                    if (q0.some((x, i) => off(x, grid.origin[i])) ||
+                        qStep.some((x, i) => dims[i] > 1 && off(x, grid.spacing[i]))) {
                         notes.push('warning: VTK ORIGIN/SPACING differ from the grid config at this cell ' +
                             `(expected ORIGIN ${q0.map(x => x.toFixed(6)).join(' ')}, SPACING ` +
                             `${qStep.map(x => x.toFixed(6)).join(' ')}); check the config and the cell`);
                     }
                 }
             } else {
-                corner = qToHkl(A, origin);
-                vectors = [0, 1, 2].map(axis => {
-                    if (dims[axis] <= 1 || spacing[axis] === 0) return [0, 0, 0];
-                    const q = [0, 0, 0];
-                    q[axis] = spacing[axis];
-                    return qToHkl(A, q);
-                });
+                corner = qToHkl(A, grid.origin);
+                vectors = diagonal(grid.spacing).map(q => q.every(x => x === 0) ? q : qToHkl(A, q));
                 notes.push('VTK stores no axis directions: grid axes assumed along cartesian x, y, z. ' +
                     'For Scatty/Spinteract grids with rotated axes (e.g. X_AXIS 6 6 0), load the config file');
             }
         }
         const cell = parentCell || { lengths: [1, 1, 1], angles: [90, 90, 90] };
-        return {
-            dims, corner, vectors, values,
+        const model = {
+            dims: dims.slice(), corner, vectors, values: grid.values,
             cellLengths: cell.lengths.slice(), cellAngles: cell.angles.slice(),
             radiation: 'unknown', axes: pickAxes(vectors, dims), notes,
         };
+        if (grid.source === 'dat') {
+            model.nsecOriginal = grid.nsecOriginal;
+            model.datHeader = grid.datHeader;
+        }
+        return model;
     }
 
-    function writeVtk(model, cell) {
-        const A = cellToLattice(cell.lengths, cell.angles);
-        const B = reciprocalBasis(A);
-        const [nh, nk, nl] = model.dims;
+    // Axis-aligned, ascending Q grid for STRUCTURED_POINTS.
+    function vtkGeometry(model, cell) {
+        const B = reciprocalBasis(cellToLattice(cell.lengths, cell.angles));
         const origin = hklToQ(B, model.corner);
         const spacing = [0, 0, 0];
         for (let axis = 0; axis < 3; axis++) {
@@ -945,7 +1195,14 @@
             }
             spacing[axis] = q[axis];
         }
-        const out = [
+        return { origin, spacing };
+    }
+
+    // Legacy VTK readers do not parse NaN; empty points are 0 as in Scatty.
+    function* writeVtkChunks(model, cell, valuesPerChunk) {
+        const { origin, spacing } = vtkGeometry(model, cell);
+        const [nh, nk, nl] = model.dims;
+        yield [
             '# vtk DataFile Version 2.0',
             'TITLE diffuse scattering',
             'ASCII',
@@ -956,13 +1213,22 @@
             `POINT_DATA ${nh * nk * nl}`,
             'SCALARS diffuse_scattering float',
             'LOOKUP_TABLE default',
-        ];
-        // Legacy VTK readers do not parse NaN; empty points are 0 as in Scatty.
+        ].join('\n') + '\n';
+        const chunkSize = Math.max(1, Number(valuesPerChunk) || 65536);
+        let out = [];
         for (let n = 0; n < model.values.length; n++) {
             const v = model.values[n];
             out.push((Number.isFinite(v) ? v : 0).toExponential(16));
+            if (out.length >= chunkSize) {
+                yield out.join('\n') + '\n';
+                out = [];
+            }
         }
-        return out.join('\n') + '\n';
+        if (out.length) yield out.join('\n') + '\n';
+    }
+
+    function writeVtk(model, cell) {
+        return Array.from(writeVtkChunks(model, cell)).join('');
     }
 
     // ----------------------------------------------------------------- writers
@@ -977,64 +1243,143 @@
         return [0, 1, 2].map(a => basis[(model.axes[a] || a + 1) - 1]);
     }
 
-    function writeUnifiedData(f, model, cell, meta) {
+    const DIRECT_WRITE_BYTES = 64 * 1048576;
+
+    // HDF5 dtype for the data array. precision 'float64' | 'float32'; any
+    // other value keeps the model's own precision.
+    function outputDtype(model, precision) {
+        if (precision === 'float32') return '<f';
+        if (precision === 'float64') return '<d';
+        return model.values instanceof Float32Array ? '<f' : '<d';
+    }
+
+    // Write model.values as a 3-D dataset: order 'hFastest' stores C dims
+    // [nl,nk,nh] (the model's own layout), 'lFastest' C dims [nh,nk,nl].
+    // Data up to opts.directWriteBytes go out in one call; larger arrays are
+    // written plane by plane into a chunked dataset, so no transposed copy of
+    // the whole volume is built. opts: { dtype, compression (gzip level),
+    // directWriteBytes, tick }.
+    async function writeVolume(group, name, model, order, opts, progress) {
+        const [nh, nk, nl] = model.dims;
+        const Arr = opts.dtype === '<f' ? Float32Array : Float64Array;
+        const shape = order === 'hFastest' ? [nl, nk, nh] : [nh, nk, nl];
+        const planeLen = shape[1] * shape[2];
+        const values = model.values;
+        const fillPlane = order === 'hFastest'
+            ? (i, out) => out.set(values.subarray(i * planeLen, (i + 1) * planeLen))
+            : (ih, out) => {
+                for (let ik = 0; ik < nk; ik++)
+                    for (let il = 0; il < nl; il++) out[ik * nl + il] = values[(il * nk + ik) * nh + ih];
+            };
+        const planeBytes = planeLen * Arr.BYTES_PER_ELEMENT;
+        const direct = opts.directWriteBytes === undefined ? DIRECT_WRITE_BYTES : opts.directWriteBytes;
+        const gzip = opts.compression ? { compression: 'gzip', compression_opts: opts.compression } : {};
+        if (shape[0] * planeBytes <= direct) {
+            let data;
+            if (order === 'hFastest' && values instanceof Arr) {
+                data = values;
+            } else {
+                data = new Arr(shape[0] * planeLen);
+                for (let i = 0; i < shape[0]; i++) fillPlane(i, data.subarray(i * planeLen, (i + 1) * planeLen));
+            }
+            const spec = { name, data, shape, dtype: opts.dtype };
+            if (opts.compression) {
+                // About 1 MiB per chunk.
+                const planes = Math.min(shape[0], Math.max(1, Math.floor(1048576 / planeBytes)));
+                Object.assign(spec, { chunks: [planes, shape[1], shape[2]] }, gzip);
+            }
+            group.create_dataset(spec);
+            if (progress) progress(1);
+            return;
+        }
+        const ds = group.create_dataset(Object.assign({
+            name, data: new Arr(0), shape: [0, shape[1], shape[2]], maxshape: shape,
+            chunks: [1, shape[1], shape[2]], dtype: opts.dtype,
+        }, gzip));
+        const plane = new Arr(planeLen);
+        for (let i = 0; i < shape[0]; i++) {
+            fillPlane(i, plane);
+            ds.resize([i + 1, shape[1], shape[2]]);
+            ds.write_slice([[i, i + 1]], plane);
+            if (progress) progress((i + 1) / shape[0]);
+            if (opts.tick) await opts.tick();
+        }
+    }
+
+    function volumeOptions(model, opts) {
+        return {
+            dtype: outputDtype(model, opts.precision),
+            compression: Number(opts.compression) || 0,
+            directWriteBytes: opts.directWriteBytes,
+            tick: opts.tick,
+        };
+    }
+
+    // opts: { precision, layout ('both' | 'entry'), compression (gzip level,
+    // 0 = none), tick, progress, directWriteBytes }.
+    async function writeUnifiedData(f, model, cell, meta, opts) {
         meta = meta || {};
+        opts = opts || {};
         if (model.axesType && model.axesType !== 'hkl') {
             throw new Error('unified writer requires hkl axes; convert Q axes with modelAxesToHkl first');
         }
-        const [nh, nk, nl] = model.dims;
         const names = axisNames(model);
         const today = new Date().toISOString().slice(0, 10);
         const method = meta.creationMethod || 'RMCProfile web format converter';
         const author = meta.authorName || 'RMCProfile';
         const radiation = model.radiation && model.radiation !== '' ? model.radiation : 'unknown';
+        const both = opts.layout !== 'entry';
+        const vol = volumeOptions(model, opts);
+        const part = k => fraction => { if (opts.progress) opts.progress((k + fraction) / (both ? 2 : 1)); };
 
         // ---- /scattering/data (NXdata compatibility layout) ----
-        f.create_attribute('audit_conform_dict_name', UNIFIED_DATA_DICTIONARY);
-        f.create_attribute('audit_conform_dict_version', '0.0.0');
-        f.create_attribute('audit_creation_date', today);
-        f.create_attribute('audit_creation_method', method);
-        f.create_attribute('audit_author_name', author);
-        f.create_attribute('default', 'scattering');
+        if (both) {
+            f.create_attribute('audit_conform_dict_name', UNIFIED_DATA_DICTIONARY);
+            f.create_attribute('audit_conform_dict_version', '0.0.0');
+            f.create_attribute('audit_creation_date', today);
+            f.create_attribute('audit_creation_method', method);
+            f.create_attribute('audit_author_name', author);
+            f.create_attribute('default', 'scattering');
 
-        const scat = f.create_group('scattering');
-        scat.create_attribute('NX_class', 'NXentry');
-        scat.create_attribute('default', 'data');
-        const sd = scat.create_group('data');
-        sd.create_attribute('NX_class', 'NXdata');
-        sd.create_attribute('signal', 'data');
-        sd.create_attribute('axes', names, [3], 'S1');
-        sd.create_attribute('indices_abs', 0, [], '<i');
-        sd.create_attribute('indices_ord', 1, [], '<i');
-        sd.create_attribute('indices_top', 2, [], '<i');
-        sd.create_attribute('radiation', radiation);
-        sd.create_attribute('space', 'reciprocal');
-        sd.create_attribute('content', 'intensity');
-        sd.create_attribute('dimension', Math.max(1, model.dims.filter(d => d > 1).length), [], '<i');
-        sd.create_attribute('data_type_experiment', meta.experiment || 'unknown');
-        sd.create_attribute('data_type_style', 'single_diffraction');
-        sd.create_attribute('data_type_axes', 'hkl');
-        sd.create_attribute('data_type_with_bragg', 'unknown');
-        sd.create_attribute('data_type_symmetrized', 'none');
-        sd.create_attribute('data_type_number', 'real');
-        sd.create_attribute('data_rad_symbol', 'unknown');
+            const scat = f.create_group('scattering');
+            scat.create_attribute('NX_class', 'NXentry');
+            scat.create_attribute('default', 'data');
+            const sd = scat.create_group('data');
+            sd.create_attribute('NX_class', 'NXdata');
+            sd.create_attribute('signal', 'data');
+            sd.create_attribute('axes', names, [3], 'S1');
+            sd.create_attribute('indices_abs', 0, [], '<i');
+            sd.create_attribute('indices_ord', 1, [], '<i');
+            sd.create_attribute('indices_top', 2, [], '<i');
+            sd.create_attribute('radiation', radiation);
+            sd.create_attribute('space', 'reciprocal');
+            sd.create_attribute('content', 'intensity');
+            sd.create_attribute('dimension', Math.max(1, model.dims.filter(d => d > 1).length), [], '<i');
+            sd.create_attribute('data_type_experiment', meta.experiment || 'unknown');
+            sd.create_attribute('data_type_style', 'single_diffraction');
+            sd.create_attribute('data_type_axes', 'hkl');
+            sd.create_attribute('data_type_with_bragg', 'unknown');
+            sd.create_attribute('data_type_symmetrized', 'none');
+            sd.create_attribute('data_type_number', 'real');
+            sd.create_attribute('data_rad_symbol', 'unknown');
 
-        sd.create_dataset({ name: 'lower_limits', data: model.corner, shape: [3], dtype: '<d' });
-        const sv = new Float64Array(9);
-        for (let axis = 0; axis < 3; axis++)
-            for (let comp = 0; comp < 3; comp++) sv[axis * 3 + comp] = model.vectors[axis][comp];
-        sd.create_dataset({ name: 'step_vectors', data: sv, shape: [3, 3], dtype: '<d' });
-        sd.create_dataset({ name: 'data_axes', data: Int32Array.from(model.axes), shape: [3], dtype: '<i' });
-        for (let axis = 0; axis < 3; axis++) {
-            const comp = model.axes[axis] - 1;
-            const vals = new Float64Array(model.dims[axis]);
-            for (let i = 0; i < vals.length; i++) vals[i] = model.corner[comp] + i * model.vectors[axis][comp];
-            sd.create_dataset({ name: names[axis], data: vals, shape: [vals.length], dtype: '<d' });
+            sd.create_dataset({ name: 'lower_limits', data: model.corner, shape: [3], dtype: '<d' });
+            const sv = new Float64Array(9);
+            for (let axis = 0; axis < 3; axis++)
+                for (let comp = 0; comp < 3; comp++) sv[axis * 3 + comp] = model.vectors[axis][comp];
+            sd.create_dataset({ name: 'step_vectors', data: sv, shape: [3, 3], dtype: '<d' });
+            sd.create_dataset({ name: 'data_axes', data: Int32Array.from(model.axes), shape: [3], dtype: '<i' });
+            for (let axis = 0; axis < 3; axis++) {
+                const comp = model.axes[axis] - 1;
+                const vals = new Float64Array(model.dims[axis]);
+                for (let i = 0; i < vals.length; i++) vals[i] = model.corner[comp] + i * model.vectors[axis][comp];
+                sd.create_dataset({ name: names[axis], data: vals, shape: [vals.length], dtype: '<d' });
+            }
+            await writeVolume(sd, 'data', model, 'hFastest', vol, part(0));
+            sd.create_dataset({ name: 'unit_cell_lengths', data: cell.lengths, shape: [3], dtype: '<d' });
+            sd.create_dataset({ name: 'unit_cell_angles', data: cell.angles, shape: [3], dtype: '<d' });
+            sd.create_dataset({ name: 'data_rad_length', data: [0, 0, 0], shape: [3], dtype: '<d' });
         }
-        sd.create_dataset({ name: 'data', data: model.values, shape: [nl, nk, nh], dtype: '<d' });
-        sd.create_dataset({ name: 'unit_cell_lengths', data: cell.lengths, shape: [3], dtype: '<d' });
-        sd.create_dataset({ name: 'unit_cell_angles', data: cell.angles, shape: [3], dtype: '<d' });
-        sd.create_dataset({ name: 'data_rad_length', data: [0, 0, 0], shape: [3], dtype: '<d' });
 
         // ---- /entry/data (current common RMCProfile/DISCUS contract) ----
         const entry = f.create_group('entry');
@@ -1067,12 +1412,7 @@
         for (let axis = 0; axis < 3; axis++)
             for (let comp = 0; comp < 3; comp++) iv[comp * 3 + axis] = model.vectors[axis][comp];
         eds('data_increment_vector', { data: iv, shape: [3, 3], dtype: '<d' });
-        const lv = new Float64Array(nh * nk * nl);   // l fastest
-        for (let il = 0; il < nl; il++)
-            for (let ik = 0; ik < nk; ik++)
-                for (let ih = 0; ih < nh; ih++)
-                    lv[(ih * nk + ik) * nl + il] = model.values[(il * nk + ik) * nh + ih];
-        eds('data_values', { data: lv, shape: [nh, nk, nl], dtype: '<d' });
+        await writeVolume(ed, 'data_values', model, 'lFastest', vol, part(both ? 1 : 0));
         eds('audit_conform_dict_name', fixedStr(UNIFIED_DATA_DICTIONARY));
         eds('audit_conform_dict_version', fixedStr('0.0.0'));
         eds('audit_creation_date', fixedStr(today));
@@ -1080,8 +1420,9 @@
         eds('audit_author_name', fixedStr(author));
     }
 
-    function writeYell(f, model, cell) {
-        const [nh, nk, nl] = model.dims;
+    // opts as for writeUnifiedData (layout does not apply).
+    async function writeYell(f, model, cell, opts) {
+        opts = opts || {};
         f.create_dataset({ name: 'format', data: ['Yell 1.0'], shape: [1], dtype: 'S8' });
         f.create_dataset({ name: 'is_direct', data: [0], shape: [1], dtype: '<b' });
         f.create_dataset({ name: 'lower_limits', data: model.corner, shape: [3], dtype: '<d' });
@@ -1097,20 +1438,102 @@
             name: 'unit_cell',
             data: cell.lengths.concat(cell.angles), shape: [6], dtype: '<d',
         });
-        const lv = new Float64Array(nh * nk * nl);   // l fastest, h slowest
-        for (let il = 0; il < nl; il++)
-            for (let ik = 0; ik < nk; ik++)
-                for (let ih = 0; ih < nh; ih++)
-                    lv[(ih * nk + ik) * nl + il] = model.values[(il * nk + ik) * nh + ih];
-        f.create_dataset({ name: 'data', data: lv, shape: [nh, nk, nl], dtype: '<d' });
+        await writeVolume(f, 'data', model, 'lFastest', volumeOptions(model, opts), opts.progress);
+    }
+
+    // ------------------------------------------------------------ conversions
+
+    // Parent cell for a conversion: the data file's own real cell first, then
+    // a structure file, then the manual entry.
+    function resolveCell(model, sources) {
+        sources = sources || {};
+        if (model && model.cellLengths && !isUnitMetric(model.cellLengths, model.cellAngles)) {
+            return {
+                cell: { lengths: model.cellLengths.slice(), angles: model.cellAngles.slice() },
+                source: 'data file',
+            };
+        }
+        if (sources.structure) return { cell: sources.structure, source: 'structure file' };
+        if (sources.manual) return { cell: sources.manual, source: 'manual entry' };
+        return null;
+    }
+
+    // Decide everything about a conversion before writing. input is { model }
+    // (HDF5 data) or { grid } (text data, see toHklModel); params: { format,
+    // structure, manual, radiation, grid, customFrame }. Returns { model,
+    // cell, cellSource, logs } or throws when the output cannot be written.
+    function planConversion(input, params) {
+        const logs = [];
+        const text = params.format === 'dat' || params.format === 'vtk';
+        let model, resolved;
+        if (input.grid && input.grid.frame === 'q') {
+            const parent = params.structure || params.manual;
+            if (!parent) {
+                throw new Error((input.grid.source === 'vtk' ? 'Q-space VTK' : 'old-format .dat') +
+                    ' input needs a structure file or a manual parent cell');
+            }
+            model = toHklModel(input.grid, parent, { grid: params.grid, customFrame: params.customFrame });
+            resolved = { cell: parent, source: params.structure ? 'structure file' : 'manual entry' };
+            if (model.nsecOriginal > 1) {
+                logs.push(`Note: input has ${model.nsecOriginal} symmetry sections; section 1 Q coordinates used.`);
+            }
+        } else {
+            model = input.grid ? toHklModel(input.grid, null) : input.model;
+            resolved = resolveCell(model, params);
+            if (!resolved) {
+                if (text) {
+                    throw new Error('data file stores the unit metric - supply a structure file or a manual parent cell');
+                }
+                resolved = {
+                    cell: { lengths: model.cellLengths.slice(), angles: model.cellAngles.slice() },
+                    source: 'data file (unit metric, passed through)',
+                };
+            }
+        }
+        model = Object.assign({}, model);
+        if (params.radiation) model.radiation = params.radiation;
+        if (model.axesType === 'Q') {
+            if (isUnitMetric(resolved.cell.lengths, resolved.cell.angles)) {
+                throw new Error('Q-axis unified data needs a real parent cell to convert Q to hkl');
+            }
+            model = modelAxesToHkl(model, resolved.cell);
+            logs.push('Converted unified Cartesian Q axes to hkl using the selected parent cell.');
+        }
+        if (text && isUnitMetric(resolved.cell.lengths, resolved.cell.angles)) {
+            throw new Error('cannot write ' + params.format + ' with a unit-metric cell - supply a ' +
+                'structure file or a manual parent cell');
+        }
+        return { model, cell: resolved.cell, cellSource: resolved.source, logs };
+    }
+
+    // Approximate output size in bytes; an upper bound when compressing.
+    function estimateOutputBytes(model, format, opts) {
+        opts = opts || {};
+        const n = model.dims[0] * model.dims[1] * model.dims[2];
+        const item = outputDtype(model, opts.precision) === '<f' ? 4 : 8;
+        if (format === 'unified') return n * item * (opts.layout === 'entry' ? 1 : 2) + 65536;
+        if (format === 'yell') return n * item + 16384;
+        if (format === 'dat') {
+            // "i j k qx qy qz I" with 17 significant digits per number.
+            const digits = model.dims.reduce((s, d) => s + String(d).length, 0);
+            return n * (digits + 4 * 23 + 4);
+        }
+        if (format === 'vtk') return n * 23 + 512;
+        return 0;
+    }
+
+    function isHdf5Signature(bytes) {
+        const u = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+        return u.length >= 4 && u[0] === 0x89 && u[1] === 0x48 && u[2] === 0x44 && u[3] === 0x46;
     }
 
     return {
         cellToLattice, latticeToCell, reciprocalBasis, hklToQ, qToHkl, isUnitMetric, modelAxesToHkl,
-        parseRmc6f, readUnifiedStructure,
+        parseRmc6f, readUnifiedStructure, isHdf5Signature,
         detectH5Kind, readUnifiedData, readYell,
-        parseOldDat, writeOldDat, writeOldDatChunks, countNonFinite,
-        isVtk, vtkFrame, parseGridConfig, parseVtk, writeVtk,
+        parseOldDat, readOldDatStream, writeOldDat, writeOldDatChunks, countNonFinite,
+        isVtk, vtkFrame, parseGridConfig, parseVtk, readVtkStream, writeVtk, writeVtkChunks,
+        toHklModel, resolveCell, planConversion, estimateOutputBytes, outputDtype,
         writeUnifiedData, writeYell,
     };
 }));
