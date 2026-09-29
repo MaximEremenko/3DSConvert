@@ -376,6 +376,20 @@ const scenarios = [
         await setFile('#dataFile', out);
         await waitLog(/hkl list \| grid 5 x 5 x 5 \| σ/);
     }],
+    ['.dat with hkl coordinates and m-3m symmetry sections, read back as _hkl.dat', async () => {
+        await setFile('#dataFile', path.join(ROOT, 'Examples/example_unified.h5'));
+        await waitLog(/Unified data format \| grid 5 x 5 x 5/);
+        await setValue('outFormat', 'dat');
+        await setValue('datFrame', 'hkl');
+        await setValue('datSections', 'm-3m');
+        const out = await convert('example_unified_diffuse3d_hkl.dat');
+        const lines = fs.readFileSync(out, 'utf8').split('\n');
+        if (lines[0] !== '125 48' || lines[1].split(' ').length !== 3 + 3 * 48 + 1) throw new Error('header ' + lines[0]);
+        if (lines[1].split(' ').slice(3, 6).map(Number).join() !== '-1,-1,-1') throw new Error('row ' + lines[1].slice(0, 80));
+        await fresh();
+        await setFile('#dataFile', out);
+        await waitLog(/RMCProfile \.dat · hkl \| grid 5 x 5 x 5 in hkl/);
+    }],
     ['crop on read: only the chosen hkl box is read', async () => {
         await evaluate(`(() => {
             for (const [axis, end, v] of [['h', 0, -0.5], ['h', 1, 1], ['l', 0, 0], ['l', 1, 0.5]]) {

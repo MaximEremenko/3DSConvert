@@ -89,3 +89,46 @@ test('hkl list config snippets: Spinteract ORIGIN + full axes, Scatty CENTRE + h
     assert.deepEqual(back.dims, [5, 3, 1]);
     assert.deepEqual(back.corner, [-1, 0, 0.5]);
 });
+
+const streamOf = text => new Blob([text]).stream();
+
+test('RMCProfile amplitude files: |A|^2 averaged over the sections, first permutation', async () => {
+    // a 2 x 1 x 1 grid, two sections: rows i j k, Q x 2, (Re Im) x 2
+    const rows = [
+        '1 1 1  0 0 0  0 0 0  3 4  0 1',                 // (25 + 1) / 2 = 13
+        '2 1 1  1 0 0  0 1 0  1 0  0 2',                 // (1 + 4) / 2 = 2.5
+    ];
+    const aver = await Converter.readOldDatStream(streamOf(rows.join('\n') + '\n'), { amplitudes: true });
+    assert.deepEqual(Array.from(aver.values), [13, 2.5]);
+    assert.match(aver.notes.join('\n'), /averaged over 2 symmetry sections/);
+    const total = await Converter.readOldDatStream(streamOf(' ipermutation = 1\n' + rows.join('\n') +
+        '\n ipermutation = 2\n1 1 1  0 0 0  0 0 0  9 9  9 9\n2 1 1  1 0 0  0 1 0  9 9  9 9\n'), { amplitudes: true });
+    assert.deepEqual(Array.from(total.values), [13, 2.5]);
+    assert.match(total.notes.join('\n'), /the first of 2 permutations/);
+    await assert.rejects(Converter.readOldDatStream(streamOf('1 1 1 0 0 0 1\n'), { amplitudes: true }), /not i j k \+ 5 per/);
+});
+
+test('old-format .dat in hkl coordinates, and with symmetry sections', async () => {
+    const m = sample(false);
+    const cell = { lengths: [4, 4, 4], angles: [90, 90, 90] };
+    const hklText = Array.from(Converter.writeOldDatChunks(m, cell, 0, { frame: 'hkl' })).join('');
+    assert.equal(hklText.split('\n')[1].split(' ').slice(3, 6).map(Number).join(), '-1,0,0.5');
+    const grid = await Converter.readOldDatStream(streamOf(hklText), { frame: 'hkl' });
+    const back = Converter.toHklModel(grid, null);
+    assert.deepEqual(back.corner, m.corner);
+    assert.deepEqual(back.vectors.flat().map(x => +x.toFixed(12)), m.vectors.flat());
+    assert.deepEqual(Array.from(back.values), Array.from(m.values));
+    // m-3m sections: 48 coordinate triplets per row, the first the point itself
+    const Processing = require('../js/processing.js');
+    const ops = Processing.laueOperations('m-3m');
+    ops.sort((a, b) => (a.flat().join() === '1,0,0,0,1,0,0,0,1' ? -1 : b.flat().join() === '1,0,0,0,1,0,0,0,1' ? 1 : 0));
+    const secText = Array.from(Converter.writeOldDatChunks(m, cell, 0, { sections: ops })).join('');
+    const lines = secText.split('\n');
+    assert.equal(lines[0], '24 48');
+    assert.equal(lines[1].split(' ').length, 3 + 3 * 48 + 1);
+    const plain = Converter.toHklModel(await Converter.readOldDatStream(streamOf(secText), {}), cell);
+    assert.ok(maxAbs(plain.corner, m.corner) < 1e-9);
+    assert.deepEqual(Array.from(plain.values), Array.from(m.values));
+});
+
+const maxAbs = (a, b) => Math.max(...a.map((x, i) => Math.abs(x - b[i])));

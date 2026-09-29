@@ -1366,9 +1366,27 @@
     // result keeps the geometry in cartesian Q: qCorner is Q at pixel
     // (1,1,1) and qVectors[axis] the Q step per pixel; toHklModel applies
     // the cell. Pixels missing from the file become NaN.
-    function datParser() {
-        let header = null, npoints = 0, perRow = 0, nsec = 0, nrows = 0;
+    // opts.amplitudes: an RMCProfile _aver_amp_calc.dat / _total_amp_calc.dat
+    // (no header; per row i j k, a Q triplet and Re Im per symmetry section):
+    // the value is |A|^2 averaged over the sections, from the first
+    // permutation block. opts.frame 'hkl': the coordinates are hkl (the
+    // _hkl.dat variant) rather than Q.
+    function datParser(opts) {
+        opts = opts || {};
+        const amplitudes = !!opts.amplitudes;
+        let header = null, npoints = 0, perRow = 0, nsec = 0, nrows = 0, cap = 0, permutations = 0;
         let pix = null, vals = null, row = [];
+        const ensure = n => {
+            if (n <= cap) return;
+            cap = Math.max(n, cap * 2, 65536);
+            const p = new Int32Array(3 * cap), v = new Float64Array(cap);
+            if (pix) {
+                p.set(pix);
+                v.set(vals);
+            }
+            pix = p;
+            vals = v;
+        };
         const dims = [0, 0, 0];
         const special = [null, null, null, null];     // Q at (1,1,1) (2,1,1) (1,2,1) (1,1,2)
         const xx = new Float64Array(16), xq = new Float64Array(12);   // least-squares sums
@@ -1376,12 +1394,22 @@
         let datHeader = null;
 
         function takeRow(tok) {
-            if (nrows >= npoints) return;
+            if (amplitudes) ensure(nrows + 1);
+            else if (nrows >= npoints) return;
             const i = parseInt(tok[0], 10), j = parseInt(tok[1], 10), k = parseInt(tok[2], 10);
             if (!(i >= 1 && j >= 1 && k >= 1)) throw new Error('pixel coordinates must be positive');
             const qx = num(tok[3]), qy = num(tok[4]), qz = num(tok[5]);
             pix[3 * nrows] = i; pix[3 * nrows + 1] = j; pix[3 * nrows + 2] = k;
-            vals[nrows++] = num(tok[perRow - 1]);
+            if (amplitudes) {
+                let sum = 0;
+                for (let s = 0; s < nsec; s++) {
+                    const re = num(tok[3 + 3 * nsec + 2 * s]), im = num(tok[4 + 3 * nsec + 2 * s]);
+                    sum += re * re + im * im;
+                }
+                vals[nrows++] = sum / nsec;
+            } else {
+                vals[nrows++] = num(tok[perRow - 1]);
+            }
             if (i > dims[0]) dims[0] = i;
             if (j > dims[1]) dims[1] = j;
             if (k > dims[2]) dims[2] = k;
@@ -1399,6 +1427,25 @@
         function line(text) {
             const t = text.trim();
             if (!t) return;
+            if (amplitudes) {
+                if (/^ipermutation\s*=/i.test(t)) {
+                    permutations++;
+                    return;
+                }
+                if (permutations > 1) return;          // the first permutation only
+                const cols = t.split(/\s+/);
+                if (!perRow) {
+                    nsec = (cols.length - 3) / 5;
+                    if (!Number.isInteger(nsec) || nsec < 1) {
+                        throw new Error(`RMCProfile amplitude file: ${cols.length} columns is not i j k + 5 per symmetry section`);
+                    }
+                    perRow = cols.length;
+                    header = ['amplitudes'];
+                }
+                if (cols.length !== perRow) throw new Error(`RMCProfile amplitude file: a row has ${cols.length} columns, expected ${perRow}`);
+                takeRow(cols);
+                return;
+            }
             const tokens = t.split(/\s+/);
             if (!header) {
                 if (tokens.length < 2 || tokens.length > 4 || tokens.some(s => !Number.isFinite(num(s)))) {
@@ -1455,6 +1502,11 @@
 
         function finish() {
             if (!header) throw new Error('old-format .dat: empty file');
+            if (amplitudes) {
+                npoints = nrows;
+                notes.push(`|A|^2 of RMCProfile amplitudes, averaged over ${nsec} symmetry section${nsec === 1 ? '' : 's'}` +
+                    (permutations > 1 ? `; the first of ${permutations} permutations` : ''));
+            }
             if (nrows < npoints) {
                 throw new Error(`old-format data file is truncated (${nrows} of ${npoints} rows)`);
             }
@@ -1470,8 +1522,9 @@
                 values[((pix[3 * n + 2] - 1) * nk + (pix[3 * n + 1] - 1)) * nh + (pix[3 * n] - 1)] = vals[n];
             }
             const g = geometry();
+            if (opts.frame === 'hkl') notes.push('the coordinates are hkl (r.l.u.), read without a Q conversion');
             return {
-                frame: 'q', source: 'dat', dims: dims.slice(), values,
+                frame: opts.frame === 'hkl' ? 'hkl' : 'q', source: 'dat', dims: dims.slice(), values,
                 qCorner: g.qCorner, qVectors: g.qVectors,
                 nsecOriginal: nsec, datHeader, notes,
             };
@@ -1489,7 +1542,7 @@
 
     // Stream an old-format .dat; returns the grid in Q (see datParser).
     async function readOldDatStream(stream, opts) {
-        const parser = datParser();
+        const parser = datParser(opts);
         await forEachStreamLine(stream, opts, parser.line);
         return parser.finish();
     }
@@ -1526,22 +1579,33 @@
 
     // Non-finite intensities are written as 0.0: RMCProfile treats I = 0 as a
     // masked point (excluded from chi^2), while a literal NaN would poison it.
-    function* writeOldDatChunks(model, cell, linesPerChunk) {
+    // opts.frame 'hkl': write hkl (r.l.u.) instead of Q (the _hkl.dat
+    // variant). opts.sections: hkl operations (3x3, acting on hkl columns);
+    // each row then lists the coordinates of every image, the first being
+    // the identity, as RMCProfile's symmetry sections (nsec = their count).
+    function* writeOldDatChunks(model, cell, linesPerChunk, opts) {
+        opts = opts || {};
         checkWritable(model, 'dat');
-        const A = cellToLattice(cell.lengths, cell.angles);
-        const B = reciprocalBasis(A);
+        const hkl = opts.frame === 'hkl';
+        const B = hkl ? null : reciprocalBasis(cellToLattice(cell.lengths, cell.angles));
+        const ops = opts.sections && opts.sections.length ? opts.sections : [[[1, 0, 0], [0, 1, 0], [0, 0, 1]]];
         const [nh, nk, nl] = model.dims;
         const chunkSize = Math.max(1, Number(linesPerChunk) || 16384);
-        let out = [`${nh * nk * nl} 1`];
+        let out = [`${nh * nk * nl} ${ops.length}`];
         for (let k = 0; k < nl; k++) {
             for (let j = 0; j < nk; j++) {
                 for (let i = 0; i < nh; i++) {
-                    const hkl = [0, 1, 2].map(c =>
+                    const p = [0, 1, 2].map(c =>
                         model.corner[c] + i * model.vectors[0][c] + j * model.vectors[1][c] + k * model.vectors[2][c]);
-                    const q = hklToQ(B, hkl);
                     const raw = model.values[(k * nk + j) * nh + i];
                     const v = Number.isFinite(raw) ? raw : 0;
-                    out.push(`${i + 1} ${j + 1} ${k + 1} ${q[0].toExponential(16)} ${q[1].toExponential(16)} ${q[2].toExponential(16)} ${v.toExponential(16)}`);
+                    let row = `${i + 1} ${j + 1} ${k + 1}`;
+                    for (const G of ops) {
+                        const g = [0, 1, 2].map(r => G[r][0] * p[0] + G[r][1] * p[1] + G[r][2] * p[2]);
+                        const x = hkl ? g : hklToQ(B, g);
+                        row += ` ${x[0].toExponential(16)} ${x[1].toExponential(16)} ${x[2].toExponential(16)}`;
+                    }
+                    out.push(`${row} ${v.toExponential(16)}`);
                     if (out.length >= chunkSize) {
                         yield out.join('\n') + '\n';
                         out = [];
@@ -1940,7 +2004,10 @@
             return v;
         });
         let corner, vectors;
-        if (grid.frame === 'hkl') {
+        if (grid.frame === 'hkl' && grid.source === 'dat') {
+            corner = grid.qCorner.slice();
+            vectors = grid.qVectors.map(v => v.slice());
+        } else if (grid.frame === 'hkl') {
             corner = grid.origin.slice();
             vectors = diagonal(grid.spacing);
             notes.push(`VTK "${grid.title}" stores ORIGIN/SPACING in reciprocal-lattice units; ` +
@@ -2379,9 +2446,10 @@
         if (format === 'unified') return n * item * (opts.layout === 'entry' ? 1 : 2) + 65536;
         if (format === 'yell') return n * item + 16384;
         if (format === 'dat') {
-            // "i j k qx qy qz I" with 17 significant digits per number.
+            // "i j k qx qy qz I" with 17 significant digits per number, three
+            // more coordinates per extra symmetry section.
             const digits = model.dims.reduce((s, d) => s + String(d).length, 0);
-            return n * (digits + 4 * 23 + 4);
+            return n * (digits + (3 * (opts.nsec || 1) + 1) * 23 + 4);
         }
         if (format === 'vtk') return n * 23 + 512;
         if (format === 'hkl') return n * 62;

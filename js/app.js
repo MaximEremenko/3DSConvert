@@ -271,7 +271,8 @@
   // ------------------------------------------------------------ data
   const KIND_LABEL = {
     yell: 'Yell 1.0', unified: 'Unified HDF5', 'mantid-md': 'Mantid MDHistoWorkspace', nexus: 'NeXus NXdata',
-    dat: 'RMCProfile .dat', vtk: 'VTK · Q', 'vtk-hkl': 'VTK · r.l.u.', hkl: 'hkl list',
+    dat: 'RMCProfile .dat', 'dat-hkl': 'RMCProfile .dat · hkl', 'dat-amp': 'RMCProfile amplitudes',
+    vtk: 'VTK · Q', 'vtk-hkl': 'VTK · r.l.u.', hkl: 'hkl list',
   };
 
   // Per grid axis: the component it runs along, its range and step.
@@ -361,8 +362,8 @@
         $('nexusPick').hidden = false;
       }
       let info;
-      if (s.kind === 'dat') {
-        info = `RMCProfile old text format | grid ${s.dims.join(' x ')} in Q`;
+      if (s.kind === 'dat' || s.kind === 'dat-amp' || s.kind === 'dat-hkl') {
+        info = `${KIND_LABEL[s.kind]} | grid ${s.dims.join(' x ')} in ${s.kind === 'dat-hkl' ? 'hkl' : 'Q'}`;
       } else if (s.kind === 'vtk') {
         info = `VTK STRUCTURED_POINTS in Q | grid ${s.dims.join(' x ')}`;
       } else if (s.kind === 'hkl') {
@@ -1663,6 +1664,7 @@
   function fileNameFor(base, tag, format) {
     if (format === 'hkl' && $('hklTarget').value === 'spinteract') return `${base}${tag}_xtal_data_01.txt`;
     if (format === 'hkl' && $('hklTarget').value === 'scatty') return 'scatty_data_01.txt';
+    if (format === 'dat' && $('datFrame').value === 'hkl') return `${base}${tag}_diffuse3d_hkl.dat`;
     return base + tag + SUFFIX[format];
   }
 
@@ -1698,6 +1700,7 @@
     $('radiation').disabled = text;
     $('profileOpts').hidden = fmt !== 'profile';
     $('hklOpts').hidden = fmt !== 'hkl';
+    $('datOpts1').hidden = $('datOpts2').hidden = fmt !== 'dat';
     $('outCard').classList.toggle('done', !!state.data);
     const s = state.data;
     if (!s) {
@@ -1709,7 +1712,8 @@
     const precision = $('precision').value;
     const single = precision === 'float32' || (precision === 'same' && s.precision === 'float32' && !direct);
     const bytes = Converter.estimateOutputBytes({ dims: s.dims, values: single ? new Float32Array(0) : new Float64Array(0) },
-      fmt, { precision, layout: $('layout').value });
+      fmt, { precision, layout: $('layout').value,
+        nsec: $('datSections').value === 'none' ? 1 : Processing.laueOperations($('datSections').value).length });
     $('outDetail').textContent = FORMAT_TITLE[fmt] +
       (bytes ? ` · about ${fmtBytes(bytes)}` + (!text && Number($('compression').value) ? ' before compression' : '') : '');
   }
@@ -1729,7 +1733,14 @@
       });
     }
   }
-  for (const id of ['outFormat', 'precision', 'layout', 'compression', 'radiation', 'hklTarget']) $(id).addEventListener('change', updateOutput);
+  for (const id of ['outFormat', 'precision', 'layout', 'compression', 'radiation', 'hklTarget', 'datFrame', 'datSections']) {
+    $(id).addEventListener('change', updateOutput);
+  }
+  for (const g of Processing.LAUE_GROUPS) {
+    const opt = el('option', null, `${g} (nsec ${Processing.laueOperations(g).length})`);
+    opt.value = g;
+    $('datSections').appendChild(opt);
+  }
 
   function download(bytes, filename, mime) {
     const blob = new Blob(Array.isArray(bytes) ? bytes : [bytes], { type: mime });
@@ -1788,6 +1799,7 @@
       precision: $('precision').value, layout: $('layout').value, compression: Number($('compression').value),
       recipe: steps.length ? { version: 1, steps } : null,
       profileWidth: Number($('profileWidth').value), hklTarget: $('hklTarget').value,
+      datFrame: $('datFrame').value, datSections: $('datSections').value,
     };
     const bad = state.recipe.map((s, n) => [n + 1, s.enabled === false ? null : checkStep(s, n).error]).filter(x => x[1]);
     for (const [n, error] of bad) log(`Error: processing step ${n}: ${error}`, 'err');

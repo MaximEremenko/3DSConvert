@@ -127,6 +127,13 @@ function converterWorker(self, h5wasm, Converter, Processing, wgpuFftWeb) {
     // { kind, model }.
     async function readTextVolume(file, opts) {
         const head = new TextDecoder().decode(await file.slice(0, 4096).arrayBuffer());
+        // RMCProfile's amplitude files and the _hkl.dat variant go by their names.
+        if (/_amp_calc\.dat$/i.test(file.name)) {
+            return { kind: 'dat-amp', grid: await Converter.readOldDatStream(file.stream(), Object.assign({ amplitudes: true }, opts)) };
+        }
+        if (/_hkl\.dat$/i.test(file.name)) {
+            return { kind: 'dat-hkl', grid: await Converter.readOldDatStream(file.stream(), Object.assign({ frame: 'hkl' }, opts)) };
+        }
         if (Converter.isHklList(head)) {
             const list = await Converter.readHklListStream(file.stream(), opts);
             return { kind: 'hkl', model: Converter.hklListModel(list, opts.grid || null) };
@@ -224,6 +231,9 @@ function converterWorker(self, h5wasm, Converter, Processing, wgpuFftWeb) {
         state.processed = { key, plan, process };
         return state.processed;
     }
+
+    // Sort key that puts the identity operation first.
+    const identityFirst = G => (G.flat().join() === '1,0,0,0,1,0,0,0,1' ? 0 : 1);
 
     // The extra volumes a recipe's steps name (combine, normalize), on hkl grids.
     function recipeExtras(recipe, params) {
@@ -492,7 +502,8 @@ function converterWorker(self, h5wasm, Converter, Processing, wgpuFftWeb) {
             state.plan = null;
             const { plan, process } = await processData(params, ctx);
             Converter.checkWritable(plan.model, params.format);
-            if ((params.format === 'dat' || params.format === 'vtk') && Converter.isUnitMetric(plan.cell.lengths, plan.cell.angles)) {
+            if (((params.format === 'dat' && params.datFrame !== 'hkl') || params.format === 'vtk') &&
+                Converter.isUnitMetric(plan.cell.lengths, plan.cell.angles)) {
                 throw new Error(`cannot write ${params.format} with a unit-metric cell - supply a structure file or a manual parent cell`);
             }
             state.plan = { plan, params, process };
@@ -514,7 +525,10 @@ function converterWorker(self, h5wasm, Converter, Processing, wgpuFftWeb) {
             const progress = f => ctx.progress('Writing', f);
             if (params.format === 'dat' || params.format === 'vtk' || params.format === 'profile' || params.format === 'hkl') {
                 let report = null;
-                const chunks = params.format === 'dat' ? Converter.writeOldDatChunks(plan.model, plan.cell)
+                const sections = params.datSections && params.datSections !== 'none'
+                    ? Processing.laueOperations(params.datSections).sort((a, b) => identityFirst(a) - identityFirst(b)) : null;
+                const chunks = params.format === 'dat'
+                    ? Converter.writeOldDatChunks(plan.model, plan.cell, 0, { frame: params.datFrame, sections })
                     : params.format === 'vtk' ? Converter.writeVtkChunks(plan.model, plan.cell)
                     : params.format === 'hkl' ? Converter.writeHklListChunks(plan.model, r => { report = r; })
                     : Processing.writeProfileChunks(plan.model, plan.cell, params.profileWidth);

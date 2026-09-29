@@ -213,6 +213,10 @@
       <label class="field"><span>Radiation</span><select id="radiation" class="text">
         <option value="">keep / unknown</option><option value="neutron">neutron</option><option value="xray">xray</option><option value="electron">electron</option></select></label>
       <label class="field" id="profileOpts" hidden><span>Shell width (Å⁻¹)</span><input id="profileWidth" value="0.05" class="text" inputmode="decimal"></label>
+      <label class="field" id="datOpts1" hidden><span>.dat coordinates</span><select id="datFrame" class="text">
+        <option value="q">Q (Å⁻¹)</option><option value="hkl">hkl (r.l.u., _hkl.dat)</option></select></label>
+      <label class="field" id="datOpts2" hidden><span>symmetry sections</span><select id="datSections" class="text">
+        <option value="none">none (nsec 1)</option></select></label>
       <label class="field" id="hklOpts" hidden><span>hkl list for</span><select id="hklTarget" class="text">
         <option value="spinteract">Spinteract (_xtal_data_01.txt)</option><option value="scatty">Scatty (scatty_data_01.txt)</option>
         <option value="plain">plain text</option></select></label>
