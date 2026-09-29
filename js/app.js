@@ -928,6 +928,18 @@
       ['shift', 'num', 'let each direction sector shift its lines by up to (fraction; a part off the sample position)'],
       ['maskSpots', 'bool', 'mask bright spots left on the rings (large grains)'],
       ['positive', 'bool', 'only positive rings (off after an empty-can subtraction, which can leave negative ones)']]],
+    filterRings: ['Ring filter at the lines (Fourier)', [
+      ['materials', 'text', 'materials whose lines are filtered: aluminium, copper, … (as a ring removal before fitted them, else fitted here)'],
+      ['temperature', 'num', 'temperature of the aluminium (K; 0 = room), when fitted here'],
+      ['radiation', ['auto', 'xray', 'neutron', 'electron'], 'radiation for the line intensities, when fitted here (auto: the data’s)'],
+      ['axis', 'text', 'rotation axis: auto (found from the rings) or a direction h k l'],
+      ['angleStep', 'num', 'bins of the angle to the axis (degrees)'],
+      ['azimuth', 'num', 'azimuthal orders about the axis (0–4; 0: the rings follow the angle to it only)'],
+      ['window', 'num', 'change the data within this many line widths of each line'],
+      ['highPass', 'num', 'Fourier high-pass: broader than this many line widths stays'],
+      ['smooth', 'num', 'Fourier low-pass: finer than this many line widths is noise'],
+      ['bragg', 'num', 'leave the sample’s Bragg regions out of the estimate: radius (r.l.u.; 0 = none)'],
+      ['passes', 'num', 'passes (1–10)']]],
     backgroundDebyeWaller: ['Background: Laue + thermal (Debye–Waller)', [
       ['composition', 'text', 'sites, e.g. Pb; Mg 0.333 + Nb 0.667; 3*O'], ['uiso', 'text', 'Uiso (Å²): one value, or e.g. 0.01, Pb 0.03'],
       ['radiation', ['auto', 'xray', 'neutron', 'electron'], 'radiation (auto: the data’s)'],
@@ -966,13 +978,13 @@
   };
   const STEP_GROUPS = [
     ['Grid', ['crop', 'resample', 'rebin', 'correctUB']], ['Masks', ['maskBragg', 'maskRings', 'maskQ', 'maskRange', 'fill']],
-    ['Background', ['normalize', 'backgroundShells', 'backgroundDebyeWaller', 'backgroundFunction', 'removeRings', 'combine']],
+    ['Background', ['normalize', 'backgroundShells', 'backgroundDebyeWaller', 'backgroundFunction', 'removeRings', 'filterRings', 'combine']],
     ['Values', ['scale', 'clip', 'smooth', 'despike']], ['Symmetry', ['symmetrize']], ['Transform', ['window', 'deltaPdf']],
   ];
   const STEP_ICON = {
     crop: 'crop', resample: 'grid', rebin: 'grid', maskBragg: 'mask', maskRings: 'rings', maskRange: 'sliders',
     scale: 'sliders', backgroundFunction: 'curve', backgroundShells: 'curve', combine: 'layers', normalize: 'layers', clip: 'sliders',
-    symmetrize: 'sym', deltaPdf: 'wave', smooth: 'curve', fill: 'wand', maskQ: 'rings', removeRings: 'rings',
+    symmetrize: 'sym', deltaPdf: 'wave', smooth: 'curve', fill: 'wand', maskQ: 'rings', removeRings: 'rings', filterRings: 'rings',
     backgroundDebyeWaller: 'curve', correctUB: 'grid', despike: 'wand', window: 'wave',
   };
   // Starting values of a new step.
@@ -989,6 +1001,8 @@
     removeRings: { materials: 'aluminium', temperature: 0, radiation: 'auto', intensities: 'free', refine: 0.01, fitWidth: true, sigma0: 0.005,
       resolution: 0.004, voxelWidth: true, shift: 0.002, maskSpots: false, highPass: 6, sectors: 8, coverage: 0.25, cutoff: 0.05, width: 0.005,
       positive: true },
+    filterRings: { materials: 'aluminium', temperature: 0, radiation: 'auto', axis: 'auto', angleStep: 1, azimuth: 2, window: 3, highPass: 4, smooth: 0.4,
+      bragg: 0.3, passes: 3 },
     backgroundDebyeWaller: { composition: '', uiso: '0.01', radiation: 'auto', fit: true, percentile: 5, width: 0.05, offset: false, scale: 1 },
     correctUB: { mode: 'refine', centring: 'P', radius: 0.25, snr: 10, peaks: 300, shift: false, ub: [], ubNew: [] },
     despike: { size: 1, k: 5 }, window: { kind: 'lorch', qmax: 0 },
@@ -997,19 +1011,23 @@
     { name: '3D-ΔPDF of a cubic crystal', note: 'm-3m symmetrize · Bragg mask · ΔPDF', steps: [
       { op: 'symmetrize', laue: 'm-3m', mode: 'average', k: 3, expand: true },
       { op: 'maskBragg', shape: 'box', size: 0.2, centring: 'P' }, { op: 'deltaPdf', taper: 0, engine: 'cpu' }] },
-    { name: 'Clean up a volume', note: 'despike · sample-environment rings · symmetrize without outliers', steps: [
+    { name: 'Clean up a volume', note: 'despike · sample-environment rings, fitted then filtered · symmetrize without outliers', steps: [
       { op: 'despike', size: 1, k: 5 }, { op: 'removeRings', materials: 'aluminium, copper', temperature: 0, radiation: 'auto', intensities: 'free', refine: 0.01,
         fitWidth: true, sigma0: 0.005, resolution: 0.004, voxelWidth: true, shift: 0.002, maskSpots: false, highPass: 6, sectors: 8,
         coverage: 0.25, cutoff: 0.05, width: 0.005, positive: true },
+      { op: 'filterRings', materials: 'aluminium, copper', temperature: 0, radiation: 'auto', axis: 'auto', angleStep: 1, azimuth: 2,
+        window: 3, highPass: 4, smooth: 0.4, bragg: 0.3, passes: 3 },
       { op: 'symmetrize', laue: 'm-3m', mode: 'clip', k: 3, expand: true }] },
     { name: 'Subtract a background volume', note: 'load it under Other volumes', steps: [
       { op: 'combine', operation: 'subtract', scale: 1 }] },
     { name: 'Diffuse scattering only', note: 'Bragg mask · background from |Q| shells', steps: [
       { op: 'maskBragg', shape: 'box', size: 0.1, centring: 'P' }, { op: 'backgroundShells', width: 0.05, percentile: 5, smooth: 1 }] },
-    { name: 'Sample-environment rings', note: 'aluminium and copper lines from their structures, fitted and taken off', steps: [
+    { name: 'Sample-environment rings', note: 'aluminium and copper lines fitted from their structures and taken off; what is left Fourier-filtered along the rotation axis', steps: [
       { op: 'removeRings', materials: 'aluminium, copper', temperature: 0, radiation: 'auto', intensities: 'free', refine: 0.01,
         fitWidth: true, sigma0: 0.005, resolution: 0.004, voxelWidth: true, shift: 0.002, maskSpots: false, highPass: 6, sectors: 8,
-        coverage: 0.25, cutoff: 0.05, width: 0.005, positive: true }] },
+        coverage: 0.25, cutoff: 0.05, width: 0.005, positive: true },
+      { op: 'filterRings', materials: 'aluminium, copper', temperature: 0, radiation: 'auto', axis: 'auto', angleStep: 1, azimuth: 2,
+        window: 3, highPass: 4, smooth: 0.4, bragg: 0.3, passes: 3 }] },
   ];
 
   for (const [group, ops] of STEP_GROUPS) {

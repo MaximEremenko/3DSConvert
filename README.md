@@ -406,6 +406,7 @@ NaN marks masked or missing voxels throughout, and |Q| is Cartesian in
 | Background from \|Q\| shells | subtracts the minimum or a percentile of each \|Q\| shell, optionally smoothed over neighbouring shells |
 | Background: Laue + thermal | the diffuse scattering of uncorrelated disorder, per formula unit Σ over sites of count × (⟨f²⟩ − ⟨f e^−W⟩²) with 2W = Uiso Q²: the Laue term of species sharing a site and the thermal diffuse scattering the Debye–Waller factors take from the Bragg peaks. The composition is written as sites, e.g. `Pb; Mg 0.333 + Nb 0.667; 3*O` (occupancies; what is missing to 1 is vacancy), with Uiso for all or per element (`0.01, Pb 0.03`); X-ray (Waasmaier–Kirfel), neutron (coherent lengths) or electron (Peng) scattering, from 3DSCalculator's tables. It is scaled by least squares to a low percentile of each \|Q\| shell (with an offset if asked), or by a given factor |
 | Remove powder rings | the rings of named materials - sample-environment metals (aluminium, copper, vanadium, niobium, titanium, zirconium, beryllium, ...), ice, calibrants (Si, CeO2, LaB6, ...) or a custom `fcc Al 4.05` - are predicted from their structure and fitted to the data, then subtracted at their \|Q\| from every voxel, so anisotropic diffuse scattering stays; `any` removes every ring sharper than a cutoff instead. See below |
+| Ring filter at the lines | a Fourier filter, on the lines of named materials only, of what a ring removal leaves (or of the rings themselves), over \|Q\| and the angle to the crystal's rotation axis. See below |
 | Combine | subtracts, adds, multiplies or divides by another volume (times a factor), interpolated onto this grid if the grids differ |
 | Replace low values | sets values below a threshold to a number or NaN |
 | Symmetrize | averages over Laue-equivalent points (-1 to m-3m; hexagonal axes for the trigonal groups), or only fills empty voxels; *median* takes the median of the equivalents and *clip* their mean without those more than k robust σ from it, so a spike or a spurious peak in one equivalent drops out. The grid is extended to its symmetric images (a half volume becomes whole) unless that is switched off; a grid that already holds them stays as it is |
@@ -475,8 +476,48 @@ leave bright spots on a ring that no smooth model takes off; *mask spots*
 then empties the voxels on a line's core more than four robust σ above the
 median of that line in that sector. On a CORELLI volume in an aluminium can
 the fit gives a = 4.0494 Å (0.006 % from aluminium at 300 K) and removes
-98–102 % of the (111), (200) and (220) ring excess. The *Sample-environment
-rings* preset runs it for aluminium and copper.
+98–102 % of the (111), (200) and (220) ring excess on average over
+directions; what it leaves varies with direction, which the ring filter
+below takes off. The *Sample-environment rings* preset runs both for
+aluminium and copper.
+
+**Ring filter.** In data from a crystal turned about one axis a ring of the
+sample environment depends on \|Q\| and on the angle to that axis - a
+detector pixel sees the ring at one angle to the axis at every turn, so
+detector edges and gaps, the resolution and the paths through the
+environment draw bands in that angle, some only a degree or two wide - and
+only smoothly on the azimuth about it. The eight direction sectors of the
+fit cannot follow such bands, nor line shapes that are not Gaussian (the
+asymmetric lines of time of flight). The filter takes what the fit leaves
+as a function of those coordinates: medians in bins of the angle to the
+axis (1° by default) and of the fit's coordinate u, band-passed along u by
+FFT (what is broader than four line widths, and the noise finer than 0.4
+of a width, come off), smoothed over the angle (more widely where the bins
+hold few voxels, near the axis), then the same over coarse cells of angle
+and azimuth for the Fourier orders up to 2 about the axis; three passes.
+The axis is found from the rings - a Legendre fit of the line excess over
+300 direction cells gives a first axis, refined to where the excess binned
+by a degree of angle is sharpest (on CORELLI data 0.26° from the vertical
+goniometer axis of the UB) - or given as h k l. The medians leave out the
+voxels within 0.3 r.l.u. of the sample's Bragg positions, whose diffuse
+clouds sit at the rings' \|Q\| when the lattices are alike (perovskites near
+4 Å, aluminium 4.05 Å), and the bins whose circle about the axis the edge of
+the grid cuts. A line is filtered when what is left on it stands out of the
+estimate's noise (the same table from every other voxel tells how large
+that is) and, after a fit, is less than half its ring; otherwise it is left
+alone and logged, as more is the sample's own scattering. Only the voxels
+within three line widths of those lines change. Lines, positions and
+widths come from a ring removal earlier in the recipe, or from a fit of the
+filter's own (alone it leaves the broad foot of a strong ring, about a
+third of it: run it after the removal). On the CORELLI volume of PMN-PT in
+aluminium the scatter of the ring excess over 300 directions, in units of
+its errors (χ²/n; 1–2 where there are no rings), goes from 78, 25 and 20 at
+Al (111), (200) and (220) after the fit to 19, 9 and 6 after the filter,
+and what remains follows the crystal's fourfold axes - the sample's own
+scattering; in the half-integer planes the (111) ring, 0.12 high, leaves
+less than 0.006. On a synthetic volume with bands and asymmetric lines the
+(111) residual falls from 0.036 after the fit to 0.008, against noise of
+0.02, with the sample near its Bragg peaks unchanged.
 
 Recommended order: subtract an empty-can measurement if there is one, then
 remove the remaining rings, then treat the Bragg peaks (mask, punch and
@@ -484,7 +525,9 @@ fill) and compute the 3D-ΔPDF. `any` instead removes every ring sharper
 than a cutoff, for phases that are not in the library.
 
 The method takes the angular low-pass of ring filters for images (rings
-have no angular frequency: Münch et al., Opt. Express 17, 8567 (2009);
+have no angular frequency: Münch et al., Opt. Express 17, 8567 (2009),
+whose Fourier damping of stripes in sinograms the ring filter applies on
+the plane of \|Q\| and the angle to the rotation axis;
 the azimuthal medians of DIALS, Parkhurst et al., IUCrJ 4, 626 (2017), and
 of pyFAI) into three dimensions, and fits the lines as ice-ring tools and
 Le Bail fits do (AUSPEX, Thorn et al., Acta Cryst. D73, 729 (2017)).

@@ -351,6 +351,22 @@ const scenarios = [
             if (!want.test(text)) throw new Error(`no ${want} in\n${text}`);
         }
     }],
+    ['rings: the ring preset fits the lines, then the Fourier filter; the filter form', async () => {
+        await setFile('#dataFile', path.join(ROOT, 'Examples/example_unified.h5'));
+        await waitLog(/Unified data format \| grid 5 x 5 x 5/);
+        await evaluate(`(() => {
+            document.getElementById('presetBtn').click();
+            [...document.querySelectorAll('#presetMenu button')].find(b => /Sample-environment rings/.test(b.textContent)).click();
+        })()`);
+        const titles = await evaluate(`[...document.querySelectorAll('#steps .step .stephead b')].map(b => b.textContent).join(' | ')`);
+        if (!/Remove powder rings \| Ring filter at the lines \(Fourier\)$/.test(titles)) throw new Error('steps: ' + titles);
+        await evaluate(`(() => {
+            const filter = document.querySelectorAll('#steps .step')[1];
+            if (!filter.classList.contains('open')) filter.querySelector('button.toggle').click();
+        })()`);
+        const values = await evaluate(`[...document.querySelectorAll('#steps .step')[1].querySelectorAll('.stepbody input')].map(i => i.value).join(' | ')`);
+        for (const want of [/aluminium, copper/, /\bauto\b/]) if (!want.test(values)) throw new Error(`no ${want} in the filter form: ${values}`);
+    }],
     ['layout: panels move, the columns and the log resize, the columns swap; kept after a reload', async () => {
         await send('Emulation.setDeviceMetricsOverride', { width: 1400, height: 900, deviceScaleFactor: 1, mobile: false });
         try {

@@ -295,6 +295,10 @@
             resolution: 0.004, voxelWidth: true, shift: 0.002, maskSpots: false,
             width: 0.005, cutoff: 0.05, highPass: 6, sectors: 8, coverage: 0.25, positive: true,
         },
+        filterRings: {
+            materials: 'aluminium', temperature: 0, radiation: 'auto', window: 3, highPass: 4, smooth: 0.4, axis: 'auto', angleStep: 1,
+            azimuth: 2, bragg: 0.3, passes: 3,
+        },
         backgroundDebyeWaller: { radiation: 'auto', uiso: '0.01', fit: true, scale: 1, offset: false, percentile: 5, width: 0.05 },
         correctUB: { mode: 'refine', centring: 'P', radius: 0.25, snr: 10, peaks: 300, shift: false },
         despike: { size: 1, k: 5 },
@@ -904,6 +908,7 @@
                 throw new Error(`materials: unknown "${part.trim()}" (known: ${Object.keys(MATERIALS).join(', ')}; ` +
                     'or a structure type (sc, fcc, bcc, diamond, hcp, rocksalt, fluorite), its elements and lattice parameters)');
             }
+            m.spec = part.trim();
             if (nums.length) m.a = nums[0];
             if (nums.length > 1) m.c = nums[1];
             if (HEXAGONAL_TYPES.has(m.type) && !(m.c > 0)) throw new Error(`materials: "${part.trim()}" needs a and c`);
@@ -1369,7 +1374,8 @@
         if (!fit.x.some(t => t > 0)) ctx.log('no rings of these materials in the data; nothing subtracted');
         // at a bound of the width search: the next pass looks further
         const atLimit = step.fitWidth && (s0 > 0.97 * sMax || s0 < 1.03 * sMax / 9 || r > 0.97 * rMax);
-        if (fit.owner.length === 0) return { ring: () => 0, s0, r, atLimit: false };
+        const names = mats.map(m => m.name);
+        if (fit.owner.length === 0) return { ring: () => 0, s0, r, atLimit: false, lines: [], names };
         // ring intensity per voxel: per sector, the fitted columns summed on
         // a fine |Q| table
         const fine = Math.max(2e-5, Math.hypot(s0, r * qLow) / 10), nf = Math.ceil(qmax * 1.05 / fine) + 2;
@@ -1395,16 +1401,19 @@
             }
             return sum / wsum;
         };
-        // the cores of the lines taken off: |Q| and width
-        const cores = [];
+        // the cores of the lines taken off: |Q| and width; and for a Fourier
+        // filter after this step, each line's width without the voxel's own
+        // and its height over whole shells
+        const cores = [], found = [];
         fit.owner.forEach(([k, lines], c) => {
             if (!fit.x[c]) return;
             for (const line of lines) {
-                const q = line.q / lambdas[k];
-                cores.push({ q, s: Math.sqrt(svAvg * svAvg + s0 * s0 + r * r * q * q) });
+                const q = line.q / lambdas[k], s = Math.sqrt(svAvg * svAvg + s0 * s0 + r * r * q * q);
+                cores.push({ q, s });
+                found.push({ q, s: Math.hypot(s0, r * q), height: fit.x[c] * line.strength / (s * 2.5066282746310002), name: mats[k].name });
             }
         });
-        return { ring, s0, r, atLimit, cores: cores.sort((x, y) => x.q - y.q) };
+        return { ring, s0, r, atLimit, cores: cores.sort((x, y) => x.q - y.q), lines: found.sort((x, y) => x.q - y.q), names };
     }
 
     // Large grains (beryllium windows, annealed copper) make spotty rings
@@ -1451,6 +1460,33 @@
         return masked;
     }
 
+    // The ring fit of named materials in a coordinate u = asinh(r Q / s0) / r
+    // for the line width sqrt(s0^2 + (r Q)^2): linear in |Q| where the width
+    // is constant, logarithmic where it grows with |Q|; bins a quarter of a
+    // width. When the widths fitted in it end at a bound of their search,
+    // the next pass is made for them (at most three). Returns the result of
+    // materialRings and the geometry of the voxels.
+    function fitMaterialRings(model, step, ctx) {
+        let s0 = Math.max(step.sigma0, 1e-4), r0 = step.resolution, result = null, logs = [], geometry = null;
+        for (let pass = 0; pass < 3; pass++) {
+            const a0 = s0, b0 = r0;
+            const coord = {
+                u: q => (b0 > 0 ? Math.asinh(b0 * q / a0) / b0 : q / a0),
+                q: u => (b0 > 0 ? a0 / b0 * Math.sinh(b0 * u) : u * a0),
+                du: 0.25,
+            };
+            const rp = Object.assign(ringProfiles(model, ctx.cell, step, coord, geometry), { du: coord.du, s0init: a0, rinit: b0 });
+            geometry = rp.geometry;
+            logs = [];
+            result = materialRings(model, rp, step, Object.assign({}, ctx, { log: t => logs.push(t) }));
+            if (!result.atLimit) break;
+            s0 = Math.max(result.s0, 1e-4);
+            r0 = result.r;
+        }
+        logs.forEach(t => ctx.log(t));
+        return { result, geometry };
+    }
+
     // Powder rings removed. With materials named (aluminium, ice, "fcc Al
     // 4.05", ...), their lines are predicted from the structure and fitted
     // (see materialRings); with "any", whatever is sharper in |Q| than the
@@ -1480,28 +1516,9 @@
             ctx.log(peaks.length ? 'sharpest rings at |Q| ' + peaks.map(([h, q]) => `${q.toFixed(3)} (${h.toPrecision(3)})`).join(', ') + ' 1/A'
                 : 'no ring sharper than the cutoff found');
         } else {
-            // the profile's coordinate u = asinh(r Q / s0) / r for the line
-            // width sqrt(s0^2 + (r Q)^2): linear in |Q| where the width is
-            // constant, logarithmic where it grows with |Q|; bins a quarter
-            // of a width. When the widths fitted in it end at a bound of
-            // their search, the next pass is made for them (at most three)
-            let s0 = Math.max(step.sigma0, 1e-4), r0 = step.resolution, result = null, logs = [], geometry = null;
-            for (let pass = 0; pass < 3; pass++) {
-                const a0 = s0, b0 = r0;
-                const coord = {
-                    u: q => (b0 > 0 ? Math.asinh(b0 * q / a0) / b0 : q / a0),
-                    q: u => (b0 > 0 ? a0 / b0 * Math.sinh(b0 * u) : u * a0),
-                    du: 0.25,
-                };
-                const rp = Object.assign(ringProfiles(model, ctx.cell, step, coord, geometry), { du: coord.du, s0init: a0, rinit: b0 });
-                geometry = rp.geometry;
-                logs = [];
-                result = materialRings(model, rp, step, Object.assign({}, ctx, { log: t => logs.push(t) }));
-                if (!result.atLimit) break;
-                s0 = Math.max(result.s0, 1e-4);
-                r0 = result.r;
-            }
-            logs.forEach(t => ctx.log(t));
+            const { result, geometry } = fitMaterialRings(model, step, ctx);
+            // what was fitted, for a ring filter later in the recipe
+            if (ctx.memo) ctx.memo.rings = { names: result.names, lines: result.lines, s0: result.s0, r: result.r, voxelWidth: step.voxelWidth };
             const cores = result.cores || [];
             // the direction of every voxel, for the blend between sectors
             const Qm = qMatrix(ctx.cell), q0 = mulMV(Qm, model.corner), [qa, qb, qc] = model.vectors.map(u => mulMV(Qm, u));
@@ -1525,6 +1542,618 @@
                 ctx.log(`${masked} voxels on the ring cores masked as spots (large grains)`);
             }
         }
+        return withValues(model, values);
+    }
+
+    // ------------------------------------------------- ring Fourier filter
+
+    // The lines to filter at: those a ring removal earlier in the recipe
+    // fitted, and for the materials it did not take, a fit here (as
+    // stepRemoveRings does, nothing subtracted). Lines weaker than 2 % of
+    // the strongest are left alone. Returns { lines, s0, r, voxelWidth }.
+    function ringLinesFor(model, step, ctx) {
+        const mats = parseMaterials(step.materials), memo = ctx.memo && ctx.memo.rings;
+        const known = memo ? mats.filter(m => memo.names.includes(m.name)) : [];
+        const missing = mats.filter(m => !known.includes(m));
+        let lines = known.length ? memo.lines.filter(x => known.some(m => m.name === x.name)).map(x => Object.assign({ removed: true }, x)) : [];
+        let s0 = known.length ? memo.s0 : 0, r = known.length ? memo.r : 0, voxelWidth = known.length ? memo.voxelWidth : true;
+        if (known.length) ctx.log(`the lines of ${known.map(m => m.name).join(', ')} as the ring removal before fitted them`);
+        if (missing.length) {
+            ctx.log(`fitting the lines of ${missing.map(m => m.spec).join(', ')} (nothing subtracted):`);
+            const fitStep = Object.assign({}, DEFAULTS.removeRings, {
+                materials: missing.map(m => m.spec).join(', '), temperature: step.temperature, radiation: step.radiation,
+            });
+            const { result } = fitMaterialRings(model, fitStep, ctx);
+            lines = lines.concat(result.lines);
+            if (!known.length) {
+                s0 = result.s0;
+                r = result.r;
+            }
+        }
+        const top = Math.max(0, ...lines.map(x => Math.abs(x.height)));
+        return { lines: lines.filter(x => Math.abs(x.height) > 0.02 * top).sort((x, y) => x.q - y.q), s0: Math.max(s0, 1e-4), r, voxelWidth };
+    }
+
+    // Groups of voxels for medians: `key` (-1: left out) of each, as a
+    // permutation sorted by group and the start of each group in it.
+    function medianGroups(key, ngroups) {
+        const start = new Int32Array(ngroups + 1);
+        for (let i = 0; i < key.length; i++) if (key[i] >= 0) start[key[i] + 1]++;
+        for (let g = 0; g < ngroups; g++) start[g + 1] += start[g];
+        const perm = new Int32Array(start[ngroups]), at = start.slice(0, ngroups);
+        for (let i = 0; i < key.length; i++) if (key[i] >= 0) perm[at[key[i]]++] = i;
+        return { perm, start, ngroups, buf: null };
+    }
+
+    // Median of each group (NaN with fewer than `least` members) and its
+    // size; with `half` 0 or 1, of the members with even or odd indices.
+    function groupMedians(groups, values, least, half) {
+        const { perm, start, ngroups } = groups, sorted = groups.buf || (groups.buf = new Float64Array(perm.length));
+        const med = new Float64Array(ngroups).fill(NaN), cnt = new Float64Array(ngroups);
+        for (let g = 0; g < ngroups; g++) {
+            let n = 0;
+            for (let t = start[g]; t < start[g + 1]; t++) {
+                if (half === undefined || (perm[t] & 1) === half) sorted[start[g] + n++] = values[perm[t]];
+            }
+            if (n < least) continue;
+            med[g] = medianOf(sorted.subarray(start[g], start[g] + n), n);
+            cnt[g] = n;
+        }
+        return { med, cnt };
+    }
+
+    // Band-pass along the rows of a table of medians (NaN: none): a row
+    // with 8 bins or more holding data is bridged over its gaps, its part
+    // broader than `wide` taken off and what is finer than `fine` smoothed
+    // away (Gaussians in Fourier space, widths in the units of the bins,
+    // which are `step` wide). A bin without data gets 0 and no weight.
+    function bandPassRows(med, cnt, rows, cols, step, wide, fine) {
+        const table = new Float64Array(rows * cols), weight = new Float64Array(rows * cols);
+        for (let t = 0; t < rows; t++) {
+            const row = med.subarray(t * cols, (t + 1) * cols), br = bridged(row);
+            if (!br) continue;
+            const broad = lowPass(br.full, step, wide);
+            const hp = Float64Array.from(br.full, (x, b) => x - broad[b]);
+            const bp = fine > 0 ? lowPass(hp, step, fine) : hp;
+            for (let b = 0; b < cols; b++) {
+                if (row[b] !== row[b]) continue;
+                table[t * cols + b] = bp[b];
+                weight[t * cols + b] = cnt[t * cols + b];
+            }
+        }
+        return { table, weight };
+    }
+
+    // Weighted Gaussian smoothing (sigma in rows) of a table across its
+    // rows, row = outer * inner + i smoothed along `outer` for each i; the
+    // weights become the smoothed weights. Where less than `least` weight
+    // is gathered (sparse rows: near the rotation axis the bins of angle
+    // hold few voxels), three and nine times as wide.
+    function smoothAcross(table, weight, outer, inner, cols, sigma, least) {
+        if (!(sigma > 0) || outer < 2) return;
+        const smoothed = sg => {
+            const rad = Math.min(outer - 1, Math.ceil(3 * sg)), kern = Float64Array.from({ length: 2 * rad + 1 }, (_, o) => Math.exp(-0.5 * ((o - rad) / sg) ** 2));
+            const num = new Float64Array(table.length), den = new Float64Array(table.length);
+            for (let o = 0; o < outer; o++) {
+                for (let d = -rad; d <= rad; d++) {
+                    const o2 = o + d;
+                    if (o2 < 0 || o2 >= outer) continue;
+                    const wk = kern[d + rad];
+                    for (let i = 0; i < inner; i++) {
+                        const to = (o * inner + i) * cols, from = (o2 * inner + i) * cols;
+                        for (let b = 0; b < cols; b++) {
+                            const w = weight[from + b];
+                            if (!w) continue;
+                            num[to + b] += wk * w * table[from + b];
+                            den[to + b] += wk * w;
+                        }
+                    }
+                }
+            }
+            return { num, den };
+        };
+        let { num, den } = smoothed(sigma);
+        for (const wider of least > 0 ? [3, 9] : []) {
+            if (!den.some(d => d < least)) break;
+            const more = smoothed(sigma * wider);
+            for (let t = 0; t < den.length; t++) {
+                if (den[t] < least) {
+                    num[t] = more.num[t];
+                    den[t] = more.den[t];
+                }
+            }
+        }
+        for (let t = 0; t < table.length; t++) {
+            table[t] = den[t] > 0 ? num[t] / den[t] : 0;
+            weight[t] = den[t];
+        }
+    }
+
+    // A table of rows x cols at fractional (row, col) positions (bin
+    // centres at integers), linear between them and held at the edges.
+    function tableAt(table, rows, cols, fr, fc) {
+        const r0 = Math.max(0, Math.min(rows - 1, Math.floor(fr))), r1 = Math.min(rows - 1, r0 + 1), tr = Math.max(0, Math.min(1, fr - r0));
+        const c0 = Math.max(0, Math.min(cols - 1, Math.floor(fc))), c1 = Math.min(cols - 1, c0 + 1), tc = Math.max(0, Math.min(1, fc - c0));
+        return (1 - tr) * ((1 - tc) * table[r0 * cols + c0] + tc * table[r0 * cols + c1]) +
+            tr * ((1 - tc) * table[r1 * cols + c0] + tc * table[r1 * cols + c1]);
+    }
+
+    // The rotation axis from the rings. Samples: directions (x, y, z per
+    // sample), values, the line each lies on and whether on its core (else
+    // on its sides). Over 300 direction cells the core-less-sides excess of
+    // each line (medians; per line on a common scale) is fitted with
+    // Legendre polynomials to the 8th of the cosine of the angle to trial
+    // axes over a hemisphere. About the best, the axis is refined, in ever
+    // smaller steps, to where that excess binned by a degree of the angle
+    // has the most contrast: the narrow bands that detector edges draw are
+    // sharp only about the true axis. null with too few samples.
+    function ringAxis(S) {
+        const m = S.val.length, nl = S.nlines;
+        if (m < 2000) return null;
+        const val = Float64Array.from(S.val);
+        // winsorized per line and core / sides: outliers (spots, Bragg tails)
+        // count as three robust sigma
+        for (let li = 0; li < nl; li++) {
+            for (let cs = 0; cs < 2; cs++) {
+                const idx = [];
+                for (let i = 0; i < m; i++) if (S.line[i] === li && S.core[i] === cs) idx.push(i);
+                if (idx.length < 10) continue;
+                const v = Float64Array.from(idx, i => val[i]), med = medianOf(Float64Array.from(v), v.length);
+                const mad = 1.4826 * medianOf(Float64Array.from(v, x => Math.abs(x - med)), v.length);
+                for (const i of idx) val[i] = Math.max(med - 3 * mad, Math.min(med + 3 * mad, val[i]));
+            }
+        }
+        const dir = i => [S.dir[3 * i], S.dir[3 * i + 1], S.dir[3 * i + 2]];
+        // the coarse fit over direction cells
+        const nc = 300, cells = sphereDirections(nc), cellOf = new Uint16Array(m);
+        for (let i = 0; i < m; i++) {
+            const [x, y, z] = dir(i);
+            let best = 0, bd = -2;
+            for (let c = 0; c < nc; c++) {
+                const d = cells[c][0] * x + cells[c][1] * y + cells[c][2] * z;
+                if (d > bd) { bd = d; best = c; }
+            }
+            cellOf[i] = best;
+        }
+        const exc = new Float64Array(nc), used = new Float64Array(nc);
+        for (let li = 0; li < nl; li++) {
+            const lists = Array.from({ length: 2 * nc }, () => []);
+            for (let i = 0; i < m; i++) if (S.line[i] === li) lists[2 * cellOf[i] + S.core[i]].push(val[i]);
+            const ex = new Float64Array(nc).fill(NaN);
+            for (let c = 0; c < nc; c++) {
+                const side = lists[2 * c], core = lists[2 * c + 1];
+                if (core.length >= 5 && side.length >= 5) {
+                    ex[c] = medianOf(Float64Array.from(core), core.length) - medianOf(Float64Array.from(side), side.length);
+                }
+            }
+            const ok = [...ex.keys()].filter(c => ex[c] === ex[c]);
+            if (ok.length < 20) continue;
+            const mean = ok.reduce((s, c) => s + ex[c], 0) / ok.length;
+            const rms = Math.sqrt(ok.reduce((s, c) => s + (ex[c] - mean) ** 2, 0) / ok.length) || 1;
+            for (const c of ok) {
+                exc[c] += (ex[c] - mean) / rms;
+                used[c]++;
+            }
+        }
+        const good = [...used.keys()].filter(c => used[c] > 0);
+        if (good.length < 20) return null;
+        const y = Float64Array.from(good, c => exc[c] / used[c]);
+        const deg = 8, P = new Float64Array(deg + 1);
+        let axis = null, bestSS = Infinity;
+        for (const e of sphereDirections(4000)) {
+            if (e[2] < 0) continue;
+            const M = Array.from({ length: deg + 1 }, () => new Array(deg + 1).fill(0)), b = new Array(deg + 1).fill(0);
+            let yy = 0;
+            good.forEach((c, k) => {
+                const x = cells[c][0] * e[0] + cells[c][1] * e[1] + cells[c][2] * e[2];
+                P[0] = 1;
+                P[1] = x;
+                for (let n = 1; n < deg; n++) P[n + 1] = ((2 * n + 1) * x * P[n] - n * P[n - 1]) / (n + 1);
+                for (let i = 0; i <= deg; i++) {
+                    b[i] += P[i] * y[k];
+                    for (let j = 0; j <= i; j++) M[i][j] += P[i] * P[j];
+                }
+                yy += y[k] * y[k];
+            });
+            for (let i = 0; i <= deg; i++) for (let j = 0; j < i; j++) M[j][i] = M[i][j];
+            for (let i = 0; i <= deg; i++) M[i][i] += 1e-9 * (M[i][i] || 1);
+            const sol = solveSmall(M, b);
+            if (!sol) continue;
+            const ss = yy - sol.reduce((s, x, i) => s + x * b[i], 0);
+            if (ss < bestSS) {
+                bestSS = ss;
+                axis = e.slice();
+            }
+        }
+        if (!axis) return null;
+        // contrast of the excess in bins of a degree of the angle to an axis
+        const nb = 180, sums = new Float64Array(nl * nb * 2), cnts = new Float64Array(nl * nb * 2);
+        const contrast = e => {
+            sums.fill(0);
+            cnts.fill(0);
+            for (let i = 0; i < m; i++) {
+                const cz = S.dir[3 * i] * e[0] + S.dir[3 * i + 1] * e[1] + S.dir[3 * i + 2] * e[2];
+                const b = Math.min(nb - 1, Math.floor(Math.acos(Math.max(-1, Math.min(1, cz))) / Math.PI * nb));
+                const k = (S.line[i] * nb + b) * 2 + S.core[i];
+                sums[k] += val[i];
+                cnts[k]++;
+            }
+            let total = 0;
+            for (let li = 0; li < nl; li++) {
+                let sw = 0, swx = 0, swxx = 0;
+                for (let b = 0; b < nb; b++) {
+                    const k = (li * nb + b) * 2;
+                    if (cnts[k] < 5 || cnts[k + 1] < 5) continue;
+                    const ex = sums[k + 1] / cnts[k + 1] - sums[k] / cnts[k], w = cnts[k + 1];
+                    sw += w;
+                    swx += w * ex;
+                    swxx += w * ex * ex;
+                }
+                if (sw > 0) total += swxx / sw - (swx / sw) ** 2;
+            }
+            return total;
+        };
+        let e = axis, cur = contrast(e);
+        for (const deg of [2, 1, 0.5, 0.25, 0.12]) {
+            const st = deg * Math.PI / 180;
+            for (let moves = 0; moves < 40; moves++) {
+                const u1 = cross(e, Math.abs(e[0]) < 0.9 ? [1, 0, 0] : [0, 1, 0]), l1 = Math.hypot(...u1);
+                const a1 = u1.map(x => x / l1), a2 = cross(e, a1);
+                let moved = false;
+                for (const [p, q] of [[1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [1, -1], [-1, 1], [-1, -1]]) {
+                    const t = [0, 1, 2].map(c => e[c] + st * (p * a1[c] + q * a2[c])), lt = Math.hypot(...t);
+                    const cand = t.map(x => x / lt), cc = contrast(cand);
+                    if (cc > cur * (1 + 1e-9)) {
+                        e = cand;
+                        cur = cc;
+                        moved = true;
+                        break;
+                    }
+                }
+                if (!moved) break;
+            }
+        }
+        return e;
+    }
+
+    // Powder rings in data from a crystal turned about one axis depend on
+    // |Q| and on the angle to that axis (a detector pixel sees a ring at one
+    // angle to the axis whatever the turn, so detector edges and gaps, the
+    // resolution and the paths through the sample environment all follow
+    // it), and only smoothly on the azimuth about it. What a ring removal
+    // leaves at the lines, or the rings without one, is estimated on those
+    // coordinates: medians in bins of the angle to the axis (a degree) and
+    // of the width-normalized |Q| of the ring fit, band-passed along |Q| in
+    // Fourier space (what is broader than a few line widths - background,
+    // broad diffuse scattering - and the noise finer than a fraction of a
+    // width taken off) and smoothed over the angle, more widely where the
+    // bins hold few voxels; then the same over coarse cells of angle and
+    // azimuth for the low azimuthal orders. The medians leave out the
+    // voxels near the sample's Bragg positions (their diffuse clouds sit at
+    // the same |Q| when the lattices are alike) and the bins whose circle
+    // about the axis the edge of the grid cuts. A line is filtered when
+    // what is left on it stands out of the noise of the estimate and, after
+    // a ring removal, is less than half its ring; only the voxels within a
+    // few line widths of those lines change.
+    function stepFilterRings(model, step, ctx) {
+        needCell(ctx.cell, 'the ring filter');
+        const { lines, s0, r, voxelWidth } = ringLinesFor(model, step, ctx);
+        if (!lines.length) {
+            ctx.log('no rings of these materials to filter; nothing changed');
+            return model;
+        }
+        const Qm = qMatrix(ctx.cell), q0 = mulMV(Qm, model.corner), [qa, qb, qc] = model.vectors.map(u => mulMV(Qm, u));
+        const [nh, nk, nl] = model.dims, N = voxelCount(model), v = model.values, [va, vb, vc] = model.vectors, c0 = model.corner;
+        const qsteps = [qa, qb, qc].filter((_, a) => model.dims[a] > 1), flat = qsteps.length < 3;
+        const sum2 = qsteps.reduce((acc, q) => acc + dot(q, q), 0), svAvg = voxelWidth ? Math.sqrt(sum2 / 36) : 0;
+        const du = 0.25, W = step.window, uOf = q => (r > 0 ? Math.asinh(r * q / s0) / r : q / s0);
+        const lu = Float64Array.from(lines, x => uOf(x.q)), nlines = lines.length;
+        const wuMax = voxelWidth ? Math.sqrt(1 + sum2 / 12 / (s0 * s0)) : 1, reach = (W + 1) * wuMax + 3 * step.highPass;
+        const b0 = Math.max(0, Math.floor((lu[0] - reach) / du)), nbr = Math.ceil((lu[nlines - 1] + reach) / du) + 1 - b0;
+        // a voxel's distance to the nearest line, in its own line widths
+        // (the voxel's width along its direction added), as a window weight
+        const windowAt = (u, q, sv2) => {
+            let lo = 0, hi = nlines - 1;
+            while (lo < hi) {
+                const mid = (lo + hi) >> 1;
+                if (lu[mid] < u) lo = mid + 1; else hi = mid;
+            }
+            let d = Math.abs(u - lu[lo]);
+            if (lo > 0) d = Math.min(d, Math.abs(u - lu[lo - 1]));
+            d /= Math.sqrt(1 + sv2 / (s0 * s0 + r * r * q * q));
+            return d <= W ? 1 : d < W + 1 ? 0.5 * (1 + Math.cos(Math.PI * (d - W))) : 0;
+        };
+        const farFrom = (h, k, l) => {
+            if (!(step.bragg > 0)) return true;
+            const dh = h - Math.round(h), dk = k - Math.round(k), dl = l - Math.round(l);
+            return dh * dh + dk * dk + dl * dl > step.bragg * step.bragg;
+        };
+        const sv2Of = (x, y, z, q) => {
+            if (!voxelWidth) return 0;
+            let s = 0;
+            for (const t of qsteps) s += ((t[0] * x + t[1] * y + t[2] * z) / q) ** 2;
+            return s / 12;
+        };
+        // the strongest lines (up to three, apart), whose cores and sides
+        // tell the axis
+        const pick = [];
+        for (const x of lines.slice().sort((p, q) => Math.abs(q.height) - Math.abs(p.height))) {
+            const w = Math.hypot(svAvg, x.s);
+            if (pick.length < 3 && pick.every(p => Math.abs(p.q - x.q) > 6 * (p.w + w))) pick.push({ q: x.q, w });
+        }
+        const auto = String(step.axis).trim().toLowerCase() === 'auto' && !flat;
+        const samples = { dir: [], val: [], line: [], core: [], nlines: pick.length };
+        // first pass: count, and gather the samples for the axis
+        let nf = 0, nw = 0, j = 0;
+        for (let il = 0; il < nl; il++)
+            for (let ik = 0; ik < nk; ik++)
+                for (let ih = 0; ih < nh; ih++, j++) {
+                    const val = v[j];
+                    if (val !== val) continue;
+                    nf++;
+                    const x = q0[0] + ih * qa[0] + ik * qb[0] + il * qc[0];
+                    const y = q0[1] + ih * qa[1] + ik * qb[1] + il * qc[1];
+                    const z = q0[2] + ih * qa[2] + ik * qb[2] + il * qc[2];
+                    const q = Math.sqrt(x * x + y * y + z * z);
+                    if (!(q > 0)) continue;
+                    if (windowAt(uOf(q), q, sv2Of(x, y, z, q)) > 0) nw++;
+                    if (!auto) continue;
+                    for (let p = 0; p < pick.length; p++) {
+                        const d = Math.abs(q - pick[p].q), w = pick[p].w;
+                        if (d >= 5 * w || (d >= 0.7 * w && d <= 3 * w)) continue;
+                        if (!farFrom(c0[0] + ih * va[0] + ik * vb[0] + il * vc[0], c0[1] + ih * va[1] + ik * vb[1] + il * vc[1],
+                            c0[2] + ih * va[2] + ik * vb[2] + il * vc[2])) break;
+                        samples.dir.push(x / q, y / q, z / q);
+                        samples.val.push(val);
+                        samples.line.push(p);
+                        samples.core.push(d < 0.7 * w ? 1 : 0);
+                        break;
+                    }
+                }
+        // the axis: found, given (h k l, a direction in reciprocal space), or
+        // for a single layer its normal
+        let e = null;
+        const ubY = (() => {
+            try {
+                const t = mulMV(Qm, mulMV(invert3(model.ub), [0, 1, 0])), lt = Math.hypot(...t);
+                return lt > 0 ? t.map(x => x / lt) : null;
+            } catch (err) {
+                return null;
+            }
+        })();
+        if (flat) {
+            const nrm = cross(qsteps[0], qsteps[1] || (Math.abs(qsteps[0][0]) < 0.9 * Math.hypot(...qsteps[0]) ? [1, 0, 0] : [0, 1, 0]));
+            e = nrm.map(x => x / Math.hypot(...nrm));
+        } else if (auto) {
+            e = ringAxis({
+                dir: Float64Array.from(samples.dir), val: Float64Array.from(samples.val), line: Uint8Array.from(samples.line),
+                core: Uint8Array.from(samples.core), nlines: pick.length,
+            });
+            if (!e) {
+                e = ubY || mulMV(Qm, [0, 0, 1]).map((x, _, t) => x / Math.hypot(...t));
+                ctx.log(`too little of the rings to find the rotation axis; taken along ${ubY ? "the UB's y" : 'l'}`);
+            }
+        } else {
+            const hkl = (Array.isArray(step.axis) ? step.axis : String(step.axis).trim().split(/[\s,]+/)).map(Number);
+            const t = mulMV(Qm, hkl);
+            e = t.map(x => x / Math.hypot(...t));
+        }
+        if (!flat) {
+            const hkl = mulMV(invert3(Qm), e), big = Math.max(...hkl.map(Math.abs));
+            const angle = ubY ? Math.acos(Math.min(1, Math.abs(dot(e, ubY)))) * 180 / Math.PI : null;
+            ctx.log(`rotation axis along [${hkl.map(x => +(x / big).toFixed(3)).join(' ')}] (${auto ? 'found from the rings' : 'as given'})` +
+                (angle !== null ? `, ${angle.toFixed(2)}° from the y axis of the UB (the vertical goniometer axis of Mantid)` : ''));
+        }
+        const e1 = (() => {
+            const t = cross(e, Math.abs(e[0]) < 0.9 ? [1, 0, 0] : [0, 1, 0]), lt = Math.hypot(...t);
+            return t.map(x => x / lt);
+        })(), e2 = cross(e, e1);
+        // second pass: bins of every value, window of those near a line
+        const NT = Math.max(1, Math.round(180 / step.angleStep)), K = step.azimuth, NP = K > 0 ? Math.max(4, 4 * K) : 1, NZ = 24;
+        const fv = new Float64Array(nf), axKey = new Int32Array(nf).fill(-1), azKey = K > 0 ? new Int32Array(nf).fill(-1) : null;
+        const wi = new Int32Array(nw), wu = new Float32Array(nw), wt = new Float32Array(nw), wz = new Float32Array(nw);
+        const wphi = new Float32Array(nw), ww = new Float32Array(nw), wd = new Float32Array(nw);
+        let f = 0, w = 0;
+        j = 0;
+        for (let il = 0; il < nl; il++)
+            for (let ik = 0; ik < nk; ik++)
+                for (let ih = 0; ih < nh; ih++, j++) {
+                    const val = v[j];
+                    if (val !== val) continue;
+                    fv[f] = val;
+                    const x = q0[0] + ih * qa[0] + ik * qb[0] + il * qc[0];
+                    const y = q0[1] + ih * qa[1] + ik * qb[1] + il * qc[1];
+                    const z = q0[2] + ih * qa[2] + ik * qb[2] + il * qc[2];
+                    const q = Math.sqrt(x * x + y * y + z * z);
+                    if (!(q > 0)) {
+                        f++;
+                        continue;
+                    }
+                    const u = uOf(q), ub = Math.floor(u / du) - b0;
+                    const cz = Math.max(-1, Math.min(1, (x * e[0] + y * e[1] + z * e[2]) / q)), th = Math.acos(cz);
+                    const phi = Math.atan2(x * e2[0] + y * e2[1] + z * e2[2], x * e1[0] + y * e1[1] + z * e1[2]);
+                    if (ub >= 0 && ub < nbr && farFrom(c0[0] + ih * va[0] + ik * vb[0] + il * vc[0], c0[1] + ih * va[1] + ik * vb[1] + il * vc[1],
+                        c0[2] + ih * va[2] + ik * vb[2] + il * vc[2])) {
+                        axKey[f] = Math.min(NT - 1, Math.floor(th / Math.PI * NT)) * nbr + ub;
+                        if (azKey) {
+                            const iz = Math.min(NZ - 1, Math.floor((cz + 1) / 2 * NZ)), ip = Math.min(NP - 1, Math.floor((phi + Math.PI) / (2 * Math.PI) * NP));
+                            azKey[f] = (iz * NP + ip) * nbr + ub;
+                        }
+                    }
+                    const sv2 = sv2Of(x, y, z, q), wv = windowAt(u, q, sv2);
+                    if (wv > 0 && w < nw) {
+                        wd[w] = Math.sqrt(1 + sv2 / (s0 * s0 + r * r * q * q));
+                        wi[w] = f;
+                        wu[w] = u / du - 0.5 - b0;
+                        wt[w] = th / Math.PI * NT - 0.5;
+                        wz[w] = (cz + 1) / 2 * NZ - 0.5;
+                        wphi[w] = phi;
+                        ww[w] = wv;
+                        w++;
+                    }
+                    f++;
+                }
+        const axial = medianGroups(axKey, NT * nbr), azimuthal = azKey ? medianGroups(azKey, NZ * NP * nbr) : null;
+        const cellQ = Math.abs(det3([qa, qb, qc])) || 1;
+        const covered = lines.map((x, k) => {
+            if (flat) return 1;
+            const lo = Math.floor(uOf(Math.max(0, x.q - x.s)) / du) - b0, hi = Math.floor(uOf(x.q + x.s) / du) - b0;
+            let n = 0;
+            for (let t = 0; t < NT; t++) for (let b = Math.max(0, lo); b <= Math.min(nbr - 1, hi); b++) n += axial.start[t * nbr + b + 1] - axial.start[t * nbr + b];
+            return n / (4 * Math.PI * x.q * x.q * 2 * x.s / cellQ);
+        });
+        const lo = Math.min(...lines.map(x => x.q)), hi = Math.max(...lines.map(x => x.q));
+        ctx.log(`${nlines} lines, |Q| ${lo.toFixed(3)} to ${hi.toFixed(3)} 1/A; the estimate from ${axial.perm.length} voxels` +
+            (step.bragg > 0 ? ` away from the sample's Bragg positions (${step.bragg} r.l.u.)` : ''));
+        // the Fourier basis about the axis at the sector centres
+        const nbas = 1 + 2 * K, cent = Float64Array.from({ length: NP }, (_, p) => -Math.PI + (p + 0.5) * 2 * Math.PI / NP);
+        const basis = (m, ang) => (m === 0 ? 1 : m % 2 ? Math.cos(((m + 1) >> 1) * ang) : Math.sin((m >> 1) * ang));
+        const rms = [];
+        // a bin of angle and |Q| whose circle about the axis the edge of the
+        // grid cuts (a quarter or more of it outside) says nothing about a
+        // ring: its median is that of a few patches of the sample
+        const toIndex = invert3(mulMM(Qm, gridMatrix(model))), broad = new Uint8Array(NT * nbr);
+        for (let t = 0; t < NT; t++) {
+            const th = (t + 0.5) / NT * Math.PI, st = Math.sin(th), ct = Math.cos(th);
+            for (let b = 0; b < nbr; b++) {
+                const u = (b + b0 + 0.5) * du, q = r > 0 ? s0 / r * Math.sinh(r * u) : u * s0;
+                let inside = 0;
+                for (let p = 0; p < 32; p++) {
+                    const ph = (p + 0.5) / 32 * 2 * Math.PI, cp = Math.cos(ph) * st, sp = Math.sin(ph) * st;
+                    const x = q * (cp * e1[0] + sp * e2[0] + ct * e[0]) - q0[0], y = q * (cp * e1[1] + sp * e2[1] + ct * e[1]) - q0[1];
+                    const z = q * (cp * e1[2] + sp * e2[2] + ct * e[2]) - q0[2];
+                    let ok = true;
+                    for (let a = 0; a < 3 && ok; a++) {
+                        const ix = toIndex[a][0] * x + toIndex[a][1] * y + toIndex[a][2] * z;
+                        ok = ix > -0.5 && ix < model.dims[a] - 0.5;
+                    }
+                    if (ok) inside++;
+                }
+                broad[t * nbr + b] = inside >= 24 ? 1 : 0;
+            }
+        }
+        const axialTable = (half, least) => {
+            const am = groupMedians(axial, fv, least, half);
+            for (let g = 0; g < am.med.length; g++) {
+                if (!broad[g]) {
+                    am.med[g] = NaN;
+                    am.cnt[g] = 0;
+                }
+            }
+            const at = bandPassRows(am.med, am.cnt, NT, nbr, du, step.highPass, step.smooth);
+            smoothAcross(at.table, at.weight, NT, 1, nbr, 0.7, 16);
+            return at;
+        };
+        let kept = lines;
+        for (let pass = 0; pass < step.passes; pass++) {
+            // the part that depends on the angle to the axis only
+            const at = axialTable(undefined, 4);
+            if (pass === 0) {
+                // a line is filtered where what is left on it stands out of
+                // the estimate's noise (the same table from the two halves
+                // of the voxels, every other one, differs by that noise:
+                // count-weighted over the line's core, the power of the
+                // table must be 1.5 times that of the half difference),
+                // where a quarter of its shell or more is measured, and,
+                // after a ring removal, where what is left is less than
+                // half the ring taken off (more is the sample's own
+                // scattering at that |Q|: diffuse clouds round Bragg peaks
+                // of a lattice like the ring material's)
+                const ta = axialTable(0, 4), tb = axialTable(1, 4), doubtful = [];
+                kept = lines.filter((x, k) => {
+                    const half = 1.5 * Math.sqrt(1 + svAvg * svAvg / (s0 * s0 + r * r * x.q * x.q));
+                    const lo = Math.max(0, Math.ceil((lu[k] - half) / du - 0.5 - b0)), hi = Math.min(nbr - 1, Math.floor((lu[k] + half) / du - 0.5 - b0));
+                    let sig = 0, noise = 0, wsum = 0;
+                    for (let t = 0; t < NT; t++) {
+                        for (let b = lo; b <= hi; b++) {
+                            const i = t * nbr + b, wgt = at.weight[i];
+                            if (!wgt || !ta.weight[i] || !tb.weight[i]) continue;
+                            sig += wgt * at.table[i] * at.table[i];
+                            noise += wgt * 0.25 * (ta.table[i] - tb.table[i]) ** 2;
+                            wsum += wgt;
+                        }
+                    }
+                    if (!(sig > 1.5 * noise && sig > 0 && covered[k] >= 0.25)) return false;
+                    if (x.removed && Math.sqrt(Math.max(0, sig - noise) / wsum) > 0.5 * Math.abs(x.height)) {
+                        doubtful.push(x);
+                        return false;
+                    }
+                    return true;
+                });
+                if (doubtful.length) {
+                    ctx.log(`left alone, as more is left on them than half their ring (the sample's own scattering at that |Q|): ` +
+                        `|Q| ${doubtful.map(x => x.q.toFixed(3)).join(', ')}`);
+                }
+                if (!kept.length) {
+                    ctx.log('nothing left at the lines above the noise of the estimate; nothing changed');
+                    return model;
+                }
+                if (kept.length < lines.length) {
+                    ctx.log(`${kept.length} of the ${nlines} lines have more left on them than the estimate's noise ` +
+                        `(|Q| ${kept.map(x => x.q.toFixed(3)).join(', ')}); only these are filtered`);
+                    const ku = Float64Array.from(kept, x => uOf(x.q));
+                    for (let t = 0; t < nw; t++) {
+                        const u = (wu[t] + 0.5 + b0) * du;
+                        let d = Infinity;
+                        for (let k = 0; k < ku.length; k++) d = Math.min(d, Math.abs(u - ku[k]));
+                        d /= wd[t];
+                        ww[t] = d <= W ? 1 : d < W + 1 ? 0.5 * (1 + Math.cos(Math.PI * (d - W))) : 0;
+                    }
+                }
+            }
+            let s2 = 0, s2z = 0, nwk = 0;
+            for (let t = 0; t < nw; t++) {
+                if (!ww[t]) continue;
+                const corr = ww[t] * tableAt(at.table, NT, nbr, wt[t], wu[t]);
+                fv[wi[t]] -= corr;
+                s2 += corr * corr;
+                nwk++;
+            }
+            // the low azimuthal orders, on coarse cells of angle and azimuth
+            if (azimuthal) {
+                const zm = groupMedians(azimuthal, fv, 4);
+                const zt = bandPassRows(zm.med, zm.cnt, NZ * NP, nbr, du, step.highPass, step.smooth);
+                smoothAcross(zt.table, zt.weight, NZ, NP, nbr, 0.7, 16);
+                const coef = Array.from({ length: nbas }, () => new Float64Array(NZ * nbr));
+                for (let iz = 0; iz < NZ; iz++) {
+                    for (let b = 0; b < nbr; b++) {
+                        let filled = 0;
+                        for (let p = 0; p < NP; p++) if (zt.weight[(iz * NP + p) * nbr + b] > 0) filled++;
+                        if (filled < nbas) continue;
+                        const M = Array.from({ length: nbas }, () => new Array(nbas).fill(0)), rhs = new Array(nbas).fill(0);
+                        for (let p = 0; p < NP; p++) {
+                            const wgt = zt.weight[(iz * NP + p) * nbr + b];
+                            if (!wgt) continue;
+                            const y = zt.table[(iz * NP + p) * nbr + b];
+                            for (let a = 0; a < nbas; a++) {
+                                const fa = basis(a, cent[p]);
+                                rhs[a] += wgt * fa * y;
+                                for (let g = 0; g < nbas; g++) M[a][g] += wgt * fa * basis(g, cent[p]);
+                            }
+                        }
+                        for (let a = 0; a < nbas; a++) M[a][a] += 1e-9 * (M[a][a] || 1);
+                        const sol = solveSmall(M, rhs);
+                        if (sol) for (let a = 1; a < nbas; a++) coef[a][iz * nbr + b] = sol[a];
+                    }
+                }
+                for (let t = 0; t < nw; t++) {
+                    if (!ww[t]) continue;
+                    let corr = 0;
+                    for (let a = 1; a < nbas; a++) corr += basis(a, wphi[t]) * tableAt(coef[a], NZ, nbr, wz[t], wu[t]);
+                    corr *= ww[t];
+                    fv[wi[t]] -= corr;
+                    s2z += corr * corr;
+                }
+            }
+            rms.push(`${Math.sqrt(s2 / Math.max(1, nwk)).toPrecision(2)}` + (azimuthal ? ` + ${Math.sqrt(s2z / Math.max(1, nwk)).toPrecision(2)}` : ''));
+        }
+        let changed = 0;
+        for (let t = 0; t < nw; t++) if (ww[t]) changed++;
+        ctx.log(`${changed} voxels (${(100 * changed / Math.max(1, nf)).toFixed(1)} % of the data) changed; RMS correction per pass ` +
+            `(along the axis${azimuthal ? ' + azimuthal' : ''}): ${rms.join(', ')}`);
+        const values = copyValues(model);
+        f = 0;
+        for (let i = 0; i < N; i++) if (values[i] === values[i]) values[i] = fv[f++];
         return withValues(model, values);
     }
 
@@ -2807,7 +3436,7 @@ D|0.413048 0.294953 0.187491 0.080701 0.023736 15.56995 32.39847 5.711404 61.889
     // ------------------------------------------------------------------ recipe
 
     // Steps that act on hkl / |Q| and so need reciprocal-space data.
-    const RECIPROCAL_ONLY = new Set(['maskBragg', 'maskRings', 'backgroundFunction', 'backgroundShells', 'deltaPdf', 'removeRings',
+    const RECIPROCAL_ONLY = new Set(['maskBragg', 'maskRings', 'backgroundFunction', 'backgroundShells', 'deltaPdf', 'removeRings', 'filterRings',
         'backgroundDebyeWaller', 'correctUB', 'window', 'maskQ']);
 
     const STEPS = {
@@ -2833,6 +3462,13 @@ D|0.413048 0.294953 0.187491 0.080701 0.023736 15.56995 32.39847 5.711404 61.889
                 materials: 'any', temperature: 'nonnegative', radiation: 'radiation', intensities: 'ringIntensities', refine: 'fraction', fitWidth: 'boolean',
                 sigma0: 'nonnegative', resolution: 'nonnegative', width: 'positive', cutoff: 'positive', highPass: 'positive', sectors: 'sectors', coverage: 'fraction',
                 positive: 'boolean', voxelWidth: 'boolean', shift: 'fraction', maskSpots: 'boolean',
+            },
+        },
+        filterRings: {
+            run: stepFilterRings,
+            fields: {
+                materials: 'any', temperature: 'nonnegative', radiation: 'radiation', window: 'positive', highPass: 'positive', smooth: 'nonnegative',
+                axis: 'axisSpec', angleStep: 'angleStep', azimuth: 'azimuthOrder', bragg: 'nonnegative', passes: 'filterPasses',
             },
         },
         scale: { run: stepScale, fields: { factor: 'number', offset: 'number', positive: 'boolean' } },
@@ -2881,6 +3517,14 @@ D|0.413048 0.294953 0.187491 0.080701 0.023736 15.56995 32.39847 5.711404 61.889
             fraction: v => finite(v) && v >= 0 && v <= 1,
             radiation: v => ['auto', 'xray', 'neutron', 'electron'].includes(v),
             ringIntensities: v => v === 'structure' || v === 'free',
+            axisSpec: v => {
+                const t = Array.isArray(v) ? v : typeof v === 'string' && v.trim().toLowerCase() !== 'auto' ? v.trim().split(/[\s,]+/).map(Number) : null;
+                if (typeof v === 'string' && v.trim().toLowerCase() === 'auto') return true;
+                return !!t && t.length === 3 && t.every(finite) && t.some(x => x !== 0);
+            },
+            angleStep: v => finite(v) && v >= 0.1 && v <= 10,
+            azimuthOrder: v => Number.isInteger(v) && v >= 0 && v <= 4,
+            filterPasses: v => Number.isInteger(v) && v >= 1 && v <= 10,
             ubMode: v => v === 'refine' || v === 'matrix',
             despikeSize: v => v === 1 || v === 2,
             nonnegative: v => finite(v) && v >= 0,
@@ -2912,6 +3556,7 @@ D|0.413048 0.294953 0.187491 0.080701 0.023736 15.56995 32.39847 5.711404 61.889
                 }
                 if (raw.op === 'backgroundFunction') backgroundCurve(step.kind, step.params);
                 if (raw.op === 'removeRings' && String(step.materials).trim().toLowerCase() !== 'any') parseMaterials(step.materials);
+                if (raw.op === 'filterRings') parseMaterials(step.materials);
                 if (raw.op === 'backgroundDebyeWaller') {
                     const sites = parseSites(step.composition), uiso = parseUiso(step.uiso);
                     for (const site of sites) for (const sp of site.species) uiso(sp.atom);
@@ -2947,6 +3592,11 @@ D|0.413048 0.294953 0.187491 0.080701 0.023736 15.56995 32.39847 5.711404 61.889
                   `${step.refine > 0 ? `, lattice within ${+(100 * step.refine).toFixed(2)} %` : ''}${step.fitWidth ? ', widths fitted' : ''}` +
                   `${step.sectors > 1 ? `, ${step.sectors} direction sectors${step.shift > 0 ? ` shifting up to ${+(100 * step.shift).toFixed(2)} %` : ''}` : ''}` +
                   `${step.maskSpots ? ', spots on the rings masked' : ''})`;
+            case 'filterRings': return `Fourier filter at the powder lines of ${step.materials}: |Q| profiles over the angle to the rotation axis ` +
+                `(${String(step.axis).trim().toLowerCase() === 'auto' ? 'found from the rings' : `along ${Array.isArray(step.axis) ? step.axis.join(' ') : step.axis}`}` +
+                `, ${step.angleStep}° bins${step.azimuth > 0 ? `, azimuthal orders up to ${step.azimuth}` : ''}), band-passed from ${step.highPass} to ` +
+                `${step.smooth} line widths within ${step.window} widths of each line, ${step.passes} pass${step.passes === 1 ? '' : 'es'}` +
+                (step.bragg > 0 ? `; the sample's Bragg regions (${step.bragg} r.l.u.) left out of the estimate` : '');
             case 'maskQ': return `mask |Q| outside ${step.min === undefined || step.min === null ? 0 : step.min}..${step.max === undefined || step.max === null ? 'inf' : step.max} 1/A`;
             case 'despike': return step.k > 0
                 ? `despike: voxels beyond ${step.k} robust sigma of the median of their ${step.size === 2 ? '5 x 5 x 5' : '3 x 3 x 3'} neighbourhood take that median`
@@ -2980,7 +3630,10 @@ D|0.413048 0.294953 0.187491 0.080701 0.023736 15.56995 32.39847 5.711404 61.889
     // Returns the processed model; after a symmetrize step, model.symmetrized is
     // 'laue' (the unified data_type_symmetrized label) and model.laueGroup the group.
     async function applyRecipe(model, recipe, ctx) {
+        // memo: what a step leaves for later ones (a ring fit for the filter);
+        // a caller may pass one on from an earlier run
         ctx = Object.assign({ log: () => {} }, ctx);
+        ctx.memo = ctx.memo || {};
         const { steps } = normalizeRecipe(recipe);
         let current = model;
         for (let n = 0; n < steps.length; n++) {

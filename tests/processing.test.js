@@ -565,6 +565,105 @@ test('removeRings of materials: aluminium lines from the structure, fitted and t
     assert.throws(() => Processing.normalizeRecipe({ steps: [{ op: 'removeRings', materials: 'unobtainium' }] }), /unknown "unobtainium"/);
 });
 
+test('filterRings: what the ring fit leaves goes by a Fourier filter over the angle to the rotation axis; the sample stays', async () => {
+    // a cubic sample (a = 4.02) with Bragg peaks and diffuse clouds; aluminium
+    // rings whose strength follows the angle to a tilted axis (narrow bands
+    // as detector edges draw) with a line shape the fit cannot follow
+    const a = 4.02, st = 0.05, R = 2.5, n = Math.round(2 * R / st) + 1, aAl = 4.0494;
+    const axis = [0.16, 0.16, -0.97].map((x, _, t) => x / Math.hypot(...t));
+    const e1 = [0, -axis[2], axis[1]].map((x, _, t) => x / Math.hypot(...t));
+    const e2 = [axis[1] * e1[2] - axis[2] * e1[1], axis[2] * e1[0] - axis[0] * e1[2], axis[0] * e1[1] - axis[1] * e1[0]];
+    const lines = [[3, 0.15], [4, 0.08], [8, 0.06]].map(([m, h]) => ({ q: 2 * Math.PI * Math.sqrt(m) / aAl, h }));
+    const Qv = (h, k, l) => [h, k, l].map(x => 2 * Math.PI * x / a);
+    const ringAt = (h, k, l) => {
+        const [x, y, z] = Qv(h, k, l), q = Math.hypot(x, y, z);
+        if (!q) return 0;
+        const th = Math.acos((x * axis[0] + y * axis[1] + z * axis[2]) / q) * 180 / Math.PI;
+        const phi = Math.atan2(x * e2[0] + y * e2[1] + z * e2[2], x * e1[0] + y * e1[1] + z * e1[2]);
+        const g = 1 + 0.5 * Math.cos(2 * th * Math.PI / 180) + 0.8 * Math.exp(-0.5 * ((th - 50) / 1.5) ** 2) +
+            0.8 * Math.exp(-0.5 * ((th - 130) / 1.5) ** 2) + 0.1 * Math.cos(phi);
+        return lines.reduce((s, L) => {
+            const sg = 0.03 + 0.002 * L.q, d = q - L.q;
+            return s + L.h * g * Math.exp(-0.5 * (d / (d < 0 ? 1.35 * sg : 0.8 * sg)) ** 2);
+        }, 0);
+    };
+    const nearBragg = (h, k, l) => (h - Math.round(h)) ** 2 + (k - Math.round(k)) ** 2 + (l - Math.round(l)) ** 2 < 0.09;
+    let seed = 17;
+    const rnd = () => ((seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0) / 4294967296);
+    const sample = (h, k, l) => {
+        const d2 = (h - Math.round(h)) ** 2 + (k - Math.round(k)) ** 2 + (l - Math.round(l)) ** 2, q = Math.hypot(...Qv(h, k, l));
+        return 0.1 + 0.015 * q + ((Math.round(h) || Math.round(k) || Math.round(l)) ? 40 * Math.exp(-d2 / 0.0018) : 0) + 0.4 / (1 + d2 / 0.01);
+    };
+    const noise = new Float64Array(n * n * n).map(() => 0.02 * Math.sqrt(-2 * Math.log(rnd() + 1e-12)) * Math.cos(2 * Math.PI * rnd()));
+    let i = 0;
+    const truth = grid(R, st, (h, k, l) => sample(h, k, l) + noise[i++]);
+    i = 0;
+    const data = Object.assign(grid(R, st, (h, k, l) => sample(h, k, l) + ringAt(h, k, l) + noise[i++]), { radiation: 'neutron' });
+    const cell = cubic(a);
+    // what is left on a line, by 10 degrees of the angle to the axis, away
+    // from the sample's Bragg positions; and the mean change near them
+    const qOf = new Float64Array(n * n * n), binOf = new Int8Array(n * n * n);
+    forHkl(truth, (j, h, k, l) => {
+        const [x, y, z] = Qv(h, k, l), q = Math.hypot(x, y, z);
+        qOf[j] = q;
+        binOf[j] = nearBragg(h, k, l) ? -1 : q ? Math.min(17, Math.floor(Math.acos((x * axis[0] + y * axis[1] + z * axis[2]) / q) * 18 / Math.PI)) : 0;
+    });
+    const left = (m, L) => {
+        const bins = Array.from({ length: 18 }, () => []);
+        let near = 0, c = 0;
+        for (let j = 0; j < qOf.length; j++) {
+            if (Math.abs(qOf[j] - L.q) > 0.03) continue;
+            const d = m.values[j] - truth.values[j];
+            if (binOf[j] < 0) { near += d; c++; } else bins[binOf[j]].push(d);
+        }
+        const meds = bins.filter(b => b.length >= 15).map(b => b.sort((p, q) => p - q)[b.length >> 1]);
+        return { sys: Math.sqrt(meds.reduce((s, x) => s + x * x, 0) / meds.length), near: near / Math.max(1, c) };
+    };
+    // the ring fit once; the filter after it (in one recipe it finds the fit
+    // in the recipe's memo; here that is passed on)
+    const memo = {}, logs = [];
+    const fitted = await Processing.applyRecipe(data, { steps: [{ op: 'removeRings', materials: 'aluminium', voxelWidth: false }] }, { cell, memo });
+    const out = await Processing.applyRecipe(fitted, { steps: [{ op: 'filterRings', materials: 'aluminium' }] }, { cell, memo, log: t => logs.push(t) });
+    const text = logs.join('\n');
+    assert.match(text, /the lines of aluminium as the ring removal before fitted them/);
+    const found = /rotation axis along \[([-\d. ]+)\] \(found from the rings\)/.exec(text);
+    assert.ok(found, text);
+    const dir = found[1].trim().split(/\s+/).map(Number), cosang = Math.abs(dir.reduce((s, x, c) => s + x * axis[c], 0)) / Math.hypot(...dir);
+    assert.ok(cosang > Math.cos(2 * Math.PI / 180), `axis ${dir} vs ${axis}`);
+    for (const L of lines.slice(0, 2)) {
+        const before = left(data, L), model = left(fitted, L), after = left(out, L);
+        assert.ok(after.sys < 0.4 * model.sys && after.sys < 0.01, `|Q| ${L.q.toFixed(3)}: ${before.sys} -> ${model.sys} -> ${after.sys}`);
+        assert.ok(Math.abs(after.near) < 0.01, `near Bragg ${after.near}`);
+    }
+    // away from the lines nothing changes
+    let moved = 0;
+    for (let j = 0; j < qOf.length; j++) if (lines.every(L => Math.abs(qOf[j] - L.q) > 0.3) && out.values[j] !== fitted.values[j]) moved++;
+    assert.equal(moved, 0);
+    // along an axis given, it says so
+    const given = [];
+    await Processing.applyRecipe(fitted, { steps: [{ op: 'filterRings', materials: 'Al', axis: '0.16 0.16 -0.97', azimuth: 0, passes: 1 }] },
+        { cell, memo, log: t => given.push(t) });
+    assert.match(given.join('\n'), /rotation axis along \[[-\d. ]+\] \(as given\)/);
+    // alone, on a single layer (its normal the axis), it fits the lines
+    // itself and takes most of the rings
+    const layer = Object.assign(grid(R, st, (h, k) => 1 + ringAt(h, k, 0.5), [n, n, 1], [-R, -R, 0.5]), { radiation: 'neutron' });
+    const alone = [];
+    const flat = await Processing.applyRecipe(layer, { steps: [{ op: 'filterRings', materials: 'aluminium', highPass: 6 }] },
+        { cell, log: t => alone.push(t) });
+    assert.match(alone.join('\n'), /fitting the lines of aluminium/);
+    const onRing = m => {
+        let s = 0, c = 0;
+        forHkl(m, (j, h, k, l) => {
+            if (Math.abs(Math.hypot(...Qv(h, k, l)) - lines[0].q) < 0.02) { s += Math.abs(m.values[j] - 1); c++; }
+        });
+        return s / c;
+    };
+    assert.ok(onRing(flat) < 0.5 * onRing(layer), `${onRing(layer)} -> ${onRing(flat)}`);
+    for (const bad of [{ axis: '0 0 0' }, { azimuth: 5 }, { passes: 0 }, { angleStep: 20 }, { materials: 'any' }]) {
+        assert.throws(() => Processing.normalizeRecipe({ steps: [Object.assign({ op: 'filterRings' }, bad)] }), /invalid value|unknown "any"/);
+    }
+});
+
 test('backgroundDebyeWaller: Laue and thermal diffuse of a composition, scaled to the floor of the data', async () => {
     // neutrons, PbO2: count x b^2 (1 - exp(-Uiso Q^2)) per site
     const bPb = 0.9405, bO = 0.5803, Qof = (h, k, l) => 2 * Math.PI * Math.hypot(h, k, l) / 4;
