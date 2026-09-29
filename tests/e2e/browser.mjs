@@ -14,15 +14,17 @@ const require = createRequire(import.meta.url);
 const H = require('../helpers.js');
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 
+// CHROME, else the usual install folders (from the environment) and PATH.
 function findBrowser() {
-    const candidates = [
-        process.env.CHROME,
-        'C:/Program Files/Google/Chrome/Application/chrome.exe',
-        'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe',
-        '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
-        '/usr/bin/google-chrome', '/usr/bin/google-chrome-stable', '/usr/bin/chromium', '/usr/bin/chromium-browser',
-    ];
-    const found = candidates.find(p => p && fs.existsSync(p));
+    const env = process.env;
+    const installed = [env.PROGRAMFILES, env['PROGRAMFILES(X86)'], env.LOCALAPPDATA].filter(Boolean).flatMap(dir => [
+        path.join(dir, 'Google', 'Chrome', 'Application', 'chrome.exe'),
+        path.join(dir, 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
+    ]);
+    const names = ['google-chrome', 'google-chrome-stable', 'chromium', 'chromium-browser', 'microsoft-edge'];
+    const onPath = (env.PATH || '').split(path.delimiter).filter(Boolean)
+        .flatMap(dir => names.map(name => path.join(dir, name)));
+    const found = [env.CHROME, ...installed, ...onPath].find(p => p && fs.existsSync(p));
     if (!found) throw new Error('no Chrome/Edge found; set CHROME to the browser executable');
     return found;
 }
