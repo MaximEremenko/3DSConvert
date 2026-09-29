@@ -147,44 +147,53 @@ then browse to `http://localhost:8000/`.
 
 ## Usage
 
-1. **Data file**: select the diffuse data file (`.h5`, `.nxs`, `.nx5`,
-   `.dat`, or `.vtk`). The format, grid size, and stored cell are reported
-   in the log. For NeXus data kept in linked files, select all of them at
-   once; when a NeXus file holds several NXdata groups, pick one from the
-   list that appears. For a Scatty or Spinteract VTK whose grid axes are not
-   along a*, b*, c*, also load the program's config file as the grid config.
-2. **Unit cell**: some conversions need the parent (crystallographic) unit
-   cell, because the text and VTK formats do not store one, and some Yell
-   files store only the unit metric. Provide either
-   - a structure file: `.rmc6f` or unified structure `.h5`. For `.rmc6f`,
-     the parent cell is the supercell divided by its dimensions. In the
-     unified structure contract, `unit_cell_lengths` already stores the
-     basic/parent cell and is used directly; or
-   - the parent cell typed in directly (a, b, c in Angstrom; alpha, beta,
-     gamma in degrees).
-   When the data file already stores a real cell (for example RMCProfile
-   `_calc.h5` output), it is used automatically and this section can be left
-   empty.
-3. **Processing** (optional): add steps, or load a saved recipe; they run
-   in order when you convert (see Processing below).
-4. **Output**: pick the target format, optionally set the radiation metadata
-   for HDF5 output, and press "Convert & download". For HDF5 output you can
-   also choose
-   - the precision of the data array: the same as the input (float32 data
-     stay float32), float64, or float32;
-   - the unified layout: both `/scattering/data` and `/entry/data` (the
-     default), or `/entry/data` only, which halves the file;
-   - gzip compression, which is slower to write.
+The page is a workspace: four cards on the left (data, unit cell,
+processing, output), a preview and the log on the right, and a bar at the
+bottom with the output file name, progress, Cancel and **Convert &
+download**. The theme button switches between light and dark (the choice is
+remembered; by default the page follows the system).
 
-   The *|Q| profile* output writes the mean of the finite voxels in |Q|
-   shells of the chosen width, with the standard error of the mean and the
-   voxel count (`Q mean_I sigma_of_mean n_voxels`).
+1. **Data**: drop files anywhere on the page, or choose them. The format is
+   detected from the content; the card then shows the grid, its hkl range
+   and step, the precision and the share of measured voxels, and the
+   reader's notes. Dropped `.json` files load as recipes, `.rmc6f` files as
+   structures, and Scatty or Spinteract configs as the grid config. For
+   NeXus data kept in linked files, select or drop all of them at once;
+   when a NeXus file holds several NXdata groups, pick one from the list.
+   The grid config and the Yell data-space override sit under *More input
+   options*.
+2. **Unit cell**: choose where the parent (crystallographic) cell comes
+   from: the data file, a structure file (`.rmc6f`: the supercell divided by
+   its dimensions; a unified structure `.h5` stores the parent cell
+   directly) or manual entry (a, b, c in Angstrom; alpha, beta, gamma in
+   degrees). The card picks the data file's own cell when it has a real
+   one, and warns when a structure file's cell differs from it. The text
+   and VTK formats store no cell, and some Yell files store only the unit
+   metric; see the table below.
+3. **Processing** (optional): add steps, start from a preset, or load a
+   saved recipe. Each step opens to show its parameters, can be switched off
+   without losing them, moved and removed; see Processing below.
+4. **Output**: pick the format card; for HDF5 output, also the precision
+   (the same as the input, float64 or float32), the unified layout (both
+   `/scattering/data` and `/entry/data`, or `/entry/data` only, which
+   halves the file), gzip compression and the radiation metadata. Formats
+   that cannot hold the result (the text formats for a 3D-ΔPDF) are
+   disabled with the reason. The *|Q| profile* output writes the mean of the
+   finite voxels in |Q| shells of the chosen width, with the standard error
+   of the mean and the voxel count (`Q mean_I sigma_of_mean n_voxels`).
 
-   Text output (`.dat`, `.vtk`, profiles) is streamed directly to disk in
-   browsers that support the File System Access API (Chromium); elsewhere a
-   chunked in-memory download is used. The log reports the expected output
-   size first, and reading, processing and writing show progress and can be
-   cancelled.
+**Preview**: the planes of the grid as read, and after the recipe
+(*After recipe* runs it once; Convert then reuses the result). A slider
+moves through the planes; the colour scale is viridis on a log or linear
+robust range, blue–orange and centred on zero for a 3D-ΔPDF, and grey marks
+voxels without data. Pointing at the slice reads out its coordinates and
+value.
+
+Text output (`.dat`, `.vtk`, profiles) is streamed directly to disk in
+browsers that support the File System Access API (Chromium); elsewhere a
+chunked in-memory download is used. The log reports the expected output
+size first, and reading, processing and writing show progress and can be
+cancelled. The log can be copied or downloaded.
 
 ### Large files
 
@@ -294,7 +303,11 @@ in all files, so results are easy to compare.
 
 ## Repository layout
 
-- `index.html` — the browser app (UI); it starts the conversion worker.
+- `index.html`, `css/app.css`, `js/app.js` — the browser app: markup,
+  styles (light and dark themes) and the page logic, which starts the
+  conversion worker.
+- `css/fonts.css` — IBM Plex Sans and Mono embedded as data URIs (see
+  Third-party code); `tools/vendor-fonts.mjs` regenerates it.
 - `js/worker.js` — the conversion worker: file mounting, loading, conversion
   planning and output, driven by messages from the page.
 - `js/converter.js` — format readers/writers and the cell/reciprocal-space
@@ -365,6 +378,11 @@ distributed under the NIST and HDF5 license terms reproduced in
 [`js/h5wasm-LICENSE.txt`](js/h5wasm-LICENSE.txt). The only change is a
 wrapper: the bundle's code sits inside a function, `h5wasmModule()`, whose
 source text the page uses to start the HDF5 engine in its Web Worker.
+
+`css/fonts.css` embeds IBM Plex Sans and IBM Plex Mono (latin and greek
+subsets, from Google Fonts), because browsers do not load font files next
+to a page opened from `file://`. They are under the SIL Open Font License
+1.1, reproduced in [`fonts/IBM-Plex-OFL.txt`](fonts/IBM-Plex-OFL.txt).
 
 `js/wgpu_fft_web.js` is a build of the browser bindings of
 [wgpuFFT](https://github.com/MaximEremenko/wgpuFFT) (Apache-2.0), with the
