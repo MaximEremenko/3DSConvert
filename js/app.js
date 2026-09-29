@@ -279,6 +279,7 @@
   const KIND_LABEL = {
     yell: 'Yell 1.0', unified: 'Unified HDF5', 'mantid-md': 'Mantid MDHistoWorkspace', nexus: 'NeXus NXdata',
     dat: 'RMCProfile .dat', 'dat-hkl': 'RMCProfile .dat · hkl', 'dat-amp': 'RMCProfile amplitudes',
+    'dat-interf': 'RMCProfile interference function',
     vtk: 'VTK · Q', 'vtk-hkl': 'VTK · r.l.u.', hkl: 'hkl list', npz: 'NumPy .npz',
     'calc-dat': '3DSCalculator .dat', 'calc-json': '3DSCalculator .json', rspace3d: 'rspace3d (CrysAlisPro)',
   };
@@ -381,7 +382,7 @@
         $('nexusPick').hidden = false;
       }
       let info;
-      if (s.kind === 'dat' || s.kind === 'dat-amp' || s.kind === 'dat-hkl') {
+      if (s.kind === 'dat' || s.kind === 'dat-amp' || s.kind === 'dat-hkl' || s.kind === 'dat-interf') {
         info = `${KIND_LABEL[s.kind]} | grid ${s.dims.join(' x ')} in ${s.kind === 'dat-hkl' ? 'hkl' : 'Q'}`;
       } else if (s.kind === 'vtk') {
         info = `VTK STRUCTURED_POINTS in Q | grid ${s.dims.join(' x ')}`;

@@ -17,7 +17,7 @@ No installation, no server, and no upload: files never leave your computer.
 | Unified data format (HDF5) | yes | yes | RMCProfile, DiffuseCode/DISCUS |
 | Yell 1.0 (HDF5) | yes | yes | DISCUS, Yell, Meerkat |
 | RMCProfile old text format (`.dat`, `_hkl.dat`) | yes | yes | RMCProfile Diffuse3D |
-| RMCProfile amplitudes (`_aver_amp_calc.dat`, `_total_amp_calc.dat`) | yes | no | RMCProfile |
+| RMCProfile amplitudes (`_aver_amp_calc.dat`, `_total_amp_calc.dat`, `_aver_interf_calc.dat`) | yes | no | RMCProfile |
 | hkl list `h k l I σ` (`.txt`) | yes | yes | Spinteract (`_xtal_data_NN.txt`), Scatty (`scatty_data_01.txt`) |
 | VTK `STRUCTURED_POINTS` (`.vtk`, ASCII or binary) | yes | yes | Scatty, Spinteract, 3DSCalculator; also loads in ParaView |
 | VTK XML image data (`.vti`) | no | yes | ParaView 5.10+ (any grid, through its Direction matrix) |
@@ -81,8 +81,11 @@ and a CCP4/MRC map holds only them.
   of the parent cell. Files with several symmetry sections are read using
   the section 1 coordinates. RMCProfile's `*_calc.dat` output adds
   `scale offset` to the header; they are logged and the intensities are
-  kept as stored. Fortran `D` exponents are accepted, and a row may wrap
-  over several lines. Grid points missing from a file are read as NaN; when
+  kept as stored. Lines are read the way RMCProfile's Fortran reads them:
+  values may be apart by blanks or commas, whatever follows the values a
+  line needs is ignored (a comment after `npoints nsec`, an extra column),
+  and a row may wrap over several lines. Fortran `D` exponents are
+  accepted. Grid points missing from a file are read as NaN; when
   pixel (1,1,1) or its neighbours are among them, the grid geometry is
   fitted to all rows. On output, NaN or infinite intensities are written as
   0.0, which RMCProfile treats as a masked point (points with I = 0 are left
@@ -94,11 +97,17 @@ and a CCP4/MRC map holds only them.
 - **RMCProfile amplitudes** (`*_amp_calc.dat`, by name): rows of `i j k`, a
   Q triplet and `Re Im` per symmetry section, without a header. The value
   read is |A|² averaged over the sections; when the file holds several
-  `ipermutation` blocks, the first is used.
+  `ipermutation` blocks (a file starting with one is taken as amplitudes
+  whatever its name), the first is used. The interference function
+  (`*_interf_calc.dat`: the Q triplets, then one `Re Im` per point) is read
+  as |F|².
 - **hkl lists**: rows of `h k l I` and optionally `σ` (Spinteract
-  `_xtal_data`/`_xtal_fit`, Scatty `scatty_data_01.txt`/`_sc_list.txt`).
-  The grid is inferred from the rows (or taken from a Spinteract/Scatty
-  config loaded as the grid config, for rotated grids); grid points without
+  `_xtal_data`/`_xtal_fit`, Scatty `scatty_data_01.txt`/`_sc_list.txt`,
+  `*_intensity3d_rmc_*.dat` tables). A first line of column names
+  (`H K L Intensity`) is skipped. The grid is inferred from the rows (or
+  taken from a Spinteract/Scatty config loaded as the grid config, for
+  rotated grids); coordinates printed with few decimals (a 1/64 step as
+  `-1.984 -1.969 ...`) go to their nearest grid point. Grid points without
   a row become NaN. On output, masked voxels are left out, σ comes from the
   data (1 with a warning when there is none), rows with σ ≤ 1e-8 are left
   out (Scatty stops on them), and the log shows the matching `ORIGIN`

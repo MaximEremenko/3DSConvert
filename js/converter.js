@@ -1497,17 +1497,26 @@
         }
     }
 
+    // A decoder for text that starts with these bytes: UTF-16 by its byte
+    // order mark (Windows PowerShell writes it), else UTF-8.
+    function textDecoderFor(bytes) {
+        if (bytes && bytes.length >= 2 && bytes[0] === 0xff && bytes[1] === 0xfe) return new TextDecoder('utf-16le');
+        if (bytes && bytes.length >= 2 && bytes[0] === 0xfe && bytes[1] === 0xff) return new TextDecoder('utf-16be');
+        return new TextDecoder();
+    }
+    const decodeText = bytes => textDecoderFor(bytes).decode(bytes);
+
     // opts: { size (bytes, for progress), progress, tick } as for HDF5 reads.
     async function forEachStreamLine(stream, opts, onLine) {
         opts = opts || {};
         const reader = stream.getReader();
-        const decoder = new TextDecoder();
-        let carry = '', bytes = 0;
+        let decoder = null, carry = '', bytes = 0;
         try {
             for (;;) {
                 const { done, value } = await reader.read();
                 if (done) break;
                 bytes += value.byteLength;
+                if (!decoder) decoder = textDecoderFor(value);
                 const text = carry + decoder.decode(value, { stream: true });
                 let start = 0, end;
                 while ((end = text.indexOf('\n', start)) >= 0) {
@@ -1521,7 +1530,7 @@
                 if (opts.progress && opts.size) opts.progress(Math.min(1, bytes / opts.size));
                 if (opts.tick) await opts.tick();
             }
-            const rest = carry + decoder.decode();
+            const rest = carry + (decoder ? decoder.decode() : '');
             if (rest) onLine(rest);
         } catch (e) {
             try {
@@ -1555,18 +1564,31 @@
 
     // Header "npoints nsec" (experimental input) or "npoints nsec scale offset"
     // (RMCProfile *_calc.dat output), then rows "i j k (qx qy qz)*nsec I".
-    // Rows are read as a token stream, so a row may wrap over lines. The
+    // Lines are read as RMCProfile reads them (Fortran list-directed input):
+    // values apart by blanks or commas, what follows the values a line needs
+    // is left (text after the header's numbers, extra columns), and a short
+    // row continues on the next line. The
     // result keeps the geometry in cartesian Q: qCorner is Q at pixel
     // (1,1,1) and qVectors[axis] the Q step per pixel; toHklModel applies
     // the cell. Pixels missing from the file become NaN.
+    // The values on a line as Fortran list-directed input takes them: apart
+    // by blanks or commas, up to a slash.
+    function listValues(t) {
+        const slash = t.indexOf('/');
+        if (slash >= 0) t = t.slice(0, slash).trim();
+        return t.indexOf(',') >= 0 ? t.split(/[\s,]+/).filter(Boolean) : t.split(/\s+/);
+    }
+
     // opts.amplitudes: an RMCProfile _aver_amp_calc.dat / _total_amp_calc.dat
     // (no header; per row i j k, a Q triplet and Re Im per symmetry section):
     // the value is |A|^2 averaged over the sections, from the first
-    // permutation block. opts.frame 'hkl': the coordinates are hkl (the
+    // permutation block. With opts.interference too, an
+    // _aver_interf_calc.dat (a Q triplet per section, then one Re Im): the
+    // value is |F|^2. opts.frame 'hkl': the coordinates are hkl (the
     // _hkl.dat variant) rather than Q.
     function datParser(opts) {
         opts = opts || {};
-        const amplitudes = !!opts.amplitudes;
+        const amplitudes = !!opts.amplitudes, interference = amplitudes && !!opts.interference;
         let header = null, npoints = 0, perRow = 0, nsec = 0, nrows = 0, cap = 0, permutations = 0;
         let pix = null, vals = null, row = [];
         const ensure = n => {
@@ -1593,7 +1615,10 @@
             if (!(i >= 1 && j >= 1 && k >= 1)) throw new Error('pixel coordinates must be positive');
             const qx = num(tok[3]), qy = num(tok[4]), qz = num(tok[5]);
             pix[3 * nrows] = i; pix[3 * nrows + 1] = j; pix[3 * nrows + 2] = k;
-            if (amplitudes) {
+            if (interference) {
+                const re = num(tok[perRow - 2]), im = num(tok[perRow - 1]);
+                vals[nrows++] = re * re + im * im;
+            } else if (amplitudes) {
                 let sum = 0;
                 for (let s = 0; s < nsec; s++) {
                     const re = num(tok[3 + 3 * nsec + 2 * s]), im = num(tok[4 + 3 * nsec + 2 * s]);
@@ -1628,9 +1653,11 @@
                 if (permutations > 1) return;          // the first permutation only
                 const cols = t.split(/\s+/);
                 if (!perRow) {
-                    nsec = (cols.length - 3) / 5;
+                    nsec = interference ? (cols.length - 5) / 3 : (cols.length - 3) / 5;
                     if (!Number.isInteger(nsec) || nsec < 1) {
-                        throw new Error(`RMCProfile amplitude file: ${cols.length} columns is not i j k + 5 per symmetry section`);
+                        throw new Error(interference
+                            ? `RMCProfile interference file: ${cols.length} columns is not i j k + 3 per symmetry section + Re Im`
+                            : `RMCProfile amplitude file: ${cols.length} columns is not i j k + 5 per symmetry section`);
                     }
                     perRow = cols.length;
                     header = ['amplitudes'];
@@ -1639,36 +1666,46 @@
                 takeRow(cols);
                 return;
             }
-            const tokens = t.split(/\s+/);
+            const tokens = listValues(t);
             if (!header) {
-                if (tokens.length < 2 || tokens.length > 4 || tokens.some(s => !Number.isFinite(num(s)))) {
-                    throw new Error('old-format .dat: unrecognized header line (expected "npoints nsec" ' +
-                        'or "npoints nsec scale offset")');
+                const whole = s => /^[+-]?\d+$/.test(s);
+                if (tokens.length < 2 || !whole(tokens[0]) || !whole(tokens[1])) {
+                    const shown = t.length > 60 ? t.slice(0, 57) + '...' : t;
+                    throw new Error(`old-format .dat: unrecognized header line "${shown}" (RMCProfile's 3-D ` +
+                        'diffuse file starts with the whole numbers "npoints nsec", or "npoints nsec scale offset")');
                 }
                 header = tokens;
                 npoints = parseInt(tokens[0], 10);
                 nsec = parseInt(tokens[1], 10);
-                if (!(npoints > 0) || !(nsec >= 1)) throw new Error('bad npoints/nsec header');
+                if (!(npoints > 0) || !(nsec >= 1)) throw new Error(`bad npoints/nsec header: ${npoints} ${nsec}`);
                 perRow = 3 + 3 * nsec + 1;
                 pix = new Int32Array(3 * npoints);
                 vals = new Float64Array(npoints);
-                if (tokens.length > 2) {
-                    datHeader = { scale: num(tokens[2]), offset: tokens.length > 3 ? num(tokens[3]) : 0 };
+                const extra = [];
+                for (const s of tokens.slice(2, 4)) {
+                    if (!Number.isFinite(num(s))) break;
+                    extra.push(num(s));
+                }
+                if (extra.length) {
+                    datHeader = { scale: extra[0], offset: extra.length > 1 ? extra[1] : 0 };
                     notes.push(`RMCProfile calculation header: scale = ${datHeader.scale}, offset = ` +
                         `${datHeader.offset}; intensities are kept as stored`);
                 }
                 return;
             }
-            if (!row.length && tokens.length === perRow) {
+            // a row starts a line; values past the row are left, a short row
+            // takes the next line too
+            if (!row.length && tokens.length >= perRow) {
                 takeRow(tokens);
                 return;
             }
             for (const s of tokens) {
                 row.push(s);
-                if (row.length === perRow) {
-                    takeRow(row);
-                    row = [];
-                }
+                if (row.length === perRow) break;
+            }
+            if (row.length === perRow) {
+                takeRow(row);
+                row = [];
             }
         }
 
@@ -1695,7 +1732,10 @@
 
         function finish() {
             if (!header) throw new Error('old-format .dat: empty file');
-            if (amplitudes) {
+            if (interference) {
+                npoints = nrows;
+                notes.push('|F|^2 of the RMCProfile interference function');
+            } else if (amplitudes) {
                 npoints = nrows;
                 notes.push(`|A|^2 of RMCProfile amplitudes, averaged over ${nsec} symmetry section${nsec === 1 ? '' : 's'}` +
                     (permutations > 1 ? `; the first of ${permutations} permutations` : ''));
@@ -1840,6 +1880,7 @@
             const t = text.trim();
             if (!t || t[0] === '#' || t[0] === '!') return;
             const tok = t.split(/\s+/);
+            if (!n && isColumnNames(tok)) return;
             if (!ncol) {
                 ncol = tok.length;
                 if (ncol < 4) throw new Error(`hkl list: expected "h k l I [sigma]" rows, found ${ncol} columns`);
@@ -1878,11 +1919,17 @@
         return parser.finish();
     }
 
+    // A line of column names ("H K L Intensity", as pandas writes a table).
+    const isColumnNames = tok => tok.length >= 3 && tok.every(x => /^[A-Za-z_]/.test(x) && !/^nan$/i.test(x));
+
     // Whether text (the head of a file) looks like an hkl list: its first two
     // data rows are numbers, four or more of them, the same count in both
-    // (an old-format .dat starts with a 2- or 4-number header instead).
+    // (an old-format .dat starts with a 2- or 4-number header instead). A
+    // line of column names may come first.
     function isHklList(head) {
-        const rows = head.split(/\r?\n/).map(x => x.trim()).filter(x => x && x[0] !== '#' && x[0] !== '!').slice(0, 2);
+        let rows = head.split(/\r?\n/).map(x => x.trim()).filter(x => x && x[0] !== '#' && x[0] !== '!');
+        if (rows.length && isColumnNames(rows[0].split(/\s+/))) rows = rows.slice(1);
+        rows = rows.slice(0, 2);
         if (rows.length < 2) return false;
         const cols = rows.map(r => r.split(/\s+/));
         return cols[0].length >= 4 && cols[0].length === cols[1].length &&
@@ -1964,6 +2011,7 @@
     function hklListModel(list, grid) {
         const notes = [];
         let dims, corner, vectors;
+        const slack = [1e-3, 1e-3, 1e-3];            // how far off a grid point a row may be, in steps
         if (grid) {
             ({ dims, corner, vectors } = grid);
             notes.push('grid from the config');
@@ -1971,24 +2019,40 @@
             corner = [0, 0, 0];
             vectors = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
             dims = [1, 1, 1];
+            let rounded = 0;
             [list.h, list.k, list.l].forEach((col, c) => {
                 const seen = new Set();
                 for (let i = 0; i < col.length; i++) seen.add(Math.round(col[i] * 1e6));
                 const u = Array.from(seen).sort((a, b) => a - b).map(x => x / 1e6);
                 corner[c] = u[0];
                 if (u.length < 2) return;
-                let step = Infinity;
-                for (let i = 1; i < u.length; i++) step = Math.min(step, u[i] - u[i - 1]);
-                step = Math.round(step * 1e6) / 1e6;
-                const n = Math.round((u[u.length - 1] - u[0]) / step) + 1;
-                if (u.some(x => Math.abs((x - u[0]) / step - Math.round((x - u[0]) / step)) > 1e-3) || n > 20000) {
+                // Coordinates printed with few decimals (1/64 steps as 0.016,
+                // 0.015, ...) are off their grid points by up to half the last
+                // decimal: the step is the one near the smallest gap that puts
+                // every value that close to a grid point.
+                let r = 1;                                   // the last decimal the values show
+                while (r > 1e-6 && !u.every(x => Math.abs(x / r - Math.round(x / r)) < 1e-6)) r /= 10;
+                const span = u[u.length - 1] - u[0], tol = 0.5 * r * (1 + 1e-6) + 1e-9;
+                let gap = Infinity;
+                for (let i = 1; i < u.length; i++) gap = Math.min(gap, u[i] - u[i - 1]);
+                let n = 0;
+                const m0 = Math.max(1, Math.ceil(span / (gap + 2 * tol) - 1e-9)), m1 = Math.floor(span / Math.max(gap - 2 * tol, 1e-12) + 1e-9);
+                for (let m = m0; m <= Math.min(m1, 20000) && !n; m++) {
+                    const step = span / m, t = Math.min(tol, 0.25 * step);
+                    if (u.every(x => Math.abs(x - u[0] - Math.round((x - u[0]) / step) * step) <= t)) n = m + 1;
+                }
+                if (!n) {
                     throw new Error(`hkl list: the ${'hkl'[c]} values are not evenly spaced; the grid axes may not ` +
                         'run along h, k and l - load the Spinteract or Scatty config as the grid config');
                 }
+                const step = span / (n - 1);
+                if (u.some(x => Math.abs(x - u[0] - Math.round((x - u[0]) / step) * step) > 1e-6 * Math.max(1, Math.abs(x)))) rounded++;
                 dims[c] = n;
                 vectors[c][c] = step;
+                slack[c] = Math.max(1e-3, Math.min(tol, 0.25 * step) / step + 1e-6);
             });
-            notes.push('grid inferred from the hkl values (axes along h, k, l)');
+            notes.push('grid inferred from the hkl values (axes along h, k, l)' +
+                (rounded ? '; the coordinates are rounded, each row goes to its nearest grid point' : ''));
         }
         const total = dims[0] * dims[1] * dims[2];
         if (total > 5e8) throw new Error(`hkl list: the grid would hold ${total} points`);
@@ -2012,7 +2076,7 @@
             const d = [list.h[i] - corner[0], list.k[i] - corner[1], list.l[i] - corner[2]];
             const f = [0, 1, 2].map(r => Minv[r][0] * d[0] + Minv[r][1] * d[1] + Minv[r][2] * d[2]);
             const j = f.map(Math.round);
-            if (f.some((x, a) => Math.abs(x - j[a]) > 1e-3) || j.some((x, a) => x < 0 || x >= dims[a])) {
+            if (f.some((x, a) => Math.abs(x - j[a]) > slack[a]) || j.some((x, a) => x < 0 || x >= dims[a])) {
                 off++;
                 continue;
             }
@@ -3111,7 +3175,7 @@
         readMantidMD, readNexusData, nexusCandidates, unresolvedLinks, planLinkMounts, projectionVector,
         parseOldDat, readOldDatStream, writeOldDat, writeOldDatChunks, countNonFinite,
         isVtk, vtkFrame, parseGridConfig, parseVtk, readVtkStream, writeVtk, writeVtkChunks,
-        isHklList, parseHklList, readHklListStream, hklListModel, writeHklListChunks, hklConfigSnippet,
+        isHklList, parseHklList, readHklListStream, hklListModel, writeHklListChunks, hklConfigSnippet, decodeText,
         writeNpz, readNpz, writeVtiChunks, writeMrc, crc32, readVtkBinary, isBinaryVtk, readRspace3d, readSubhklCell,
         is3dsCalculatorDat, is3dsCalculatorJson, read3dsCalculatorJson,
         toHklModel, resolveCell, planConversion, checkWritable, estimateOutputBytes, outputDtype,

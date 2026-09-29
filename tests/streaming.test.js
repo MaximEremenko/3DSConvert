@@ -40,6 +40,13 @@ test('stream readers report progress, yield, and stop on cancellation', async ()
         e => e === cancel);
 });
 
+test('UTF-16 text (as Windows PowerShell writes it) reads like UTF-8', async () => {
+    const utf16 = Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(exampleDat, 'utf16le')]);
+    const grid = await Converter.readOldDatStream(new Blob([utf16]).stream());
+    sameGrid(Converter.toHklModel(grid, cell), Converter.parseOldDat(exampleDat, cell), 1e-12);
+    assert.equal(Converter.decodeText(new Uint8Array(utf16.subarray(0, 42))), exampleDat.slice(0, 20));
+});
+
 test('.dat rows may wrap over several lines', async () => {
     const lines = exampleDat.trim().split('\n');
     const wrapped = [lines[0], ...lines.slice(1).map(l => {

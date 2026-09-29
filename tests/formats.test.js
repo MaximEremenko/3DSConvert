@@ -62,7 +62,7 @@ test('hkl list: a rotated grid is sparse on h, k, l axes; its config gives the r
     const inferred = Converter.hklListModel(list);
     assert.deepEqual(inferred.dims, [4, 4, 3]);                  // right hkl for each point, most voxels empty
     assert.match(inferred.notes.join('\n'), /36 of 48 grid points have no row/);
-    assert.throws(() => Converter.hklListModel(Converter.parseHklList('0 0 0 1 1\n0.3 0 0 1 1\n0.5 0 0 1 1\n')), /not evenly spaced/);
+    assert.throws(() => Converter.hklListModel(Converter.parseHklList('0 0 0 1 1\n0.31 0 0 1 1\n0.5 0 0 1 1\n')), /not evenly spaced/);
     const cfg = Converter.parseGridConfig('ORIGIN 0 0 0\nX_AXIS 0.75 0.75 0 4\nY_AXIS 0 0 1 3\nZ_AXIS 0 0 0 1\n');
     const m = Converter.hklListModel(list, cfg.grids[0]);
     assert.deepEqual(m.dims, [4, 3, 1]);
@@ -74,6 +74,23 @@ test('hkl lists and old-format .dat files are told apart', () => {
     assert.equal(Converter.isHklList(readText('Examples/example_diffuse3d.dat')), false);
     assert.equal(Converter.isHklList('  -2.4  -3.0  -3.0   1.604   1.0\n  -2.36 -3.0 -3.0 1.412 1.0\n'), true);
     assert.throws(() => Converter.parseHklList('1 2 3 4 5\n1 2 3\n'), /row 2 has 3 columns/);
+});
+
+test('hkl list: a line of column names first; coordinates rounded to 3 decimals (1/64 steps)', () => {
+    // pandas' to_csv of an "H K L Intensity" table, l fastest, CRLF
+    const rows = ['H K L Intensity'];
+    for (let ih = 0; ih < 9; ih++) for (let ik = 0; ik < 2; ik++) for (let il = 0; il < 9; il++) {
+        rows.push([-2 + ih / 64, -2 + ik / 8, -2 + il / 64].map(x => x.toFixed(3)).join(' ') + ' ' +
+            (100 * ih + 10 * ik + il).toExponential(10));
+    }
+    const text = rows.join('\r\n') + '\r\n';
+    assert.match(text, /-1\.984 -2\.000 -1\.969 /);
+    assert.ok(Converter.isHklList(text));
+    const m = Converter.hklListModel(Converter.parseHklList(text));
+    assert.deepEqual([m.dims, m.corner, m.vectors], [[9, 2, 9], [-2, -2, -2], [[1 / 64, 0, 0], [0, 1 / 8, 0], [0, 0, 1 / 64]]]);
+    for (let il = 0; il < 9; il++) assert.equal(m.values[(il * 2 + 1) * 9 + 7], 710 + il);
+    assert.match(m.notes.join('\n'), /the coordinates are rounded/);
+    assert.doesNotMatch(m.notes.join('\n'), /no row/);
 });
 
 test('hkl list config snippets: Spinteract ORIGIN + full axes, Scatty CENTRE + half axes', () => {
@@ -106,6 +123,12 @@ test('RMCProfile amplitude files: |A|^2 averaged over the sections, first permut
     assert.deepEqual(Array.from(total.values), [13, 2.5]);
     assert.match(total.notes.join('\n'), /the first of 2 permutations/);
     await assert.rejects(Converter.readOldDatStream(streamOf('1 1 1 0 0 0 1\n'), { amplitudes: true }), /not i j k \+ 5 per/);
+    // _aver_interf_calc.dat: Q per section, then one complex value per point
+    const interf = await Converter.readOldDatStream(streamOf('1 1 1  0 0 0  0 0 0  3 4\n2 1 1  1 0 0  0 1 0  0 2\n'),
+        { amplitudes: true, interference: true });
+    assert.deepEqual(Array.from(interf.values), [25, 4]);
+    assert.equal(interf.nsecOriginal, 2);
+    assert.match(interf.notes.join('\n'), /interference function/);
 });
 
 test('old-format .dat in hkl coordinates, and with symmetry sections', async () => {

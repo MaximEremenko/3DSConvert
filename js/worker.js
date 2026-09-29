@@ -150,10 +150,14 @@ function converterWorker(self, h5wasm, Converter, Processing, wgpuFftWeb) {
     // or, for an hkl list (placed on opts.grid when a config gives one),
     // { kind, model }.
     async function readTextVolume(file, opts) {
-        const head = new TextDecoder().decode(await file.slice(0, 4096).arrayBuffer());
+        const head = Converter.decodeText(new Uint8Array(await file.slice(0, 4096).arrayBuffer()));
         // RMCProfile's amplitude files and the _hkl.dat variant go by their names.
-        if (/_amp_calc\.dat$/i.test(file.name)) {
+        if (/_amp_calc\.dat$/i.test(file.name) || /^\s*ipermutation\s*=/i.test(head)) {
             return { kind: 'dat-amp', grid: await Converter.readOldDatStream(file.stream(), Object.assign({ amplitudes: true }, opts)) };
+        }
+        if (/_interf_calc\.dat$/i.test(file.name)) {
+            const grid = await Converter.readOldDatStream(file.stream(), Object.assign({ amplitudes: true, interference: true }, opts));
+            return { kind: 'dat-interf', grid };
         }
         if (/_hkl\.dat$/i.test(file.name)) {
             return { kind: 'dat-hkl', grid: await Converter.readOldDatStream(file.stream(), Object.assign({ frame: 'hkl' }, opts)) };

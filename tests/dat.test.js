@@ -33,11 +33,21 @@ test('accepts Fortran D exponents and CRLF line ends', () => {
     assert.ok(maxAbsDiff(m.corner, example.corner) < 1e-12);
 });
 
-test('rejects an unrecognized header line', () => {
+test('reads the header and rows as RMCProfile does (Fortran list-directed input)', () => {
+    // values past the ones a line needs are left: text after the header, an extra column
+    const rows = exampleText.trim().split('\n').slice(1).map(l => l.trim() + '  0.5');
+    for (const header of ['125 1   ! npoints nsec', '125,1', '125 1 1.0 0.0 7']) {
+        const m = Converter.parseOldDat([header, ...rows].join('\n'), cell);
+        assert.equal(maxAbsDiff(m.values, example.values), 0, header);
+    }
+    assert.deepEqual(Converter.parseOldDat(replaceHeader(exampleText, '125 1 1.0 0.0 7'), cell).datHeader, { scale: 1, offset: 0 });
+});
+
+test('rejects an unrecognized header line, and shows it', () => {
     assert.throws(() => Converter.parseOldDat(replaceHeader(exampleText, 'npoints nsec'), cell),
-        /unrecognized header line/);
-    assert.throws(() => Converter.parseOldDat(replaceHeader(exampleText, '125 1 1.0 0.0 7'), cell),
-        /unrecognized header line/);
+        /unrecognized header line "npoints nsec"/);
+    assert.throws(() => Converter.parseOldDat(replaceHeader(exampleText, '1.25e2 1'), cell),
+        /unrecognized header line "1\.25e2 1"/);
 });
 
 test('writes NaN and infinite intensities as 0 (RMCProfile mask value)', async () => {
