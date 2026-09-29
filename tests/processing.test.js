@@ -184,8 +184,8 @@ test('symmetrize sums down the subgroup chain exactly as over every operation', 
     }
     const hex = grid(1, 0.5, (h, k, l) => h + 2 * k + 3 * l, [5, 5, 5]);
     for (const laue of ['6/mmm', '-3m1']) {
-        const a = await run(hex, [{ op: 'symmetrize', laue }]);
-        const b = await run(hex, [{ op: 'symmetrize', laue }], { symmetrizeEveryOperation: true });
+        const a = await run(hex, [{ op: 'symmetrize', laue, expand: false }]);
+        const b = await run(hex, [{ op: 'symmetrize', laue, expand: false }], { symmetrizeEveryOperation: true });
         assert.ok(maxAbsDiff(a.values, b.values) < 1e-12, laue);
     }
     assert.equal(Processing.laueChain('m-3m', 'reciprocal').reduce((s, r) => s + r.length, 0), 11);
@@ -352,8 +352,40 @@ test('the example files survive a crop-mask-symmetrize recipe', async () => {
         { op: 'maskBragg', shape: 'box', size: 0.01 },
         { op: 'symmetrize', laue: 'm-3m', mode: 'fill' },
     ] }, { cell });
-    assert.deepEqual(out.dims, [5, 5, 4]);
+    assert.deepEqual(out.dims, [5, 5, 5]);                 // l -0.5..1 extended to -1..1 by default
     assert.ok(Converter.countNonFinite(out.values) < out.values.length);
+    const kept = await Processing.applyRecipe(model, { steps: [
+        { op: 'crop', h: [-1, 1], k: [-1, 1], l: [-0.5, 1] },
+        { op: 'symmetrize', laue: 'm-3m', mode: 'fill', expand: false },
+    ] }, { cell });
+    assert.deepEqual(kept.dims, [5, 5, 4]);
+});
+
+test('symmetrize median and clip: a spike in one equivalent drops out; the grid extends by default', async () => {
+    // 9 x 9 x 9 around 0, symmetric under m-3m, with one spike
+    const m = grid(1, 0.25, (h, k, l) => 1 + h * h + k * k + l * l);
+    const at = (model, h, k, l) => {
+        const [nh, nk] = model.dims, f = [h, k, l].map((x, c) => Math.round((x - model.corner[c]) / model.vectors[c][c]));
+        return model.values[(f[2] * nk + f[1]) * nh + f[0]];
+    };
+    const spiked = Object.assign({}, m, { values: Float64Array.from(m.values) });
+    const i0 = (8 * 9 + 6) * 9 + 5;                                      // (0.25, 0.5, 1)
+    spiked.values[i0] = 1000;
+    const want = 1 + 0.0625 + 0.25 + 1;
+    const avg = await run(spiked, [{ op: 'symmetrize', laue: 'm-3m', mode: 'average' }]);
+    assert.ok(at(avg, 0.25, 0.5, 1) > want + 10, 'the mean spreads the spike');
+    for (const mode of ['median', 'clip']) {
+        const r = await run(spiked, [{ op: 'symmetrize', laue: 'm-3m', mode }]);
+        for (const p of [[0.25, 0.5, 1], [-1, 0.25, -0.5], [0.5, -1, 0.25]]) assert.ok(Math.abs(at(r, ...p) - want) < 1e-12, `${mode} ${p}`);
+        assert.equal(maxAbsDiff(r.values, m.values), 0, `${mode} keeps the symmetric data`);
+    }
+    // a half volume (h >= 0) comes back whole, holding the other half's values
+    const half = await run(m, [{ op: 'crop', h: [0, 1] }]);
+    const whole = await run(half, [{ op: 'symmetrize', laue: 'mmm' }]);
+    assert.deepEqual(whole.dims, [9, 9, 9]);
+    assert.equal(maxAbsDiff(whole.values, m.values), 0);
+    const robust = await run(half, [{ op: 'symmetrize', laue: 'mmm', mode: 'clip' }]);
+    assert.equal(maxAbsDiff(robust.values, m.values), 0);
 });
 
 // ---- smoothing, filling, powder lines, fitted scales, shifts

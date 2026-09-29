@@ -289,7 +289,7 @@
         backgroundShells: { percentile: 0, smooth: 0 },
         combine: { scale: 1 },
         clip: { below: 0, to: 0 },
-        symmetrize: { mode: 'average', expand: false },
+        symmetrize: { mode: 'average', expand: true, k: 3 },
         deltaPdf: { taper: 0, engine: 'cpu', fill: 0 },
         normalize: { background: '', backgroundNorm: '', scale: 1, fitScale: false, laue: 'none' },
     };
@@ -817,16 +817,22 @@
     }
 
     // Average over the Laue-equivalent grid points (NaN-aware). mode 'fill'
-    // keeps measured values and fills only NaN voxels. expand extends the
-    // grid to the symmetric images of its range (e.g. a half volume).
+    // keeps measured values and fills only NaN voxels; 'median' takes the
+    // median of the equivalents and 'clip' their mean without those more
+    // than k robust sigma (1.4826 x the median absolute deviation) from the
+    // median, so spikes and spurious peaks in one equivalent drop out.
+    // expand extends the grid to the symmetric images of its range (e.g. a
+    // half volume); a grid that already holds them stays as it is.
     // Direct-space data (a 3D-ΔPDF) use the operations on u, v, w. sigma
     // becomes that of the mean, sqrt(sum sigma^2) / n.
     async function stepSymmetrize(model, step, ctx) {
         const space = model.axesType === 'uvw' ? 'direct' : 'reciprocal';
         const src = model.values, sg = model.sigma;
         const N0 = src.length;
+        const extended = step.expand ? expandedGrid(model, step.laue, space, ctx) : null;
+        if (step.mode === 'median' || step.mode === 'clip') return robustSymmetrize(model, extended || model, step, space, ctx);
         let target = model, sum, cnt, q;
-        if (!step.expand) {
+        if (!extended) {
             const x0 = new Float64Array(N0), c0 = new Uint8Array(N0), q0 = sg ? new Float64Array(N0) : null;
             for (let i = 0; i < N0; i++) {
                 const x = src[i];
@@ -843,30 +849,8 @@
         } else {
             const ops = laueOperations(step.laue, space);
             const M = gridMatrix(model), Minv = invert3(M);
-            const maps0 = ops.map(G => gridAction(model, G, M, Minv));
-            const usable = maps0.filter(Boolean).length;
-            if (usable < ops.length) {
-                ctx.log(`${ops.length - usable} of the ${ops.length} operations do not map the grid onto itself and are skipped`);
-            }
-            // Bounding box (in grid indices) of the images of the grid corners.
-            const lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
-            ops.forEach((G, g) => {
-                if (!maps0[g]) return;
-                for (let a = 0; a < 8; a++) {
-                    const idx = [a & 1, (a >> 1) & 1, (a >> 2) & 1].map((bit, k) => bit * (model.dims[k] - 1));
-                    const p = mulMV(M, idx).map((x, c) => x + model.corner[c]);
-                    mulMV(Minv, mulMV(G, p).map((x, c) => x - model.corner[c])).forEach((x, k) => {
-                        lo[k] = Math.min(lo[k], Math.round(x));
-                        hi[k] = Math.max(hi[k], Math.round(x));
-                    });
-                }
-            });
-            const dims = [0, 1, 2].map(a => hi[a] - lo[a] + 1);
-            if (dims.some((n, a) => n > 4 * model.dims[a] + 1)) throw new Error('symmetrize: the expanded grid is unreasonably large');
-            const corner = [0, 1, 2].map(c => model.corner[c] + lo[0] * M[c][0] * (model.dims[0] > 1 ? 1 : 0) +
-                lo[1] * M[c][1] * (model.dims[1] > 1 ? 1 : 0) + lo[2] * M[c][2] * (model.dims[2] > 1 ? 1 : 0));
-            target = Object.assign({}, model, { dims, corner });
-            ctx.log(`grid extended from ${model.dims.join(' x ')} to ${dims.join(' x ')}`);
+            target = extended;
+            const dims = target.dims;
             const Nt = dims[0] * dims[1] * dims[2];
             sum = new Float64Array(Nt);
             cnt = new Int32Array(Nt);
@@ -917,6 +901,128 @@
                     }
                 }
         if (keep) ctx.log(`${filled} empty voxels filled`);
+        return withValues(target, out, { symmetrized: 'laue', laueGroup: step.laue, sigma: outSigma });
+    }
+
+    // The grid over the box of the images of this one under the group, or
+    // null when that box is the grid itself (nothing to extend).
+    function expandedGrid(model, laue, space, ctx) {
+        const ops = laueOperations(laue, space);
+        const M = gridMatrix(model), Minv = invert3(M);
+        const maps = ops.map(G => gridAction(model, G, M, Minv));
+        const usable = maps.filter(Boolean).length;
+        if (usable < ops.length) {
+            ctx.log(`${ops.length - usable} of the ${ops.length} operations do not map the grid onto itself and are skipped`);
+        }
+        // Bounding box (in grid indices) of the images of the grid corners.
+        const lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
+        ops.forEach((G, g) => {
+            if (!maps[g]) return;
+            for (let a = 0; a < 8; a++) {
+                const idx = [a & 1, (a >> 1) & 1, (a >> 2) & 1].map((bit, k) => bit * (model.dims[k] - 1));
+                const p = mulMV(M, idx).map((x, c) => x + model.corner[c]);
+                mulMV(Minv, mulMV(G, p).map((x, c) => x - model.corner[c])).forEach((x, k) => {
+                    lo[k] = Math.min(lo[k], Math.round(x));
+                    hi[k] = Math.max(hi[k], Math.round(x));
+                });
+            }
+        });
+        // a single layer stays one: images off its plane are left out
+        for (let a = 0; a < 3; a++) {
+            if (model.dims[a] <= 1) lo[a] = hi[a] = 0;
+        }
+        if (lo.every(x => x === 0) && hi.every((x, a) => x === model.dims[a] - 1)) return null;
+        const dims = [0, 1, 2].map(a => hi[a] - lo[a] + 1);
+        if (dims.some((n, a) => n > 4 * model.dims[a] + 1)) throw new Error('symmetrize: the expanded grid is unreasonably large');
+        const corner = [0, 1, 2].map(c => model.corner[c] + lo[0] * M[c][0] * (model.dims[0] > 1 ? 1 : 0) +
+            lo[1] * M[c][1] * (model.dims[1] > 1 ? 1 : 0) + lo[2] * M[c][2] * (model.dims[2] > 1 ? 1 : 0));
+        ctx.log(`grid extended from ${model.dims.join(' x ')} to ${dims.join(' x ')}`);
+        return Object.assign({}, model, {
+            dims, corner, vectors: model.vectors.map((v, a) => (dims[a] > 1 ? M.map(r => r[a]) : [0, 0, 0])),
+        });
+    }
+
+    // Median of the first n values of a (reordered in place).
+    function medianOf(a, n) {
+        const part = a.subarray(0, n).sort();
+        return n % 2 ? part[(n - 1) >> 1] : 0.5 * (part[n / 2 - 1] + part[n / 2]);
+    }
+
+    // mode 'median' or 'clip' of stepSymmetrize: orbit by orbit over the
+    // target grid (each set of equivalent voxels once, its members counted
+    // once each), from the values of the source grid.
+    async function robustSymmetrize(model, target, step, space, ctx) {
+        const ops = laueOperations(step.laue, space);
+        const M = gridMatrix(model), Minv = invert3(M);
+        const maps = ops.map(G => gridAction(target, G, M, Minv)).filter(Boolean);
+        const off = mulMV(Minv, target.corner.map((x, c) => x - model.corner[c])).map(Math.round);
+        const [th, tk, tl] = target.dims, [sh, sk, sl] = model.dims;
+        const Nt = th * tk * tl, src = model.values, sg = model.sigma;
+        const out = newValues(model, Nt), outSigma = sg ? newValues(model, Nt) : undefined;
+        const orbitOf = new Int32Array(Nt);          // 1 + the orbit's first voxel, once visited
+        const members = new Int32Array(maps.length), vals = new Float64Array(maps.length);
+        const vs = new Float64Array(maps.length), dev = new Float64Array(maps.length), s2 = new Float64Array(maps.length);
+        const k = step.k;
+        let dropped = 0, n = 0;
+        for (let jl = 0; jl < tl; jl++) {
+            for (let jk = 0; jk < tk; jk++) {
+                for (let jh = 0; jh < th; jh++, n++) {
+                    if (orbitOf[n]) continue;
+                    let m = 0, nv = 0;
+                    for (const { A, T } of maps) {
+                        const a = A[0][0] * jh + A[0][1] * jk + A[0][2] * jl + T[0];
+                        const b = A[1][0] * jh + A[1][1] * jk + A[1][2] * jl + T[1];
+                        const c = A[2][0] * jh + A[2][1] * jk + A[2][2] * jl + T[2];
+                        if (a < 0 || a >= th || b < 0 || b >= tk || c < 0 || c >= tl) continue;
+                        const t = (c * tk + b) * th + a;
+                        if (orbitOf[t] === n + 1) continue;
+                        orbitOf[t] = n + 1;
+                        members[m++] = t;
+                        const i0 = a + off[0], i1 = b + off[1], i2 = c + off[2];
+                        if (i0 < 0 || i0 >= sh || i1 < 0 || i1 >= sk || i2 < 0 || i2 >= sl) continue;
+                        const at = (i2 * sk + i1) * sh + i0, x = src[at];
+                        if (x === x) {
+                            vals[nv] = x;
+                            s2[nv] = sg ? sg[at] * sg[at] : 0;
+                            nv++;
+                        }
+                    }
+                    let value = NaN, sigma = NaN;
+                    if (nv) {
+                        vs.set(vals.subarray(0, nv));
+                        const med = medianOf(vs, nv);
+                        if (step.mode === 'median') {
+                            value = med;
+                            if (sg) {
+                                let q = 0;
+                                for (let i = 0; i < nv; i++) q += s2[i];
+                                sigma = 1.2533 * Math.sqrt(q) / nv;
+                            }
+                        } else {
+                            for (let i = 0; i < nv; i++) dev[i] = Math.abs(vals[i] - med);
+                            // most equal to the median: any other value is off
+                            const lim = k * 1.4826 * medianOf(dev, nv) || 1e-12 * Math.max(1, Math.abs(med));
+                            let sum = 0, q = 0, used = 0;
+                            for (let i = 0; i < nv; i++) {
+                                if (Math.abs(vals[i] - med) > lim) continue;
+                                sum += vals[i];
+                                q += s2[i];
+                                used++;
+                            }
+                            dropped += nv - used;
+                            value = sum / used;
+                            if (sg) sigma = Math.sqrt(q) / used;
+                        }
+                    }
+                    for (let i = 0; i < m; i++) {
+                        out[members[i]] = value;
+                        if (outSigma) outSigma[members[i]] = sigma;
+                    }
+                }
+            }
+            if (ctx.tick && jl % 8 === 7) await ctx.tick();
+        }
+        if (step.mode === 'clip') ctx.log(`${dropped} values beyond ${k} robust sigma of their equivalents left out`);
         return withValues(target, out, { symmetrized: 'laue', laueGroup: step.laue, sigma: outSigma });
     }
 
@@ -1224,7 +1330,7 @@
         backgroundShells: { run: stepBackgroundShells, fields: { width: 'positive', percentile: 'number', smooth: 'number' } },
         combine: { run: stepCombine, fields: { operation: 'string', file: 'string', scale: 'number' } },
         clip: { run: stepClip, fields: { below: 'number', to: 'clipTo' } },
-        symmetrize: { run: stepSymmetrize, fields: { laue: 'string', mode: 'string', expand: 'boolean' } },
+        symmetrize: { run: stepSymmetrize, fields: { laue: 'string', mode: 'symMode', expand: 'boolean', k: 'positive' } },
         deltaPdf: { run: stepDeltaPdf, fields: { taper: 'number', engine: 'engine', fill: 'passes' } },
         normalize: {
             run: stepNormalize,
@@ -1251,6 +1357,7 @@
             passes: v => Number.isInteger(v) && v >= 0 && v <= 50,
             'string?': v => v === undefined || v === null || typeof v === 'string',
             'laue?': v => v === 'none' || LAUE_GROUPS.includes(v),
+            symMode: v => ['average', 'fill', 'median', 'clip'].includes(v),
             any: v => v !== undefined,
         }[kind];
         if (!ok(value)) throw new Error(`${where}: invalid value ${JSON.stringify(value)}`);
@@ -1300,7 +1407,9 @@
             case 'backgroundShells': return `subtract background from |Q| shells of ${step.width} 1/A (${step.percentile ? step.percentile + 'th percentile' : 'minimum'}${step.smooth ? ', smoothed over ' + step.smooth : ''})`;
             case 'combine': return `${step.operation} "${step.file}"${step.scale !== 1 ? ' x ' + step.scale : ''}`;
             case 'clip': return `set values below ${step.below} to ${step.to}`;
-            case 'symmetrize': return `symmetrize with Laue group ${step.laue} (${step.mode}${step.expand ? ', extend the grid' : ''})`;
+            case 'symmetrize': return `symmetrize with Laue group ${step.laue} (` +
+                (step.mode === 'clip' ? `mean without values beyond ${step.k} robust sigma` : step.mode) +
+                `${step.expand ? ', extend the grid' : ''})`;
             case 'normalize': return `Σdata/Σnorm with "${step.norm}"` +
                 (step.background ? ` − ${step.fitScale ? 'fitted scale' : step.scale} × Σ"${step.background}"/Σ"${step.backgroundNorm}"` : '') +
                 (step.laue !== 'none' ? `, summed over ${step.laue}` : '');

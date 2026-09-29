@@ -930,7 +930,9 @@
       ['file', 'extra', 'volume'], ['scale', 'num', 'times']]],
     clip: ['Replace low values', [['below', 'num', 'below'], ['to', 'clipTo', 'with (a number or nan)']]],
     symmetrize: ['Symmetrize', [['laue', Processing.LAUE_GROUPS, 'Laue group'],
-      ['mode', ['average', 'fill'], 'average all, or fill empty voxels'], ['expand', 'bool', 'extend the grid']]],
+      ['mode', ['average', 'fill', 'median', 'clip'], 'average all · fill empty voxels · median · mean without outliers'],
+      ['k', 'num', 'clip: leave out equivalents beyond k robust σ'],
+      ['expand', 'bool', 'extend the grid to the symmetric range (a half volume becomes whole)']]],
     deltaPdf: ['3D-ΔPDF', [['taper', 'num', 'Tukey taper (0–1)'], ['engine', ['cpu', 'gpu'], 'FFT on (CPU float64, GPU float32)'],
       ['fill', 'num', 'fill holes, voxels deep (0 = count them as 0)']]],
   };
@@ -951,13 +953,13 @@
     scale: { factor: 1, offset: 0, positive: false }, backgroundFunction: { kind: 'constant', params: [0] },
     smooth: { sigma: 0.5 }, fill: { passes: 2 },
     backgroundShells: { width: 0.05, percentile: 5, smooth: 1 }, combine: { operation: 'subtract', scale: 1 },
-    clip: { below: 0, to: 0 }, symmetrize: { laue: 'm-3m', mode: 'average', expand: false },
+    clip: { below: 0, to: 0 }, symmetrize: { laue: 'm-3m', mode: 'average', k: 3, expand: true },
     deltaPdf: { taper: 0, engine: 'cpu', fill: 0 },
     normalize: { background: '', backgroundNorm: '', scale: 1, fitScale: false, laue: 'none' },
   };
   const PRESETS = [
     { name: '3D-ΔPDF of a cubic crystal', note: 'm-3m symmetrize · Bragg mask · ΔPDF', steps: [
-      { op: 'symmetrize', laue: 'm-3m', mode: 'average', expand: false },
+      { op: 'symmetrize', laue: 'm-3m', mode: 'average', k: 3, expand: true },
       { op: 'maskBragg', shape: 'box', size: 0.2, centring: 'P' }, { op: 'deltaPdf', taper: 0, engine: 'cpu' }] },
     { name: 'Subtract a background volume', note: 'load it under Other volumes', steps: [
       { op: 'combine', operation: 'subtract', scale: 1 }] },
