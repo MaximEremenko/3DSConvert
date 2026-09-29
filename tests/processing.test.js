@@ -475,7 +475,7 @@ test('removeRings: sharp rings go by Fourier filtering of the |Q| profile, the d
     const ringed = grid(2, st, (h, k, l) => 10 + Qof(h, k, l) + 3 * Math.cos(Math.PI * h) * Math.cos(Math.PI * k) +
         ring(Qof(h, k, l)) + (rnd() - 0.5), [n, n, n]);
     const logs = [];
-    const out = await run(ringed, [{ op: 'removeRings', width: 0.005, cutoff: 0.05 }], { log: t => logs.push(t) });
+    const out = await run(ringed, [{ op: 'removeRings', materials: 'any', width: 0.005, cutoff: 0.05 }], { log: t => logs.push(t) });
     assert.match(logs.join(' '), /sharpest rings at \|Q\| 2\.00/);
     const excess = (m, lo, hi) => {
         let s = 0, c = 0;
@@ -488,9 +488,62 @@ test('removeRings: sharp rings go by Fourier filtering of the |Q| profile, the d
     assert.ok(excess(ringed, 1.99, 2.01) > 25);
     assert.ok(Math.abs(excess(out, 1.99, 2.01)) < 0.1 * excess(ringed, 1.99, 2.01), 'the ring is gone');
     assert.ok(Math.abs(excess(out, 2.4, 3)) < 0.1, 'the rest stays');
-    // only near the lines of a named powder: aluminium has none at 2.00 1/A
-    const kept = await run(ringed, [{ op: 'removeRings', width: 0.005, cutoff: 0.05, powder: 'aluminium', near: 0.03 }]);
+    // a named material takes only its own lines: aluminium has none at 2.00 1/A
+    const named = [];
+    const kept = await run(Object.assign({}, ringed, { radiation: 'neutron' }), [{ op: 'removeRings', materials: 'aluminium' }],
+        { log: t => named.push(t) });
     assert.ok(excess(kept, 1.99, 2.01) > 25);
+    assert.match(named.join(' '), /aluminium: no clear lines/);
+});
+
+test('removeRings of materials: aluminium lines from the structure, fitted and taken off; others left out', async () => {
+    // neutron lines of fcc aluminium, 0.3 % larger than listed, widths sqrt(0.006^2 + (0.004 Q)^2)
+    const aAl = 4.0495 * 1.003, b = 0.3449, B = 0.85, lines = [];
+    for (let h = 0; h <= 8; h++) for (let k = 0; k <= h; k++) for (let l = 0; l <= k; l++) {
+        if (!(h % 2 === k % 2 && k % 2 === l % 2) || !(h + k + l)) continue;
+        const q = 2 * Math.PI * Math.hypot(h, k, l) / aAl, images = new Set();
+        for (const [x, y, z] of [[h, k, l], [h, l, k], [k, h, l], [k, l, h], [l, h, k], [l, k, h]])
+            for (const sx of [1, -1]) for (const sy of [1, -1]) for (const sz of [1, -1]) images.add([sx * x, sy * y, sz * z].join());
+        lines.push([q, images.size * 16 * b * b * Math.exp(-2 * B * (q / (4 * Math.PI)) ** 2) / (4 * Math.PI * q * q)]);
+    }
+    const rings = q => lines.reduce((sum, [c, w]) => {
+        const sg = Math.hypot(0.006, 0.004 * c);
+        return sum + 40 * w * Math.exp(-0.5 * ((q - c) / sg) ** 2) / (sg * Math.sqrt(2 * Math.PI));
+    }, 0);
+    const a = 5, Qof = (h, k, l) => 2 * Math.PI * Math.hypot(h, k, l) / a;
+    let seed = 5;
+    const rnd = () => ((seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0) / 4294967296);
+    const smooth = (h, k, l) => 10 + Qof(h, k, l) + 4 * Math.cos(Math.PI * h) * Math.cos(Math.PI * k);
+    const clean = grid(3, 0.1, smooth);
+    const data = Object.assign(grid(3, 0.1, (h, k, l) => smooth(h, k, l) + rings(Qof(h, k, l)) + 0.5 * (rnd() - 0.5)), { radiation: 'neutron' });
+    const cell = { lengths: [a, a, a], angles: [90, 90, 90] };
+    const near = m => {
+        let s = 0, c = 0;
+        forHkl(m, (i, h, k, l) => {
+            if (rings(Qof(h, k, l)) > 1) { s += Math.abs(m.values[i] - clean.values[i]); c++; }
+        });
+        return s / c;
+    };
+    const logs = [];
+    const out = await Processing.applyRecipe(data, { steps: [{ op: 'removeRings', materials: 'aluminium, copper, ice' }] },
+        { cell, log: t => logs.push(t) });
+    const text = logs.join('\n');
+    const fitted = /aluminium: a = ([\d.]+) A/.exec(text);
+    assert.ok(fitted && Math.abs(Number(fitted[1]) / aAl - 1) < 5e-4, text);
+    assert.match(text, /copper: no clear lines/);
+    assert.match(text, /ice: no clear lines/);
+    assert.ok(near(data) > 20 && near(out) < 0.05 * near(data), `${near(data)} -> ${near(out)}`);
+    let far = 0, n = 0;
+    forHkl(out, (i, h, k, l) => {
+        if (rings(Qof(h, k, l)) < 0.01) { far += Math.abs(out.values[i] - clean.values[i]); n++; }
+    });
+    assert.ok(far / n < 0.2, `away from the lines ${far / n}`);
+    // each line an intensity of its own does the same
+    const free = await Processing.applyRecipe(data, { steps: [{ op: 'removeRings', materials: 'Al', intensities: 'free' }] }, { cell });
+    assert.ok(near(free) < 0.08 * near(data));
+    // a custom material, and unknown ones refused
+    assert.equal(Processing.normalizeRecipe({ steps: [{ op: 'removeRings', materials: 'hcp Ti 2.95 4.69, aluminium 4.03' }] }).steps.length, 1);
+    assert.throws(() => Processing.normalizeRecipe({ steps: [{ op: 'removeRings', materials: 'unobtainium' }] }), /unknown "unobtainium"/);
 });
 
 test('backgroundDebyeWaller: Laue and thermal diffuse of a composition, scaled to the floor of the data', async () => {

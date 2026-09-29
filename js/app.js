@@ -914,11 +914,16 @@
       ['width', 'num', 'half-width (Å⁻¹)']]],
     maskRange: ['Mask a value range', [['min', 'num?', 'keep from'], ['max', 'num?', 'keep up to']]],
     maskQ: ['Mask a |Q| range', [['min', 'num?', 'keep from |Q| (Å⁻¹)'], ['max', 'num?', 'keep up to |Q| (Å⁻¹)']]],
-    removeRings: ['Remove rings (Fourier filter)', [['cutoff', 'num', 'remove what is sharper in |Q| than (Å⁻¹)'],
-      ['width', 'num', '|Q| profile bin (Å⁻¹)'], ['sectors', 'num', 'direction sectors (1 = whole shells)'],
-      ['coverage', 'num', 'judge only shells covered at least this much (0–1)'],
-      ['powder', ['none', 'aluminium', 'copper', 'vanadium'], 'only near the lines of'], ['a', 'num?', 'its lattice parameter (Å; blank: room temperature)'],
-      ['near', 'num', 'within (Å⁻¹; 0 = twice the cutoff)'], ['positive', 'bool', 'only excess intensity (rings add, never take away)']]],
+    removeRings: ['Remove powder rings', [
+      ['materials', 'text', 'materials: aluminium, copper, vanadium, niobium, titanium, ice, … or fcc Al 4.05 · any: every sharp ring'],
+      ['radiation', ['auto', 'xray', 'neutron', 'electron'], 'radiation for the line intensities (auto: the data’s)'],
+      ['intensities', ['structure', 'free'], 'line intensities from the structure factors, or each line its own'],
+      ['refine', 'num', 'refine the lattice parameter within ± (fraction, e.g. 0.01)'], ['fitWidth', 'bool', 'fit the line widths'],
+      ['sigma0', 'num', 'line width: constant part σ₀ (Å⁻¹)'], ['resolution', 'num', 'line width: part growing with |Q|, σ/Q'],
+      ['highPass', 'num', 'Fourier high-pass: broader than this many line widths is background'],
+      ['sectors', 'num', 'direction sectors (1 = whole shells)'], ['coverage', 'num', 'judge only shells covered at least this much (0–1)'],
+      ['cutoff', 'num', 'any: remove what is sharper in |Q| than (Å⁻¹)'], ['width', 'num', 'any: |Q| profile bin (Å⁻¹)'],
+      ['positive', 'bool', 'any: only excess intensity (rings add, never take away)']]],
     backgroundDebyeWaller: ['Background: Laue + thermal (Debye–Waller)', [
       ['composition', 'text', 'sites, e.g. Pb; Mg 0.333 + Nb 0.667; 3*O'], ['uiso', 'text', 'Uiso (Å²): one value, or e.g. 0.01, Pb 0.03'],
       ['radiation', ['auto', 'xray', 'neutron', 'electron'], 'radiation (auto: the data’s)'],
@@ -976,7 +981,9 @@
     clip: { below: 0, to: 0 }, symmetrize: { laue: 'm-3m', mode: 'average', k: 3, expand: true },
     deltaPdf: { taper: 0, engine: 'cpu', fill: 0 },
     normalize: { background: '', backgroundNorm: '', scale: 1, fitScale: false, laue: 'none' },
-    maskQ: { min: 0.3 }, removeRings: { cutoff: 0.05, width: 0.005, sectors: 1, coverage: 0.25, powder: 'none', near: 0, positive: true },
+    maskQ: { min: 0.3 },
+    removeRings: { materials: 'aluminium', radiation: 'auto', intensities: 'free', refine: 0.01, fitWidth: true, sigma0: 0.005,
+      resolution: 0.004, highPass: 6, sectors: 8, coverage: 0.25, cutoff: 0.05, width: 0.005, positive: true },
     backgroundDebyeWaller: { composition: '', uiso: '0.01', radiation: 'auto', fit: true, percentile: 5, width: 0.05, offset: false, scale: 1 },
     correctUB: { mode: 'refine', centring: 'P', radius: 0.25, snr: 10, peaks: 300, shift: false, ub: [], ubNew: [] },
     despike: { size: 1, k: 5 }, window: { kind: 'lorch', qmax: 0 },
@@ -985,8 +992,9 @@
     { name: '3D-ΔPDF of a cubic crystal', note: 'm-3m symmetrize · Bragg mask · ΔPDF', steps: [
       { op: 'symmetrize', laue: 'm-3m', mode: 'average', k: 3, expand: true },
       { op: 'maskBragg', shape: 'box', size: 0.2, centring: 'P' }, { op: 'deltaPdf', taper: 0, engine: 'cpu' }] },
-    { name: 'Clean up a volume', note: 'despike · remove rings · symmetrize without outliers', steps: [
-      { op: 'despike', size: 1, k: 5 }, { op: 'removeRings', cutoff: 0.05, width: 0.005, sectors: 1, coverage: 0.25, powder: 'none', near: 0, positive: true },
+    { name: 'Clean up a volume', note: 'despike · aluminium rings · symmetrize without outliers', steps: [
+      { op: 'despike', size: 1, k: 5 }, { op: 'removeRings', materials: 'aluminium', radiation: 'auto', intensities: 'free', refine: 0.01,
+        fitWidth: true, sigma0: 0.005, resolution: 0.004, highPass: 6, sectors: 8, coverage: 0.25, cutoff: 0.05, width: 0.005, positive: true },
       { op: 'symmetrize', laue: 'm-3m', mode: 'clip', k: 3, expand: true }] },
     { name: 'Subtract a background volume', note: 'load it under Other volumes', steps: [
       { op: 'combine', operation: 'subtract', scale: 1 }] },

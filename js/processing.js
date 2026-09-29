@@ -290,7 +290,10 @@
         combine: { scale: 1 },
         clip: { below: 0, to: 0 },
         symmetrize: { mode: 'average', expand: true, k: 3 },
-        removeRings: { width: 0.005, cutoff: 0.05, sectors: 1, coverage: 0.25, positive: true, powder: 'none', near: 0 },
+        removeRings: {
+            materials: 'aluminium', radiation: 'auto', intensities: 'free', refine: 0.01, fitWidth: true, sigma0: 0.005, resolution: 0.004,
+            width: 0.005, cutoff: 0.05, highPass: 6, sectors: 8, coverage: 0.25, positive: true,
+        },
         backgroundDebyeWaller: { radiation: 'auto', uiso: '0.01', fit: true, scale: 1, offset: false, percentile: 5, width: 0.05 },
         correctUB: { mode: 'refine', centring: 'P', radius: 0.25, snr: 10, peaks: 300, shift: false },
         despike: { size: 1, k: 5 },
@@ -675,18 +678,19 @@
         return out;
     }
 
-    // Powder rings removed by Fourier filtering of the |Q| profile: the
-    // median of every |Q| bin (per direction sector when sectors > 1) is
-    // split into a smooth part and what is sharper than `cutoff` (1/A) by a
-    // Gaussian low-pass in Fourier space, run again on the profile clipped
-    // to that smooth part until it passes under the rings. The sharp,
-    // positive remainder - the rings - is subtracted from every voxel at
-    // that |Q|; anisotropic diffuse scattering is untouched. With a powder,
-    // only near its lines (within `near` 1/A).
-    function stepRemoveRings(model, step, ctx) {
-        needCell(ctx.cell, 'ring removal');
+    // |Q| of every voxel, its direction sector and |Q| bin (-1 when empty),
+    // and per (sector, bin) the median of the values with its uncertainty
+    // (1.2533 x 1.4826 x MAD / sqrt(n)); a bin with less than `coverage` of
+    // its shell measured keeps its median but no uncertainty (it is not
+    // judged). profile(s) gives { level, err } of sector s, or of whole
+    // shells with s = -1. The bins are `width` wide in |Q|, or of equal width
+    // du in a coordinate u(|Q|) (`coord`: { u, q, du }, q its inverse).
+    function ringProfiles(model, cell, step, coord) {
         const w = step.width, nsec = Math.max(1, Math.round(step.sectors));
-        const Q = qMatrix(ctx.cell), dirs = nsec > 1 ? sphereDirections(nsec) : null;
+        const binOf = coord ? q => Math.floor(coord.u(q) / coord.du) : q => Math.floor(q / w);
+        const centre = coord ? b => coord.q((b + 0.5) * coord.du) : b => (b + 0.5) * w;
+        const binWidth = coord ? b => coord.q((b + 1) * coord.du) - coord.q(b * coord.du) : () => w;
+        const Q = qMatrix(cell), dirs = nsec > 1 ? sphereDirections(nsec) : null;
         const N = voxelCount(model), v = model.values;
         const bin = new Int32Array(N).fill(-1), sec = nsec > 1 ? new Uint16Array(N) : null, qs = new Float32Array(N);
         const q0 = mulMV(Q, model.corner), [qa, qb, qc] = model.vectors.map(u => mulMV(Q, u));
@@ -709,58 +713,71 @@
                         sec[i] = best;
                     }
                     if (v[i] === v[i]) {
-                        bin[i] = Math.floor(q / w);
+                        bin[i] = binOf(q);
                         if (bin[i] + 1 > nb) nb = bin[i] + 1;
                     }
                 }
         if (!nb) throw new Error('ring removal: no finite values');
-        // medians per (sector, bin), by a counting sort of the values
-        const key = j => (sec ? sec[j] : 0) * nb + bin[j];
-        const counts = new Int32Array(nsec * nb + 1);
-        for (let j = 0; j < N; j++) if (bin[j] >= 0) counts[key(j) + 1]++;
-        for (let t = 0; t < nsec * nb; t++) counts[t + 1] += counts[t];
-        const sorted = new Float32Array(counts[nsec * nb]), at = counts.slice(0, nsec * nb);
-        for (let j = 0; j < N; j++) if (bin[j] >= 0) sorted[at[key(j)]++] = v[j];
-        const lines = step.powder && step.powder !== 'none'
-            ? powderLines(step.powder, step.a, (nb + 1) * w) : null;
-        const near = step.near > 0 ? step.near : 2 * step.cutoff;
-        // voxels a whole shell (of this sector) would hold: 4 pi q^2 w over
-        // the Q volume of a voxel (2 pi q w over its area for a single layer)
+        // voxels a whole shell would hold: 4 pi q^2 w over the Q volume of a
+        // voxel (2 pi q w over its area for a single layer)
         const flat = [0, 1, 2].filter(a => model.dims[a] <= 1);
         const cellQ = flat.length ? Math.hypot(...cross(...[qa, qb, qc].filter((_, a) => !flat.includes(a)).slice(0, 2)))
             : Math.abs(det3([qa, qb, qc]));
-        const fullShell = b => ((flat.length ? 2 * Math.PI * (b + 0.5) * w : 4 * Math.PI * ((b + 0.5) * w) ** 2) * w) / cellQ / nsec;
-        const ringAt = new Float64Array(nsec * nb);
-        let strongest = [];
-        for (let s = 0; s < nsec; s++) {
-            // the median of each bin and its uncertainty, 1.2533 x 1.4826 x
-            // MAD / sqrt(n): a bin with few voxels or spread values (partial
-            // shells in the corners, strong anisotropic diffuse) needs more
-            // to count as a ring
-            const p = new Float64Array(nb).fill(NaN), err = new Float64Array(nb).fill(Infinity);
+        const fullShell = b => ((flat.length ? 2 * Math.PI * centre(b) : 4 * Math.PI * centre(b) ** 2) * binWidth(b)) / cellQ;
+        const voxelQ = Math.min(...[qa, qb, qc].filter((_, a) => model.dims[a] > 1).map(u => Math.hypot(...u)));
+        const profile = s => {
+            const nsk = s < 0 ? 1 : nsec;
+            const key = j => (s < 0 || !sec ? 0 : sec[j]) * nb + bin[j];
+            const counts = new Int32Array(nsk * nb + 1);
+            for (let j = 0; j < N; j++) if (bin[j] >= 0 && (s < 0 || !sec || sec[j] === s)) counts[key(j) + 1]++;
+            for (let t = 0; t < nsk * nb; t++) counts[t + 1] += counts[t];
+            const sorted = new Float32Array(counts[nsk * nb]), at = counts.slice(0, nsk * nb);
+            for (let j = 0; j < N; j++) if (bin[j] >= 0 && (s < 0 || !sec || sec[j] === s)) sorted[at[key(j)]++] = v[j];
+            const base = s < 0 || !sec ? 0 : s * nb, share = s < 0 ? 1 : nsec;
+            const level = new Float64Array(nb).fill(NaN), err = new Float64Array(nb).fill(Infinity);
             for (let b = 0; b < nb; b++) {
-                const part = sorted.subarray(counts[s * nb + b], counts[s * nb + b + 1]);
+                const part = sorted.subarray(counts[base + b], counts[base + b + 1]);
                 if (part.length < 3) continue;
-                p[b] = medianOf(part, part.length);
-                if (part.length < step.coverage * fullShell(b)) continue;         // too little of the shell to judge
-                const dev = Float64Array.from(part, x => Math.abs(x - p[b]));
+                level[b] = medianOf(part, part.length);
+                if (part.length < step.coverage * fullShell(b) / share) continue;
+                const dev = Float64Array.from(part, x => Math.abs(x - level[b]));
                 err[b] = 1.2533 * 1.4826 * medianOf(dev, dev.length) / Math.sqrt(part.length);
             }
-            const known = [];
-            for (let b = 0; b < nb; b++) if (p[b] === p[b]) known.push(b);
-            if (known.length < 8) continue;
-            // gaps bridged linearly, ends held, for the transform only
-            const full = new Float64Array(nb);
-            for (let t = 0, b = 0; b < nb; b++) {
-                while (t + 1 < known.length && known[t + 1] <= b) t++;
-                const lo = known[t], hi = known[Math.min(known.length - 1, t + 1)];
-                full[b] = b <= lo || hi === lo ? p[lo] : p[lo] + (p[hi] - p[lo]) * (b - lo) / (hi - lo);
-                if (b < known[0]) full[b] = p[known[0]];
-            }
-            // only excess above four times that is clipped and counts as a ring
+            return { level, err };
+        };
+        return { nb, nsec, qs, sec, bin, w, voxelQ, profile, centre };
+    }
+
+    // The profile with its empty bins bridged linearly (ends held), for the
+    // transform; null with fewer than 8 bins holding data.
+    function bridged(level) {
+        const known = [];
+        for (let b = 0; b < level.length; b++) if (level[b] === level[b]) known.push(b);
+        if (known.length < 8) return null;
+        const full = new Float64Array(level.length);
+        for (let t = 0, b = 0; b < level.length; b++) {
+            while (t + 1 < known.length && known[t + 1] <= b) t++;
+            const lo = known[t], hi = known[Math.min(known.length - 1, t + 1)];
+            full[b] = b <= lo || hi === lo ? level[lo] : level[lo] + (level[hi] - level[lo]) * (b - lo) / (hi - lo);
+            if (b < known[0]) full[b] = level[known[0]];
+        }
+        return { full, known };
+    }
+
+    // Any ring sharper than `cutoff`: the profile is split by a Gaussian
+    // low-pass in Fourier space, run again on the profile clipped to that
+    // smooth part until it passes under the rings; runs of positive excess
+    // that rise above four times the median's uncertainty are rings. Returns
+    // the ring level per (sector, bin) and the strongest [height, |Q|].
+    function sharpRings(rp, step) {
+        const { nb, nsec, w } = rp, ringAt = new Float64Array(nsec * nb), strongest = [];
+        for (let s = 0; s < nsec; s++) {
+            const { level: p, err } = rp.profile(nsec > 1 ? s : -1);
+            const br = bridged(p);
+            if (!br) continue;
+            const { full, known } = br;
             const typical = medianOf(Float64Array.from(known, b => Math.abs(p[b])), known.length);
-            const tol = Float64Array.from(err, e => Math.max(4 * (e < Infinity ? e : 0), 1e-3 * typical));
-            for (let b = 0; b < nb; b++) if (!(err[b] < Infinity)) tol[b] = Infinity;
+            const tol = Float64Array.from(err, e => (e < Infinity ? Math.max(4 * e, 1e-3 * typical) : Infinity));
             let smooth = lowPass(full, w, step.cutoff);
             for (let it = 0; it < 12; it++) {
                 const clipped = Float64Array.from(full, (x, b) => Math.min(x, smooth[b] + (tol[b] < Infinity ? tol[b] : 0)));
@@ -785,31 +802,487 @@
                     if (r[e] > tol[e]) above = true;
                     e++;
                 }
-                const keep = above && (!lines || lines.some(l => Math.abs(qtop - l) <= near));
-                for (let t = b; t < e; t++) ringAt[s * nb + t] = keep ? r[t] : 0;
-                if (keep) strongest.push([top, qtop]);
+                for (let t = b; t < e; t++) ringAt[s * nb + t] = above ? r[t] : 0;
+                if (above) strongest.push([top, qtop]);
                 b = e;
             }
             if (!step.positive) {
                 for (let b = 0; b < nb; b++) if (r[b] < 0 && -r[b] > tol[b]) ringAt[s * nb + b] = r[b];
             }
         }
-        // subtracted with linear interpolation between bin centres
-        const values = copyValues(model);
-        for (let j = 0; j < N; j++) {
-            if (values[j] !== values[j]) continue;
-            const f = qs[j] / w - 0.5, b0 = Math.max(0, Math.min(nb - 1, Math.floor(f))), b1 = Math.min(nb - 1, b0 + 1);
-            const t = Math.min(1, Math.max(0, f - b0)), base = (sec ? sec[j] : 0) * nb;
-            values[j] -= (1 - t) * ringAt[base + b0] + t * ringAt[base + b1];
+        return { ringAt, strongest };
+    }
+
+    // Polycrystalline materials whose rings get into diffuse data: structure
+    // type, elements, lattice parameters (A; room temperature unless noted)
+    // and an isotropic Debye-Waller B (A^2).
+    const MATERIALS = {
+        aluminium: { type: 'fcc', el: ['Al'], a: 4.0495, B: 0.85 },
+        copper: { type: 'fcc', el: ['Cu'], a: 3.6149, B: 0.55 },
+        nickel: { type: 'fcc', el: ['Ni'], a: 3.524, B: 0.37 },
+        silver: { type: 'fcc', el: ['Ag'], a: 4.0853, B: 0.72 },
+        gold: { type: 'fcc', el: ['Au'], a: 4.0782, B: 0.6 },
+        platinum: { type: 'fcc', el: ['Pt'], a: 3.9242, B: 0.32 },
+        lead: { type: 'fcc', el: ['Pb'], a: 4.9508, B: 2.0 },
+        vanadium: { type: 'bcc', el: ['V'], a: 3.024, B: 0.55 },
+        niobium: { type: 'bcc', el: ['Nb'], a: 3.3004, B: 0.45 },
+        iron: { type: 'bcc', el: ['Fe'], a: 2.8665, B: 0.35 },
+        chromium: { type: 'bcc', el: ['Cr'], a: 2.8846, B: 0.25 },
+        molybdenum: { type: 'bcc', el: ['Mo'], a: 3.147, B: 0.24 },
+        tantalum: { type: 'bcc', el: ['Ta'], a: 3.3013, B: 0.3 },
+        tungsten: { type: 'bcc', el: ['W'], a: 3.1652, B: 0.16 },
+        titanium: { type: 'hcp', el: ['Ti'], a: 2.9508, c: 4.6855, B: 0.6 },
+        zirconium: { type: 'hcp', el: ['Zr'], a: 3.2316, c: 5.1475, B: 0.5 },
+        beryllium: { type: 'hcp', el: ['Be'], a: 2.2858, c: 3.5843, B: 0.4 },
+        magnesium: { type: 'hcp', el: ['Mg'], a: 3.2094, c: 5.2108, B: 1.0 },
+        silicon: { type: 'diamond', el: ['Si'], a: 5.431, B: 0.47 },
+        germanium: { type: 'diamond', el: ['Ge'], a: 5.6579, B: 0.55 },
+        graphite: { type: 'graphite', el: ['C'], a: 2.4612, c: 6.7079, B: 0.6 },
+        ice: { type: 'iceIh', el: ['O', 'H'], a: 4.497, c: 7.322, B: 1.0 },
+        'ice-d2o': { type: 'iceIh', el: ['O', 'D'], a: 4.497, c: 7.322, B: 1.0 },
+        nacl: { type: 'rocksalt', el: ['Na', 'Cl'], a: 5.6402, B: 1.6 },
+        mgo: { type: 'rocksalt', el: ['Mg', 'O'], a: 4.2112, B: 0.3 },
+        caf2: { type: 'fluorite', el: ['Ca', 'F'], a: 5.4626, B: 0.5 },
+        ceo2: { type: 'fluorite', el: ['Ce', 'O'], a: 5.4116, B: 0.4 },
+        lab6: { type: 'lab6', el: ['La', 'B'], a: 4.15683, B: 0.3 },
+    };
+    const MATERIAL_ALIASES = {
+        al: 'aluminium', aluminum: 'aluminium', cu: 'copper', ni: 'nickel', ag: 'silver', au: 'gold', pt: 'platinum', pb: 'lead',
+        v: 'vanadium', nb: 'niobium', fe: 'iron', cr: 'chromium', mo: 'molybdenum', ta: 'tantalum', w: 'tungsten',
+        ti: 'titanium', zr: 'zirconium', be: 'beryllium', mg: 'magnesium', si: 'silicon', ge: 'germanium', c: 'graphite',
+        h2o: 'ice', 'ice-h2o': 'ice', d2o: 'ice-d2o',
+    };
+    const STRUCTURE_TYPES = ['sc', 'fcc', 'bcc', 'diamond', 'hcp', 'rocksalt', 'fluorite'];
+    const HEXAGONAL_TYPES = new Set(['hcp', 'graphite', 'iceIh']);
+
+    // "aluminium, ice": materials by name (an alias such as Al, or a name
+    // then new lattice parameters: "aluminium 4.032"), or by structure type,
+    // elements and lattice parameters: "fcc Al 4.05", "hcp Ti 2.95 4.69",
+    // "rocksalt Na Cl 5.64".
+    function parseMaterials(text) {
+        const out = [];
+        for (const part of String(text || '').split(/[,;]/)) {
+            const tok = part.trim().split(/\s+/).filter(Boolean);
+            if (!tok.length) continue;
+            const nums = tok.filter(t => Number.isFinite(Number(t))).map(Number), words = tok.filter(t => !Number.isFinite(Number(t)));
+            const key = words[0].toLowerCase(), name = MATERIALS[key] ? key : MATERIAL_ALIASES[key];
+            let m;
+            if (name && words.length === 1) {
+                m = Object.assign({ name }, MATERIALS[name]);
+            } else if (STRUCTURE_TYPES.includes(key) && words.length >= 2) {
+                const need = key === 'rocksalt' || key === 'fluorite' ? 2 : 1;
+                if (words.length - 1 !== need) throw new Error(`materials: "${part.trim()}" needs ${need} element${need > 1 ? 's' : ''}`);
+                m = { name: part.trim(), type: key, el: words.slice(1), B: 0.5 };
+                if (!nums.length) throw new Error(`materials: "${part.trim()}" needs its lattice parameter`);
+            } else {
+                throw new Error(`materials: unknown "${part.trim()}" (known: ${Object.keys(MATERIALS).join(', ')}; ` +
+                    'or a structure type (sc, fcc, bcc, diamond, hcp, rocksalt, fluorite), its elements and lattice parameters)');
+            }
+            if (nums.length) m.a = nums[0];
+            if (nums.length > 1) m.c = nums[1];
+            if (HEXAGONAL_TYPES.has(m.type) && !(m.c > 0)) throw new Error(`materials: "${part.trim()}" needs a and c`);
+            if (!(m.a > 0)) throw new Error(`materials: "${part.trim()}" has no valid lattice parameter`);
+            m.el.forEach(atomOf);
+            out.push(m);
         }
-        strongest = strongest.sort((x, y) => y[0] - x[0]);
-        const peaks = [];
-        for (const [r, q] of strongest) {
-            if (peaks.length >= 6) break;
-            if (!peaks.some(([, p]) => Math.abs(p - q) < 3 * w)) peaks.push([r, q]);
+        if (!out.length) throw new Error('materials: name at least one, e.g. aluminium');
+        return out;
+    }
+
+    // Atoms of the conventional cell: [element, [x, y, z], occupancy].
+    function structureAtoms(m) {
+        const FCC = [[0, 0, 0], [0, 0.5, 0.5], [0.5, 0, 0.5], [0.5, 0.5, 0]];
+        const at = (el, list, occ) => list.map(p => [el, p.map(x => ((x % 1) + 1) % 1), occ === undefined ? 1 : occ]);
+        const shift = (list, d) => list.map(p => p.map((x, c) => x + d[c]));
+        const [A, B] = m.el;
+        switch (m.type) {
+            case 'sc': return at(A, [[0, 0, 0]]);
+            case 'fcc': return at(A, FCC);
+            case 'bcc': return at(A, [[0, 0, 0], [0.5, 0.5, 0.5]]);
+            case 'diamond': return at(A, FCC.concat(shift(FCC, [0.25, 0.25, 0.25])));
+            case 'hcp': return at(A, [[1 / 3, 2 / 3, 0.25], [2 / 3, 1 / 3, 0.75]]);
+            case 'rocksalt': return at(A, FCC).concat(at(B, shift(FCC, [0.5, 0, 0])));
+            case 'fluorite': return at(A, FCC).concat(at(B, shift(FCC, [0.25, 0.25, 0.25]).concat(shift(FCC, [0.75, 0.75, 0.75]))));
+            case 'graphite': return at(A, [[0, 0, 0.25], [0, 0, 0.75], [1 / 3, 2 / 3, 0.25], [2 / 3, 1 / 3, 0.75]]);
+            case 'lab6': {
+                const x = 0.1996;
+                return at(A, [[0, 0, 0]]).concat(at(B, [[x, 0.5, 0.5], [1 - x, 0.5, 0.5], [0.5, x, 0.5], [0.5, 1 - x, 0.5], [0.5, 0.5, x], [0.5, 0.5, 1 - x]]));
+            }
+            case 'iceIh': {
+                // O on 4f (z = 1/16, ideal tetrahedra) of P63/mmc; half an H
+                // (or D) 1.0 A from each O along each of its four O-O bonds
+                const z = 0.0625, O = [[1 / 3, 2 / 3, z], [2 / 3, 1 / 3, z + 0.5], [2 / 3, 1 / 3, -z], [1 / 3, 2 / 3, 0.5 - z]];
+                const L = Converter.cellToLattice([m.a, m.a, m.c], [90, 90, 120]), toCart = f => mulMV(L, f), Li = invert3(L);
+                const H = [];
+                for (const p of O) {
+                    for (const q of O) for (let i = -1; i <= 1; i++) for (let j = -1; j <= 1; j++) for (let k = -1; k <= 1; k++) {
+                        const d = toCart([q[0] + i - p[0], q[1] + j - p[1], q[2] + k - p[2]]), r = Math.hypot(...d);
+                        if (r > 2.4 && r < 3.1) H.push(p.map((x, c) => x + mulMV(Li, d.map(y => y / r))[c]));
+                    }
+                }
+                return at(A, O).concat(at(B, H, 0.5));
+            }
+            default: throw new Error(`unknown structure type ${m.type}`);
         }
-        ctx.log(peaks.length ? 'sharpest rings at |Q| ' + peaks.map(([r, q]) => `${q.toFixed(3)} (${r.toPrecision(3)})`).join(', ') + ' 1/A'
-            : 'no ring sharper than the cutoff found');
+    }
+
+    // Powder lines of a material up to qmax, for the radiation: every
+    // reflection's integrated intensity m |F|^2 exp(-2W) spread over the
+    // sphere of its |Q| in reciprocal space, so the line strength is
+    // sum |F|^2 / (4 pi Q^2). [{ q, strength, hkl }], by |Q|.
+    function materialLines(m, radiation, qmax) {
+        const hex = HEXAGONAL_TYPES.has(m.type);
+        const L = Converter.cellToLattice(hex ? [m.a, m.a, m.c] : [m.a, m.a, m.a], hex ? [90, 90, 120] : [90, 90, 90]);
+        const Bq = Converter.reciprocalBasis(L).map(r => r.map(x => 2 * Math.PI * x));
+        const atoms = structureAtoms(m).map(([el, p, occ]) => ({ atom: atomOf(el), p, occ }));
+        const nmax = [0, 1, 2].map(c => Math.ceil(qmax * Math.hypot(L[0][c], L[1][c], L[2][c]) / (2 * Math.PI)));
+        const lines = new Map();
+        for (let h = -nmax[0]; h <= nmax[0]; h++)
+            for (let k = -nmax[1]; k <= nmax[1]; k++)
+                for (let l = -nmax[2]; l <= nmax[2]; l++) {
+                    if (!h && !k && !l) continue;
+                    const q = Math.hypot(...mulMV(Bq, [h, k, l]));
+                    if (q > qmax) continue;
+                    const dw = Math.exp(-m.B * (q / (4 * Math.PI)) ** 2);
+                    let re = 0, im = 0;
+                    for (const { atom, p, occ } of atoms) {
+                        const f = occ * amplitudeOf(atom, radiation, q) * dw, ph = 2 * Math.PI * (h * p[0] + k * p[1] + l * p[2]);
+                        re += f * Math.cos(ph);
+                        im += f * Math.sin(ph);
+                    }
+                    const key = Math.round(q * 1e6);
+                    const line = lines.get(key) || { q, strength: 0, hkl: [Math.abs(h), Math.abs(k), Math.abs(l)] };
+                    line.strength += (re * re + im * im) / (4 * Math.PI * q * q);
+                    lines.set(key, line);
+                }
+        const list = [...lines.values()], top = Math.max(0, ...list.map(x => x.strength));
+        return list.filter(x => x.strength > 1e-6 * top).sort((x, y) => x.q - y.q);
+    }
+
+    // Line profile of a material at bin centres (or any |Q|): Gaussians of
+    // unit area, width sqrt(s0^2 + (r Q)^2), at the lines' |Q| / lambda
+    // (lambda: the ratio of the lattice parameter to the listed one).
+    function lineCurve(lines, lambda, s0, r) {
+        return q => {
+            let sum = 0;
+            for (const line of lines) {
+                const mu = line.q / lambda, s = Math.sqrt(s0 * s0 + r * r * mu * mu), d = (q - mu) / s;
+                if (d * d < 50) sum += line.strength * Math.exp(-0.5 * d * d) / (s * 2.5066282746310002);
+            }
+            return sum;
+        };
+    }
+
+    // Least squares with non-negative coefficients for a few columns: the
+    // normal equations, dropping a column whose coefficient comes out below
+    // zero, until none does.
+    // Columns that are zero where the weights are (lines outside the data)
+    // stay out; a tiny ridge keeps nearly equal columns solvable. Returns
+    // { x, M, idx }: the coefficients, and the normal matrix of the columns
+    // kept.
+    function nonNegative(cols, y, wt, keep) {
+        const n = cols.length, x = new Array(n).fill(0);
+        const dotw = (u, v) => { let s = 0; for (let b = 0; b < y.length; b++) if (wt[b]) s += wt[b] * u[b] * v[b]; return s; };
+        const norms = cols.map(c => dotw(c, c)), top = Math.max(0, ...norms);
+        const active = norms.map((v, i) => v > 1e-24 * top && v > 0 && (!keep || keep[i]));
+        for (let round = 0; round <= n; round++) {
+            const idx = [...active.keys()].filter(i => active[i]);
+            if (!idx.length) return { x: x.fill(0), M: null, idx };
+            const M = idx.map(i => idx.map(j => dotw(cols[i], cols[j]) + (i === j ? 1e-10 * norms[i] : 0)));
+            const sol = solveSmall(M, idx.map(i => dotw(cols[i], y)));
+            if (!sol) return { x: x.fill(0), M: null, idx: [] };
+            x.fill(0);
+            idx.forEach((i, k) => { x[i] = sol[k]; });
+            const neg = idx.filter(i => !(x[i] >= 0));
+            if (!neg.length) return { x, M, idx };
+            for (const i of neg) active[i] = false;
+        }
+        return { x: x.fill(0), M: null, idx: [] };
+    }
+
+    // Rings of named materials: their lines are fitted to the high-passed
+    // |Q| profile (the same Gaussian low-pass taken off the data and off
+    // the model, so a smooth background and broad diffuse features drop
+    // out) by non-negative, robustly reweighted least squares for the
+    // scales, with one-dimensional searches for each lattice parameter
+    // (within +/- `refine`) and for the width model. Per sector the scales
+    // are fitted again with the lines fixed. Returns per voxel the ring
+    // intensity to subtract.
+    function materialRings(model, rp, step, ctx) {
+        let radiation = step.radiation === 'auto' ? model.radiation : step.radiation, unknown = false;
+        if (!['xray', 'neutron', 'electron'].includes(radiation)) {
+            // the positions do not depend on it: every line then gets an
+            // intensity of its own
+            ctx.log('the radiation of the data is not known, so each line is fitted with an intensity of its own');
+            radiation = 'xray';
+            unknown = true;
+        }
+        const { nb, nsec } = rp, qmax = rp.centre(nb);
+        const mats = parseMaterials(step.materials).map(m => Object.assign(m, { lines: materialLines(m, radiation, qmax * 1.05) }));
+        const centres = Float64Array.from({ length: nb }, (_, b) => rp.centre(b));
+        // in the profile's coordinate every line is one width wide: the
+        // high-pass takes off what is broader than `highPass` line widths
+        const highPass = x => {
+            const lp = lowPass(x, rp.du, step.highPass);
+            return Float64Array.from(x, (y, b) => y - lp[b]);
+        };
+        // columns of the model: one per material, or (free intensities) one
+        // per group of lines closer than two widths
+        const columns = (lambdas, s0, r, free, skip) => {
+            const cols = [], owner = [];
+            mats.forEach((m, k) => {
+                if (skip && skip.has(k)) return;
+                if (free) {
+                    let group = [];
+                    const flush = () => {
+                        if (!group.length) return;
+                        const curve = lineCurve(group, lambdas[k], s0, r);
+                        cols.push(Float64Array.from(centres, curve));
+                        owner.push([k, group]);
+                        group = [];
+                    };
+                    for (const line of m.lines) {
+                        const last = group[group.length - 1];
+                        if (last && line.q / lambdas[k] - last.q / lambdas[k] > 2 * Math.hypot(s0, r * line.q)) flush();
+                        group.push(line);
+                    }
+                    flush();
+                } else {
+                    cols.push(Float64Array.from(centres, lineCurve(m.lines, lambdas[k], s0, r)));
+                    owner.push([k, m.lines]);
+                }
+            });
+            return { cols, owner };
+        };
+        const prepared = new WeakMap();
+        const fitProfile = (prof, lambdas, s0, r, free, significant, skip) => {
+            if (!prepared.has(prof)) {
+                const br = bridged(prof.level);
+                if (br) {
+                    const y = highPass(br.full), base = Float64Array.from(prof.err, e => (e < Infinity && e > 0 ? 1 / (e * e) : 0));
+                    // Huber's loss, quadratic up to 5 x the robust spread of
+                    // the data themselves, then linear
+                    const zs = Float64Array.from([...y.keys()].filter(b => base[b]), b => Math.abs(y[b]) * Math.sqrt(base[b]));
+                    const spread = zs.length ? 1.4826 * medianOf(zs, zs.length) : 1;
+                    prepared.set(prof, { y, base, c: 5 * Math.max(spread, 1e-300) });
+                } else {
+                    prepared.set(prof, null);
+                }
+            }
+            const pre = prepared.get(prof);
+            if (!pre) return null;
+            const { y, base, c: hc } = pre;
+            const { cols, owner } = columns(lambdas, s0, r, free, skip);
+            const hp = cols.map(highPass);
+            const resid = x => Float64Array.from(y, (yb, b) => (base[b] ? (yb - hp.reduce((s, c, i) => s + x[i] * c[b], 0)) * Math.sqrt(base[b]) : NaN));
+            let wt = base, fit = null, z = null;
+            for (let it = 0; it < 3; it++) {
+                fit = nonNegative(hp, y, wt);
+                // Huber reweighting of the standardized residuals: what the
+                // lines cannot explain (diffuse leakage) counts less, but
+                // nothing is dropped
+                z = resid(fit.x);
+                wt = Float64Array.from(base, (b0, b) => (z[b] === z[b] ? b0 * Math.min(1, hc / Math.abs(z[b])) : 0));
+            }
+            let x = fit.x;
+            if (significant && fit.M) {
+                // only amplitudes above three standard errors (the reduced
+                // chi-square of the reweighted fit scaling the covariance)
+                let ssr = 0, used = 0;
+                for (let b = 0; b < nb; b++) {
+                    if (!wt[b]) continue;
+                    const d = y[b] - hp.reduce((s, c, i) => s + x[i] * c[b], 0);
+                    ssr += wt[b] * d * d;
+                    used++;
+                }
+                const s2 = ssr / Math.max(1, used - fit.idx.length);
+                const keep = new Array(hp.length).fill(false);
+                fit.idx.forEach((i, k) => {
+                    const e = new Array(fit.idx.length).fill(0);
+                    e[k] = 1;
+                    const col = solveSmall(fit.M, e);
+                    const se = col ? Math.sqrt(Math.max(0, col[k] * s2)) : Infinity;
+                    keep[i] = x[i] > 3 * se;
+                });
+                if (keep.some((k, i) => !k && x[i] > 0)) {
+                    x = nonNegative(hp, y, wt, keep).x;
+                    z = resid(x);
+                }
+            }
+            const huber = t => (Math.abs(t) <= hc ? t * t : 2 * hc * Math.abs(t) - hc * hc);
+            let loss = 0, before = 0;
+            for (let b = 0; b < nb; b++) {
+                if (!base[b]) continue;
+                loss += huber(z[b]);
+                before += huber(y[b] * Math.sqrt(base[b]));
+            }
+            return { x, owner, loss, before };
+        };
+        const whole = rp.profile(-1);
+        let lambdas = mats.map(() => 1), s0 = rp.s0init, r = step.resolution;
+        const objective = () => {
+            const f = fitProfile(whole, lambdas, s0, r);
+            return f ? f.loss : Infinity;
+        };
+        // a coarse scan, then golden-section search about its best point;
+        // returns how much deeper the best point lies than the scan's median
+        const search = (set, lo, hi, steps) => {
+            let best = lo, fb = Infinity;
+            const scan = new Float64Array(steps + 1);
+            for (let i = 0; i <= steps; i++) {
+                const t = lo + (hi - lo) * i / steps;
+                set(t);
+                const f = objective();
+                scan[i] = f;
+                if (f < fb) { fb = f; best = t; }
+            }
+            const mid = medianOf(Float64Array.from(scan), scan.length);
+            let a = Math.max(lo, best - 2 * (hi - lo) / steps), b = Math.min(hi, best + 2 * (hi - lo) / steps);
+            const g = (Math.sqrt(5) - 1) / 2;
+            for (let it = 0; it < 24; it++) {
+                const c = b - g * (b - a), d = a + g * (b - a);
+                set(c);
+                const fc = objective();
+                set(d);
+                const fd = objective();
+                if (fc < fd) b = d; else a = c;
+            }
+            set((a + b) / 2);
+            return mid > 0 ? (mid - Math.min(fb, objective())) / mid : 0;
+        };
+        // widths within a factor 3 of the ones the coordinate was made for,
+        // so the high-pass cannot take the lines for background
+        const qLow = Math.min(...mats.map(m => (m.lines.length ? m.lines[0].q : Infinity)).concat([qmax]));
+        const sMax = 3 * rp.s0init, rMax = Math.max(3 * rp.rinit, 0.002);
+        const match = mats.map(() => 1);
+        // coarse to fine: the lattice parameters first with broad lines
+        // (a smooth objective), then the widths, then both again
+        // the two widths together (they trade off): a grid, then each refined
+        const widths = () => {
+            let best = [s0, r], fb = Infinity;
+            for (let i = 0; i < 12; i++) {
+                for (let j = 0; j < 12; j++) {
+                    s0 = sMax / 9 * Math.pow(9, i / 11);
+                    r = rMax * j / 11;
+                    const f = objective();
+                    if (f < fb) { fb = f; best = [s0, r]; }
+                }
+            }
+            [s0, r] = best;
+            search(t => { s0 = t; }, Math.max(sMax / 9, s0 / 1.5), Math.min(sMax, s0 * 1.5), 8);
+            search(t => { r = t; }, Math.max(0, r - rMax / 11), Math.min(rMax, r + rMax / 11), 8);
+        };
+        if (step.fitWidth) s0 = 2 * rp.s0init;
+        for (let round = 0; round < 2; round++) {
+            if (step.refine > 0) mats.forEach((_, k) => { match[k] = search(t => { lambdas[k] = t; }, 1 - step.refine, 1 + step.refine, 40); });
+            if (step.fitWidth) widths();
+        }
+        if (step.refine > 0) mats.forEach((_, k) => { match[k] = Math.max(match[k], search(t => { lambdas[k] = t; }, lambdas[k] - step.refine / 10, lambdas[k] + step.refine / 10, 10)); });
+        const free = step.intensities === 'free' || unknown;
+        let fit = fitProfile(whole, lambdas, s0, r, free, true);
+        if (!fit) throw new Error('ring removal: too few |Q| bins with data to fit');
+        // a material stays only when its lines explain a share of the profile
+        // (2 % or more) and, when its lattice parameter was refined, the fit
+        // clearly prefers that value (15 % below the median of the scan)
+        const skip = new Set();
+        mats.forEach((m, k) => {
+            const without = fitProfile(whole, lambdas, s0, r, free, true, new Set([k]));
+            const share = fit.before > 0 && without ? (without.loss - fit.loss) / fit.before : 0;
+            if (share < 0.02 || (step.refine > 0 && match[k] < 0.15)) {
+                skip.add(k);
+                ctx.log(`${m.name}: no clear lines (they explain ${Math.round(100 * Math.max(0, share))} % of the profile` +
+                    (step.refine > 0 ? `, the lattice parameter is ${Math.round(100 * match[k])} % better than elsewhere` : '') + '); left out');
+            }
+        });
+        if (skip.size) fit = fitProfile(whole, lambdas, s0, r, free, true, skip);
+        // scales of every column, per sector when asked
+        const sectorScale = [];
+        for (let s = 0; s < nsec; s++) {
+            const f = nsec > 1 ? fitProfile(rp.profile(s), lambdas, s0, r, free, true, skip) : fit;
+            sectorScale.push(f && f.x.some(t => t > 0) ? f.x : fit.x);
+        }
+        const gain = fit.before > 0 ? 1 - fit.loss / fit.before : 0;
+        mats.forEach((m, k) => {
+            if (skip.has(k)) return;
+            const scale = fit.owner.reduce((s, [owner], i) => s + (owner === k ? fit.x[i] : 0), 0);
+            const strongest = m.lines.slice().sort((p, q) => q.strength - p.strength).slice(0, 3)
+                .map(line => `(${line.hkl.join(' ')}) ${(line.q / lambdas[k]).toFixed(3)}`).join(', ');
+            ctx.log(`${m.name}: ${HEXAGONAL_TYPES.has(m.type) ? `a = ${(m.a * lambdas[k]).toFixed(4)}, c = ${(m.c * lambdas[k]).toFixed(4)}`
+                : `a = ${(m.a * lambdas[k]).toFixed(4)}`} A (${((lambdas[k] - 1) * 100).toFixed(2)} %), ` +
+                `${m.lines.length} lines to |Q| ${qmax.toFixed(1)} 1/A, scale ${scale.toPrecision(3)}; strongest ${strongest}`);
+        });
+        ctx.log(`ring width sigma = sqrt(${s0.toPrecision(3)}^2 + (${r.toPrecision(3)} Q)^2) 1/A; ` +
+            `the rings account for ${Math.round(100 * gain)} % of the high-passed |Q| profile` +
+            (free ? `; ${fit.owner.length} line groups with intensities of their own` : ''));
+        if (!fit.x.some(t => t > 0)) ctx.log('no rings of these materials in the data; nothing subtracted');
+        // at a bound of the width search: the next pass looks further
+        const atLimit = step.fitWidth && (s0 > 0.97 * sMax || s0 < 1.03 * sMax / 9 || r > 0.97 * rMax);
+        if (fit.owner.length === 0) return { ring: () => 0, s0, r, atLimit: false };
+        // ring intensity per voxel: per sector, the fitted columns summed on
+        // a fine |Q| table
+        const fine = Math.max(2e-5, Math.hypot(s0, r * qLow) / 10), nf = Math.ceil(qmax * 1.05 / fine) + 2;
+        const curves = fit.owner.map(([k, lines]) => lineCurve(lines, lambdas[k], s0, r));
+        const colTables = curves.map(f => Float64Array.from({ length: nf }, (_, i) => f(i * fine)));
+        const tables = sectorScale.map(x => Float64Array.from({ length: nf }, (_, i) => colTables.reduce((sum, t, c) => sum + x[c] * t[i], 0)));
+        const ring = j => {
+            const q = rp.qs[j] / fine, i0 = Math.min(nf - 2, Math.floor(q)), t = q - i0, table = tables[rp.sec ? rp.sec[j] : 0];
+            return (1 - t) * table[i0] + t * table[i0 + 1];
+        };
+        return { ring, s0, r, atLimit };
+    }
+
+    // Powder rings removed. With materials named (aluminium, ice, "fcc Al
+    // 4.05", ...), their lines are predicted from the structure and fitted
+    // (see materialRings); with "any", whatever is sharper in |Q| than the
+    // cutoff and rises above the noise goes (see sharpRings). The rings are
+    // subtracted at their |Q| from every voxel, so anisotropic diffuse
+    // scattering stays.
+    function stepRemoveRings(model, step, ctx) {
+        needCell(ctx.cell, 'ring removal');
+        const any = String(step.materials).trim().toLowerCase() === 'any';
+        const values = copyValues(model), N = values.length;
+        if (any) {
+            const rp = Object.assign(ringProfiles(model, ctx.cell, step, null), { du: step.width });
+            const { ringAt, strongest } = sharpRings(rp, step);
+            const { nb, w } = rp;
+            for (let j = 0; j < N; j++) {
+                if (values[j] !== values[j]) continue;
+                const f = rp.qs[j] / w - 0.5, b0 = Math.max(0, Math.min(nb - 1, Math.floor(f))), b1 = Math.min(nb - 1, b0 + 1);
+                const t = Math.min(1, Math.max(0, f - b0)), base = (rp.sec ? rp.sec[j] : 0) * nb;
+                values[j] -= (1 - t) * ringAt[base + b0] + t * ringAt[base + b1];
+            }
+            strongest.sort((x, y) => y[0] - x[0]);
+            const peaks = [];
+            for (const [h, q] of strongest) {
+                if (peaks.length >= 6) break;
+                if (!peaks.some(([, p]) => Math.abs(p - q) < 3 * w)) peaks.push([h, q]);
+            }
+            ctx.log(peaks.length ? 'sharpest rings at |Q| ' + peaks.map(([h, q]) => `${q.toFixed(3)} (${h.toPrecision(3)})`).join(', ') + ' 1/A'
+                : 'no ring sharper than the cutoff found');
+        } else {
+            // the profile's coordinate u = asinh(r Q / s0) / r for the line
+            // width sqrt(s0^2 + (r Q)^2): linear in |Q| where the width is
+            // constant, logarithmic where it grows with |Q|; bins a quarter
+            // of a width. When the widths fitted in it end at a bound of
+            // their search, the next pass is made for them (at most three)
+            let s0 = Math.max(step.sigma0, 1e-4), r0 = step.resolution, result = null, logs = [];
+            for (let pass = 0; pass < 3; pass++) {
+                const a0 = s0, b0 = r0;
+                const coord = {
+                    u: q => (b0 > 0 ? Math.asinh(b0 * q / a0) / b0 : q / a0),
+                    q: u => (b0 > 0 ? a0 / b0 * Math.sinh(b0 * u) : u * a0),
+                    du: 0.25,
+                };
+                const rp = Object.assign(ringProfiles(model, ctx.cell, step, coord), { du: coord.du, s0init: a0, rinit: b0 });
+                logs = [];
+                result = materialRings(model, rp, step, Object.assign({}, ctx, { log: t => logs.push(t) }));
+                if (!result.atLimit) break;
+                s0 = Math.max(result.s0, 1e-4);
+                r0 = result.r;
+            }
+            logs.forEach(t => ctx.log(t));
+            for (let j = 0; j < N; j++) if (values[j] === values[j]) values[j] -= result.ring(j);
+        }
         return withValues(model, values);
     }
 
@@ -2115,8 +2588,9 @@ D|0.413048 0.294953 0.187491 0.080701 0.023736 15.56995 32.39847 5.711404 61.889
         removeRings: {
             run: stepRemoveRings,
             fields: {
-                width: 'positive', cutoff: 'positive', sectors: 'sectors', coverage: 'fraction', positive: 'boolean',
-                powder: 'powder', a: 'number?', near: 'number',
+                materials: 'any', radiation: 'radiation', intensities: 'ringIntensities', refine: 'fraction', fitWidth: 'boolean',
+                sigma0: 'nonnegative', resolution: 'nonnegative', width: 'positive', cutoff: 'positive', highPass: 'positive', sectors: 'sectors', coverage: 'fraction',
+                positive: 'boolean',
             },
         },
         scale: { run: stepScale, fields: { factor: 'number', offset: 'number', positive: 'boolean' } },
@@ -2164,6 +2638,7 @@ D|0.413048 0.294953 0.187491 0.080701 0.023736 15.56995 32.39847 5.711404 61.889
             sectors: v => Number.isInteger(v) && v >= 1 && v <= 256,
             fraction: v => finite(v) && v >= 0 && v <= 1,
             radiation: v => ['auto', 'xray', 'neutron', 'electron'].includes(v),
+            ringIntensities: v => v === 'structure' || v === 'free',
             ubMode: v => v === 'refine' || v === 'matrix',
             despikeSize: v => v === 1 || v === 2,
             nonnegative: v => finite(v) && v >= 0,
@@ -2194,6 +2669,7 @@ D|0.413048 0.294953 0.187491 0.080701 0.023736 15.56995 32.39847 5.711404 61.889
                     throw new Error(`recipe step ${n + 1} (normalize): a background volume needs its norm volume`);
                 }
                 if (raw.op === 'backgroundFunction') backgroundCurve(step.kind, step.params);
+                if (raw.op === 'removeRings' && String(step.materials).trim().toLowerCase() !== 'any') parseMaterials(step.materials);
                 if (raw.op === 'backgroundDebyeWaller') {
                     const sites = parseSites(step.composition), uiso = parseUiso(step.uiso);
                     for (const site of sites) for (const sp of site.species) uiso(sp.atom);
@@ -2220,9 +2696,13 @@ D|0.413048 0.294953 0.187491 0.080701 0.023736 15.56995 32.39847 5.711404 61.889
                 (step.powder && step.powder !== 'none'
                     ? `${(step.q || []).length ? ' and' : ''} of ${step.powder} (a = ${step.a > 0 ? step.a : POWDER[step.powder].a} A)` : '') +
                 ` +/- ${step.width} 1/A`;
-            case 'removeRings': return `remove rings sharper than ${step.cutoff} 1/A by Fourier filtering of the |Q| profile ` +
-                `(bins of ${step.width} 1/A${step.sectors > 1 ? `, ${step.sectors} direction sectors` : ''}` +
-                (step.powder && step.powder !== 'none' ? `, only near the ${step.powder} lines` : '') + ')';
+            case 'removeRings': return String(step.materials).trim().toLowerCase() === 'any'
+                ? `remove any ring sharper than ${step.cutoff} 1/A by Fourier filtering of the |Q| profile ` +
+                  `(bins of ${step.width} 1/A${step.sectors > 1 ? `, ${step.sectors} direction sectors` : ''})`
+                : `remove the powder rings of ${step.materials}: lines from the structure, fitted to the |Q| profile ` +
+                  `high-passed at ${step.highPass} line widths (${step.intensities === 'free' ? 'free' : 'structure-factor'} intensities` +
+                  `${step.refine > 0 ? `, lattice within ${+(100 * step.refine).toFixed(2)} %` : ''}${step.fitWidth ? ', widths fitted' : ''}` +
+                  `${step.sectors > 1 ? `, ${step.sectors} direction sectors` : ''})`;
             case 'maskQ': return `mask |Q| outside ${step.min === undefined || step.min === null ? 0 : step.min}..${step.max === undefined || step.max === null ? 'inf' : step.max} 1/A`;
             case 'despike': return step.k > 0
                 ? `despike: voxels beyond ${step.k} robust sigma of the median of their ${step.size === 2 ? '5 x 5 x 5' : '3 x 3 x 3'} neighbourhood take that median`
