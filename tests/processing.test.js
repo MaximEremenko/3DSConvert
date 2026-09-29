@@ -492,3 +492,24 @@ test('removeRings: sharp rings go by Fourier filtering of the |Q| profile, the d
     const kept = await run(ringed, [{ op: 'removeRings', width: 0.005, cutoff: 0.05, powder: 'aluminium', near: 0.03 }]);
     assert.ok(excess(kept, 1.99, 2.01) > 25);
 });
+
+test('backgroundDebyeWaller: Laue and thermal diffuse of a composition, scaled to the floor of the data', async () => {
+    // neutrons, PbO2: count x b^2 (1 - exp(-Uiso Q^2)) per site
+    const bPb = 0.9405, bO = 0.5803, Qof = (h, k, l) => 2 * Math.PI * Math.hypot(h, k, l) / 4;
+    const I = q => bPb * bPb * (1 - Math.exp(-0.02 * q * q)) + 2 * bO * bO * (1 - Math.exp(-0.01 * q * q));
+    const m = grid(3, 0.1, (h, k, l) => 5 * I(Qof(h, k, l)) + 1);
+    const logs = [];
+    const out = await run(m, [{ op: 'backgroundDebyeWaller', radiation: 'neutron', composition: 'Pb; 2*O', uiso: 'Pb 0.02, O 0.01',
+        percentile: 50, width: 0.02, offset: true }], { log: t => logs.push(t) });
+    const fitted = /shells: ([\d.]+), offset ([\d.-]+)/.exec(logs.join(' '));
+    assert.ok(Math.abs(Number(fitted[1]) - 5) < 0.02 && Math.abs(Number(fitted[2]) - 1) < 0.02, logs.join('\n'));
+    let worst = 0;
+    for (const x of out.values) worst = Math.max(worst, Math.abs(x));
+    assert.ok(worst < 0.02, `left over ${worst}`);
+    // a given scale, no fit; the Laue part of a mixed site without displacements is flat
+    const flat = await run(m, [{ op: 'backgroundDebyeWaller', radiation: 'neutron', composition: 'Pb; 2*O', uiso: 'Pb 0.02, O 0.01', fit: false, scale: 5 }]);
+    assert.ok(Math.abs(flat.values[0] - 1) < 1e-9 && Math.abs(flat.values[flat.values.length - 1] - 1) < 1e-9);
+    await assert.rejects(run(m, [{ op: 'backgroundDebyeWaller', radiation: 'neutron', composition: 'Mg 0.5 + Nb 0.5', uiso: '0', offset: true }]),
+        /does not change with \|Q\|/);
+    await assert.rejects(run(m, [{ op: 'backgroundDebyeWaller', composition: 'Pb' }]), /radiation of the data is not known/);
+});
