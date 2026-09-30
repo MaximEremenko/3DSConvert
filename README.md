@@ -553,15 +553,21 @@ rings first leaves copper (111) at 28, against 2.8 before symmetrizing. A
 second ring filter after symmetrizing, which takes the lines of the first
 fit, brings that to 3.0 with aluminium at 1.4-4.4; *mask spots* in the first
 removal also helps (19), at some cost to the sample's scattering on the ring
-cores. A second ring fit after symmetrizing finds nothing: what is left is
-no line of the fitted shape. Symmetrized, an empty-can volume has a comb of
-maxima along each ring, which a subtraction carries into the sample's volume
-(the streaks along h and k in the half-integer planes of symmetrized,
-can-subtracted CORELLI volumes).
+cores. Symmetrizing without outliers (mode *clip*) keeps the spots out of
+the average - the copper (111) excess of the symmetrized volume as read
+stays that of the measured one (0.017; 0.032 with *average*) - and with the
+second filter no line is left above 4.8 (aluminium 2.1-4.8, copper 4.8 and
+3.5, against 2.9-5.1 at the sample's own shells): the preset *Rings, then
+symmetrize* runs that. A second ring fit after symmetrizing finds nothing:
+what is left is no line of the fitted shape. Symmetrized, an empty-can
+volume has a comb of maxima along each ring, which a subtraction carries
+into the sample's volume (the streaks along h and k in the half-integer
+planes of symmetrized, can-subtracted CORELLI volumes).
 
 Recommended order: subtract an empty-can measurement if there is one (both
 volumes unsymmetrized, on one scale), then remove the remaining rings, then
-symmetrize and filter the rings once more, then treat the Bragg peaks (mask,
+symmetrize without outliers and filter the rings once more (the preset
+*Rings, then symmetrize*), then treat the Bragg peaks (mask,
 punch and fill) and compute the 3D-ΔPDF. `any` instead removes every ring sharper
 than a cutoff, for phases that are not in the library.
 
