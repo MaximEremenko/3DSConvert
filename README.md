@@ -558,7 +558,12 @@ the average - the copper (111) excess of the symmetrized volume as read
 stays that of the measured one (0.017; 0.032 with *average*) - and with the
 second filter no line is left above 4.8 (aluminium 2.1-4.8, copper 4.8 and
 3.5, against 2.9-5.1 at the sample's own shells): the preset *Rings, then
-symmetrize* runs that. A second ring fit after symmetrizing finds nothing:
+symmetrize* runs that. It also serves a volume that was symmetrized already:
+the filter, working about one axis, breaks the symmetry a little, and the
+symmetrization puts it back (on Mantid's m-3m volume at 533 K aluminium
+2.1-6.1 and copper 1.7 and 1.4, against 2.7-6.7 and 2.4 and 1.4 with the fit
+and filter alone). The spots such a volume has already averaged in stay as
+ring intensity, and a faint material may go unfound. A second ring fit after symmetrizing finds nothing:
 what is left is no line of the fitted shape. Symmetrized, an empty-can
 volume has a comb of maxima along each ring, which a subtraction carries
 into the sample's volume (the streaks along h and k in the half-integer
