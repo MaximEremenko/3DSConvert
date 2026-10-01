@@ -927,7 +927,8 @@
       ['voxelWidth', 'bool', 'widen the lines by the voxel size along each direction (binned data)'],
       ['shift', 'num', 'let each direction sector shift its lines by up to (fraction; a part off the sample position)'],
       ['maskSpots', 'bool', 'mask bright spots left on the rings (large grains)'],
-      ['positive', 'bool', 'only positive rings (off after an empty-can subtraction, which can leave negative ones)']]],
+      ['positive', 'bool', 'fit positive rings first; search rejected materials for negative rings'],
+      ['protect', 'extra?', 'sample-feature mask (positive values excluded from estimates and left unchanged; same grid)']]],
     filterRings: ['Ring filter at the lines (Fourier)', [
       ['materials', 'text', 'materials whose lines are filtered: aluminium, copper, … (as a ring removal before fitted them, else fitted here)'],
       ['temperature', 'num', 'temperature of the aluminium (K; 0 = room), when fitted here'],
@@ -940,7 +941,8 @@
       ['smooth', 'num', 'Fourier low-pass: finer than this many line widths is noise'],
       ['bragg', 'num', 'leave the sample’s Bragg regions out of the estimate: radius (r.l.u.; 0 = none)'],
       ['passes', 'num', 'passes (1–10)'],
-      ['local', 'num', 'then fit the ring’s strength locally, in patches of about this many voxels (0 = off): texture and grains along a ring']]],
+      ['local', 'num', 'optional local strength fit: voxels per patch (0 = off; may remove narrow sample features)'],
+      ['protect', 'extra?', 'sample-feature mask (positive values excluded from estimates and left unchanged; same grid)']]],
     backgroundDebyeWaller: ['Background: Laue + thermal (Debye–Waller)', [
       ['composition', 'text', 'sites, e.g. Pb; Mg 0.333 + Nb 0.667; 3*O'], ['uiso', 'text', 'Uiso (Å²): one value, or e.g. 0.01, Pb 0.03'],
       ['radiation', ['auto', 'xray', 'neutron', 'electron'], 'radiation (auto: the data’s)'],
@@ -1003,7 +1005,7 @@
       resolution: 0.004, voxelWidth: true, shift: 0.002, maskSpots: false, highPass: 6, sectors: 8, coverage: 0.25, cutoff: 0.05, width: 0.005,
       positive: true },
     filterRings: { materials: 'aluminium', temperature: 0, radiation: 'auto', axis: 'auto', angleStep: 1, azimuth: 4, window: 3, highPass: 4, smooth: 0.4,
-      bragg: 0.3, passes: 3, local: 30 },
+      bragg: 0.3, passes: 3, local: 0 },
     backgroundDebyeWaller: { composition: '', uiso: '0.01', radiation: 'auto', fit: true, percentile: 5, width: 0.05, offset: false, scale: 1 },
     correctUB: { mode: 'refine', centring: 'P', radius: 0.25, snr: 10, peaks: 300, shift: false, ub: [], ubNew: [] },
     despike: { size: 1, k: 5 }, window: { kind: 'lorch', qmax: 0 },
@@ -1017,7 +1019,7 @@
         fitWidth: true, sigma0: 0.005, resolution: 0.004, voxelWidth: true, shift: 0.002, maskSpots: false, highPass: 6, sectors: 8,
         coverage: 0.25, cutoff: 0.05, width: 0.005, positive: true },
       { op: 'filterRings', materials: 'aluminium, copper', temperature: 0, radiation: 'auto', axis: 'auto', angleStep: 1, azimuth: 4,
-        window: 3, highPass: 4, smooth: 0.4, bragg: 0.3, passes: 3, local: 30 },
+        window: 3, highPass: 4, smooth: 0.4, bragg: 0.3, passes: 3, local: 0 },
       { op: 'symmetrize', laue: 'm-3m', mode: 'clip', k: 3, expand: true }] },
     { name: 'Subtract a background volume', note: 'load it under Other volumes', steps: [
       { op: 'combine', operation: 'subtract', scale: 1 }] },
@@ -1028,20 +1030,16 @@
         fitWidth: true, sigma0: 0.005, resolution: 0.004, voxelWidth: true, shift: 0.002, maskSpots: false, highPass: 6, sectors: 8,
         coverage: 0.25, cutoff: 0.05, width: 0.005, positive: true },
       { op: 'filterRings', materials: 'aluminium, copper', temperature: 0, radiation: 'auto', axis: 'auto', angleStep: 1, azimuth: 4,
-        window: 3, highPass: 4, smooth: 0.4, bragg: 0.3, passes: 3, local: 30 }] },
-    // the rings go while they are still ordered about the rotation axis;
-    // symmetrizing without outliers keeps the spots of large grains, which
-    // the robust fit leaves, from being averaged into rings; the second
-    // filter takes the rest with the lines of the fit
-    { name: 'Rings, then symmetrize', note: 'aluminium and copper rings fitted and filtered as measured · m-3m symmetrize without outliers · the rings filtered once more', steps: [
+        window: 3, highPass: 4, smooth: 0.4, bragg: 0.3, passes: 3, local: 0 }] },
+    // A second filter and local amplitudes are explicit choices: they can
+    // improve ring residuals but are not uniformly beneficial to the sample.
+    { name: 'Rings, then symmetrize', note: 'fit and filter rings, then m-3m clip average; local refinement and a second filter can be added after inspection', steps: [
       { op: 'removeRings', materials: 'aluminium, copper', temperature: 0, radiation: 'auto', intensities: 'free', refine: 0.01,
         fitWidth: true, sigma0: 0.005, resolution: 0.004, voxelWidth: true, shift: 0.002, maskSpots: false, highPass: 6, sectors: 8,
         coverage: 0.25, cutoff: 0.05, width: 0.005, positive: true },
       { op: 'filterRings', materials: 'aluminium, copper', temperature: 0, radiation: 'auto', axis: 'auto', angleStep: 1, azimuth: 4,
-        window: 3, highPass: 4, smooth: 0.4, bragg: 0.3, passes: 3, local: 30 },
-      { op: 'symmetrize', laue: 'm-3m', mode: 'clip', k: 3, expand: true },
-      { op: 'filterRings', materials: 'aluminium, copper', temperature: 0, radiation: 'auto', axis: 'auto', angleStep: 1, azimuth: 4,
-        window: 3, highPass: 4, smooth: 0.4, bragg: 0.3, passes: 3, local: 30 }] },
+        window: 3, highPass: 4, smooth: 0.4, bragg: 0.3, passes: 3, local: 0 },
+      { op: 'symmetrize', laue: 'm-3m', mode: 'clip', k: 3, expand: true }] },
   ];
 
   for (const [group, ops] of STEP_GROUPS) {

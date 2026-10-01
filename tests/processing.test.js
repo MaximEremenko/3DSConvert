@@ -631,7 +631,7 @@ test('filterRings: what the ring fit leaves goes by a Fourier filter over the an
     // in the recipe's memo; here that is passed on)
     const memo = {}, logs = [];
     const fitted = await Processing.applyRecipe(data, { steps: [{ op: 'removeRings', materials: 'aluminium', voxelWidth: false }] }, { cell, memo });
-    const out = await Processing.applyRecipe(fitted, { steps: [{ op: 'filterRings', materials: 'aluminium' }] }, { cell, memo, log: t => logs.push(t) });
+    const out = await Processing.applyRecipe(fitted, { steps: [{ op: 'filterRings', materials: 'aluminium', local: 30 }] }, { cell, memo, log: t => logs.push(t) });
     const text = logs.join('\n');
     assert.match(text, /the lines of aluminium as the ring removal before fitted them/);
     assert.match(text, /local ring strength over patches of about 30 voxels/);

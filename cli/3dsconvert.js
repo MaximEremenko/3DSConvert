@@ -57,7 +57,7 @@ Input
 
 Processing
       --recipe FILE       a recipe .json saved by the page
-      --extra FILE        a volume the recipe names (combine, normalize; repeat)
+      --extra FILE        a named volume or ring-protection mask (repeat)
 
   -q, --quiet             only errors
   -h, --help              this text`;

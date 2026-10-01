@@ -297,7 +297,7 @@
         },
         filterRings: {
             materials: 'aluminium', temperature: 0, radiation: 'auto', window: 3, highPass: 4, smooth: 0.4, axis: 'auto', angleStep: 1,
-            azimuth: 4, bragg: 0.3, passes: 3, local: 30,
+            azimuth: 4, bragg: 0.3, passes: 3, local: 0,
         },
         backgroundDebyeWaller: { radiation: 'auto', uiso: '0.01', fit: true, scale: 1, offset: false, percentile: 5, width: 0.05 },
         correctUB: { mode: 'refine', centring: 'P', radius: 0.25, snr: 10, peaks: 300, shift: false },
@@ -1011,31 +1011,63 @@
         };
     }
 
-    // Least squares with non-negative coefficients for a few columns: the
-    // normal equations, dropping a column whose coefficient comes out below
-    // zero, until none does.
-    // Columns that are zero where the weights are (lines outside the data)
-    // stay out; a tiny ridge keeps nearly equal columns solvable. Returns
-    // { x, M, idx }: the coefficients, and the normal matrix of the columns
-    // kept.
+    // Weighted non-negative least squares for a few columns. The active set
+    // admits an excluded column whenever its gradient violates the KKT
+    // conditions; an infeasible trial moves only as far as the first zero.
+    // Normalize columns before solving and retain a 1e-10 diagonal ridge in
+    // that coordinate, so duplicate / nearly equal columns remain solvable.
+    // Thus the minimized objective is sum(w * residual^2) +
+    // 1e-10 * sum(norm[column] * x[column]^2). The signed path minimizes the
+    // same objective without inequality constraints. Returns { x, M, idx },
+    // with M in the original coordinates for amplitude uncertainties.
     function nonNegative(cols, y, wt, keep, signed) {
         const n = cols.length, x = new Array(n).fill(0);
         const dotw = (u, v) => { let s = 0; for (let b = 0; b < y.length; b++) if (wt[b]) s += wt[b] * u[b] * v[b]; return s; };
         const norms = cols.map(c => dotw(c, c)), top = Math.max(0, ...norms);
-        const active = norms.map((v, i) => v > 1e-24 * top && v > 0 && (!keep || keep[i]));
-        for (let round = 0; round <= n; round++) {
-            const idx = [...active.keys()].filter(i => active[i]);
-            if (!idx.length) return { x: x.fill(0), M: null, idx };
-            const M = idx.map(i => idx.map(j => dotw(cols[i], cols[j]) + (i === j ? 1e-10 * norms[i] : 0)));
-            const sol = solveSmall(M, idx.map(i => dotw(cols[i], y)));
-            if (!sol) return { x: x.fill(0), M: null, idx: [] };
-            x.fill(0);
-            idx.forEach((i, k) => { x[i] = sol[k]; });
-            const neg = idx.filter(i => !(signed ? Number.isFinite(x[i]) : x[i] >= 0));
-            if (!neg.length) return { x, M, idx };
-            for (const i of neg) active[i] = false;
+        const available = norms.map((v, i) => i).filter(i => norms[i] > 1e-24 * top && norms[i] > 0 && (!keep || keep[i]));
+        const p = available.length;
+        if (!p) return { x, M: null, idx: [] };
+        const scale = available.map(i => Math.sqrt(norms[i]));
+        const G = Array.from({ length: p }, () => new Array(p).fill(0));
+        for (let i = 0; i < p; i++) {
+            G[i][i] = 1 + 1e-10;
+            for (let j = 0; j < i; j++) G[i][j] = G[j][i] = dotw(cols[available[i]], cols[available[j]]) / (scale[i] * scale[j]);
         }
-        return { x: x.fill(0), M: null, idx: [] };
+        const rhs = available.map((i, k) => dotw(cols[i], y) / scale[k]);
+        const finish = (z, indices) => {
+            available.forEach((i, k) => { x[i] = z[k] / scale[k]; });
+            return { x, idx: indices.map(i => available[i]), M: indices.length ? indices.map(i => indices.map(j => G[i][j] * scale[i] * scale[j])) : null };
+        };
+        const full = solveSmall(G, rhs);
+        if (!full || !full.every(Number.isFinite)) throw new Error('ring fit: non-finite least-squares solution');
+        if (signed || full.every(v => v >= 0)) return finish(full, [...available.keys()]);
+        const z = new Array(p).fill(0), passive = new Set();
+        const tol = 1e-10 * Math.max(1e-300, ...rhs.map(Math.abs));
+        let iterations = 0;
+        while (iterations++ < 100 * p * p) {
+            let enter = -1, largest = tol;
+            for (let i = 0; i < p; i++) {
+                if (passive.has(i)) continue;
+                const gradient = rhs[i] - G[i].reduce((sum, g, j) => sum + g * z[j], 0);
+                if (gradient > largest) { largest = gradient; enter = i; }
+            }
+            if (enter < 0) return finish(z, [...passive].sort((a, b) => a - b));
+            passive.add(enter);
+            while (iterations++ < 100 * p * p) {
+                const indices = [...passive].sort((a, b) => a - b);
+                const trial = solveSmall(indices.map(i => indices.map(j => G[i][j])), indices.map(i => rhs[i]));
+                if (!trial || !trial.every(Number.isFinite)) throw new Error('ring fit: non-finite active-set solution');
+                if (trial.every(v => v > 0)) {
+                    indices.forEach((i, k) => { z[i] = trial[k]; });
+                    break;
+                }
+                let alpha = 1;
+                indices.forEach((i, k) => { if (trial[k] <= 0) alpha = Math.min(alpha, z[i] / (z[i] - trial[k] || 1)); });
+                indices.forEach((i, k) => { z[i] += alpha * (trial[k] - z[i]); });
+                indices.forEach(i => { if (z[i] <= tol) { z[i] = 0; passive.delete(i); } });
+            }
+        }
+        throw new Error('ring fit: non-negative least squares did not converge');
     }
 
     // Rings of named materials: their lines are fitted to the high-passed
@@ -1207,7 +1239,7 @@
                 const z = (pre.y[b] - t * sum[b]) * Math.sqrt(pre.base[b]);
                 loss += Math.abs(z) <= pre.c ? z * z : 2 * pre.c * Math.abs(z) - pre.c * pre.c;
             }
-            return { t: t > 0 ? t : 1, loss };
+            return { t, loss };
         };
         // a voxel holds the mean over its extent: along the direction n a
         // line is widened by sqrt(sum_i (q_i . n)^2 / 12), q_i its steps in
@@ -1273,7 +1305,8 @@
             if (step.refine > 0) mats.forEach((_, k) => { match[k] = search(t => { lambdas[k] = t; }, 1 - step.refine, 1 + step.refine, 40); });
             if (step.fitWidth) widths();
         }
-        if (step.refine > 0) mats.forEach((_, k) => { match[k] = Math.max(match[k], search(t => { lambdas[k] = t; }, lambdas[k] - step.refine / 10, lambdas[k] + step.refine / 10, 10)); });
+        if (step.refine > 0) mats.forEach((_, k) => { match[k] = Math.max(match[k], search(t => { lambdas[k] = t; },
+            Math.max(1 - step.refine, lambdas[k] - step.refine / 10), Math.min(1 + step.refine, lambdas[k] + step.refine / 10), 10)); });
         const free = step.intensities === 'free' || unknown;
         let fit = fitProfile(whole, lambdas, s0, r, free, true);
         if (!fit) throw new Error('ring removal: too few |Q| bins with data to fit');
@@ -1489,7 +1522,7 @@
     // the next pass is made for them (at most three). Returns the result of
     // materialRings and the geometry of the voxels.
     function fitMaterialRings(model, step, ctx) {
-        const once = (st, geometryIn) => {
+        const once = (st, geometryIn, fitModel = model) => {
             let s0 = Math.max(st.sigma0, 1e-4), r0 = st.resolution, result = null, logs = [], geometry = geometryIn;
             for (let pass = 0; pass < 3; pass++) {
                 const a0 = s0, b0 = r0;
@@ -1498,10 +1531,10 @@
                     q: u => (b0 > 0 ? a0 / b0 * Math.sinh(b0 * u) : u * a0),
                     du: 0.25,
                 };
-                const rp = Object.assign(ringProfiles(model, ctx.cell, st, coord, geometry), { du: coord.du, s0init: a0, rinit: b0, coordU: coord.u });
+                const rp = Object.assign(ringProfiles(fitModel, ctx.cell, st, coord, geometry), { du: coord.du, s0init: a0, rinit: b0, coordU: coord.u });
                 geometry = rp.geometry;
                 logs = [];
-                result = materialRings(model, rp, st, Object.assign({}, ctx, { log: t => logs.push(t) }));
+                result = materialRings(fitModel, rp, st, Object.assign({}, ctx, { log: t => logs.push(t) }));
                 if (!result.atLimit) break;
                 s0 = Math.max(result.s0, 1e-4);
                 r0 = result.r;
@@ -1509,15 +1542,47 @@
             return { result, geometry, logs };
         };
         let out = once(step, null);
-        if (step.positive && !out.result.lines.length) {
-            // no positive rings: an empty-can subtraction may have taken off
-            // more than the rings and left them negative
-            const signed = once(Object.assign({}, step, { positive: false }), out.geometry);
-            const negative = signed.result.lines.filter(x => x.height < 0).length;
-            if (signed.result.lines.length && 2 * negative >= signed.result.lines.length) {
-                ctx.log('no positive rings, but negative ones (an empty-can subtraction took off more than the rings): ' +
-                    'fitted with intensities of either sign');
-                out = signed;
+        const missing = step.positive ? parseMaterials(step.materials).filter(m => !out.result.lines.some(line => line.name === m.name)) : [];
+        if (missing.length) {
+            // An empty-can subtraction can leave one material positive and
+            // another negative. Preserve every accepted positive model, then
+            // test only the missing materials on the negated residual. This
+            // is a negative-only NNLS candidate with the same significance,
+            // share and lattice-preference safeguards as the positive fit.
+            // Arbitrarily signed lines within one material remain opt-in via
+            // positive:false.
+            const positive = out.result, residual = new Float64Array(model.values.length);
+            if (!positive.lines.length) {
+                for (let j = 0; j < residual.length; j++) residual[j] = -model.values[j];
+            } else {
+                const Qm = qMatrix(ctx.cell), q0 = mulMV(Qm, model.corner), [qa, qb, qc] = model.vectors.map(u => mulMV(Qm, u));
+                const [nh, nk, nl] = model.dims, n = [0, 0, 0];
+                let j = 0;
+                for (let il = 0; il < nl; il++)
+                    for (let ik = 0; ik < nk; ik++)
+                        for (let ih = 0; ih < nh; ih++, j++) {
+                            if (model.values[j] !== model.values[j]) { residual[j] = NaN; continue; }
+                            const x = q0[0] + ih * qa[0] + ik * qb[0] + il * qc[0];
+                            const y = q0[1] + ih * qa[1] + ik * qb[1] + il * qc[1];
+                            const z = q0[2] + ih * qa[2] + ik * qb[2] + il * qc[2];
+                            const q = Math.hypot(x, y, z);
+                            n[0] = x / q; n[1] = y / q; n[2] = z / q;
+                            residual[j] = positive.ring(j, q > 0 ? n : null) - model.values[j];
+                        }
+            }
+            const negative = once(Object.assign({}, step, { materials: missing.map(m => m.spec).join(', ') }),
+                out.geometry, Object.assign({}, model, { values: residual }));
+            if (negative.result.lines.length) {
+                ctx.log((positive.lines.length ? 'additional materials have negative rings' : 'no positive rings, but negative ones') +
+                    ': missing materials fitted with negative-only intensities on the residual');
+                const neg = negative.result;
+                out.logs.push(...negative.logs.map(t => 'negative residual fit: ' + t));
+                out.result = Object.assign({}, positive.lines.length ? positive : neg, {
+                    ring: (j, n) => positive.ring(j, n) - neg.ring(j, n),
+                    lines: positive.lines.concat(neg.lines.map(line => Object.assign({}, line, { height: -line.height }))).sort((a, b) => a.q - b.q),
+                    cores: (positive.cores || []).concat(neg.cores || []).sort((a, b) => a.q - b.q),
+                    names: positive.names,
+                });
             }
         }
         out.logs.forEach(t => ctx.log(t));
@@ -1858,9 +1923,10 @@
     // directions about the axis that hold about `least` voxels each (their
     // angle grows as 1/|Q|), Huber-weighted least squares of the voxels
     // within four widths of the line on a quadratic background and the
-    // line's Gaussian profile give the ring's local amplitude left there
-    // (the scattering that crosses a ring is broad across it, so the
-    // background takes it). The amplitude is shrunk by its significance
+    // line's Gaussian profile estimate a possible ring amplitude. This is
+    // optional: narrow sample planes or rods can have the same radial shape,
+    // so the polynomial does not identify the physical source. The amplitude
+    // is shrunk by its significance
     // (A (1 - se^2/A^2)), held within the ring's height, smoothed over
     // neighbouring patches (weights 1/se^2) and interpolated between their
     // centres. Patches round the sample's reflections at the line's |Q| are
@@ -1871,10 +1937,15 @@
         const { lines, s0, r, fv, wi, wq, wd, wt, wphi, wfar, nw, NT, e, e1, e2, Qm } = o;
         if (!lines.length) return;
         const W = 4, qs = lines.map(x => x.q);
-        const aStar = Math.min(...[0, 1, 2].map(c => Math.hypot(Qm[0][c], Qm[1][c], Qm[2][c])));
+        const Qi = invert3(Qm);
+        // An upper bound on ||Qm||_2 maps the hkl exclusion ball to a
+        // containing Q-space ball; exact for the cubic grids in the paper.
+        const qNorm = Math.sqrt(Math.max(...Qm.map(row => row.reduce((s, x) => s + Math.abs(x), 0))) *
+            Math.max(...[0, 1, 2].map(c => Qm.reduce((s, row) => s + Math.abs(row[c]), 0))));
         // per window voxel: its line (nearest in widths) and offset in widths
         const owner = new Int16Array(nw).fill(-1), xs = new Float32Array(nw);
         for (let t = 0; t < nw; t++) {
+            if (o.allowed && !o.allowed[t]) continue;
             const q = wq[t], w0 = s0 * s0 + r * r * q * q, sv2 = (wd[t] * wd[t] - 1) * w0;
             let best = -1, bx = Infinity;
             for (let k = 0; k < qs.length; k++) {
@@ -1899,29 +1970,46 @@
                 nphi[b] = Math.max(1, Math.round(2 * Math.PI * Math.sqrt(1 - zc * zc) / P));
                 offs[b + 1] = offs[b] + nphi[b];
             }
-            const NP = offs[nz], centre = new Float64Array(3 * NP);
+            const NP = offs[nz], centre = new Float64Array(3 * NP), patchRadius = new Float64Array(NP);
             for (let b = 0; b < nz; b++) {
                 const zc = -1 + (b + 0.5) * 2 / nz, rc = Math.sqrt(1 - zc * zc);
+                const zlo = -1 + b * 2 / nz, zhi = -1 + (b + 1) * 2 / nz, cp = Math.cos(Math.PI / nphi[b]);
+                const edgeDot = z => zc * z + rc * Math.sqrt(Math.max(0, 1 - z * z)) * cp;
+                let minDot = Math.min(edgeDot(zlo), edgeDot(zhi));
+                if (cp < 0) {
+                    const stationary = -zc / Math.hypot(zc, rc * cp);
+                    if (stationary >= zlo && stationary <= zhi) minDot = Math.min(minDot, edgeDot(stationary));
+                }
+                const angularRadius = Math.acos(Math.max(-1, Math.min(1, minDot)));
                 for (let j = 0; j < nphi[b]; j++) {
                     const ph = -Math.PI + (j + 0.5) * 2 * Math.PI / nphi[b], p = offs[b] + j;
                     for (let c = 0; c < 3; c++) centre[3 * p + c] = rc * (Math.cos(ph) * e1[c] + Math.sin(ph) * e2[c]) + zc * e[c];
+                    patchRadius[p] = angularRadius;
                 }
             }
             const patchOf = (zeta, phi) => {
                 const b = Math.min(nz - 1, Math.max(0, Math.floor((zeta + 1) / 2 * nz)));
                 return offs[b] + Math.min(nphi[b] - 1, Math.floor((phi + Math.PI) / (2 * Math.PI) * nphi[b]));
             };
-            // patches round the sample's reflections at this |Q|: not fitted
-            const blocked = new Uint8Array(NP), cone = Math.cos(Math.min(Math.PI / 2, 1.2 * Math.max(o.bragg, 0.1) * aStar / line.q));
-            const hmax = Math.ceil((line.q + 3 * sig) / aStar) + 1;
+            // Exclude a patch when its whole radial fitting interval meets a
+            // sample-reflection neighborhood. Unlike a 3-sigma shell test,
+            // this includes reflections just outside the ring core. The
+            // angular patch radius enlarges the guard to cover its footprint.
+            const blocked = new Uint8Array(NP), radius = 1.2 * o.bragg * qNorm;
+            const radialLo = Math.max(0, line.q - W * sig), radialHi = line.q + W * sig;
+            const maxQ = radialHi + radius;
+            const bounds = Qi.map(row => Math.ceil(Math.hypot(...row) * maxQ));
             let nref = 0;
-            for (let h = -hmax; h <= hmax; h++) for (let kk = -hmax; kk <= hmax; kk++) for (let l = -hmax; l <= hmax; l++) {
+            if (o.bragg > 0) for (let h = -bounds[0]; h <= bounds[0]; h++) for (let kk = -bounds[1]; kk <= bounds[1]; kk++) for (let l = -bounds[2]; l <= bounds[2]; l++) {
                 if (!h && !kk && !l) continue;
                 const g = mulMV(Qm, [h, kk, l]), qh = Math.hypot(...g);
-                if (Math.abs(qh - line.q) > 3 * sig) continue;
+                if (qh < radialLo - radius || qh > maxQ) continue;
                 nref++;
                 for (let p = 0; p < NP; p++) {
-                    if ((centre[3 * p] * g[0] + centre[3 * p + 1] * g[1] + centre[3 * p + 2] * g[2]) / qh > cone) blocked[p] = 1;
+                    const projection = centre[3 * p] * g[0] + centre[3 * p + 1] * g[1] + centre[3 * p + 2] * g[2];
+                    const closest = Math.max(radialLo, Math.min(radialHi, projection));
+                    const footprint = 2 * radialHi * Math.sin(patchRadius[p] / 2);
+                    if (qh * qh + closest * closest - 2 * closest * projection < (radius + footprint) ** 2) blocked[p] = 1;
                 }
             }
             // the voxels of this line
@@ -2033,11 +2121,12 @@
             `${Math.sqrt(sumCorr / Math.max(1, nCorr)).toPrecision(2)}`);
     }
 
-    // Powder rings in data from a crystal turned about one axis depend on
+    // Powder rings in data from a crystal turned about one axis often depend on
     // |Q| and on the angle to that axis (a detector pixel sees a ring at one
     // angle to the axis whatever the turn, so detector edges and gaps, the
     // resolution and the paths through the sample environment all follow
-    // it), and only smoothly on the azimuth about it. What a ring removal
+    // it). Low azimuthal orders approximate coverage/attenuation effects;
+    // finite scans and sharp shadows need not be smooth. What a ring removal
     // leaves at the lines, or the rings without one, is estimated on those
     // coordinates: medians in bins of the angle to the axis (a degree) and
     // of the width-normalized |Q| of the ring fit, band-passed along |Q| in
@@ -2063,13 +2152,14 @@
         const [nh, nk, nl] = model.dims, N = voxelCount(model), v = model.values, [va, vb, vc] = model.vectors, c0 = model.corner;
         const qsteps = [qa, qb, qc].filter((_, a) => model.dims[a] > 1), flat = qsteps.length < 3;
         const sum2 = qsteps.reduce((acc, q) => acc + dot(q, q), 0), svAvg = voxelWidth ? Math.sqrt(sum2 / 36) : 0;
-        const du = 0.25, W = step.window, uOf = q => (r > 0 ? Math.asinh(r * q / s0) / r : q / s0);
+        const du = 0.25, W = step.window, support = Math.max(W, step.local > 0 ? 4 : W);
+        const uOf = q => (r > 0 ? Math.asinh(r * q / s0) / r : q / s0);
         const lu = Float64Array.from(lines, x => uOf(x.q)), nlines = lines.length;
-        const wuMax = voxelWidth ? Math.sqrt(1 + sum2 / 12 / (s0 * s0)) : 1, reach = (W + 1) * wuMax + 3 * step.highPass;
+        const wuMax = voxelWidth ? Math.sqrt(1 + sum2 / 12 / (s0 * s0)) : 1, reach = (support + 1) * wuMax + 3 * step.highPass;
         const b0 = Math.max(0, Math.floor((lu[0] - reach) / du)), nbr = Math.ceil((lu[nlines - 1] + reach) / du) + 1 - b0;
         // a voxel's distance to the nearest line, in its own line widths
         // (the voxel's width along its direction added), as a window weight
-        const windowAt = (u, q, sv2) => {
+        const windowAt = (u, q, sv2, width = W) => {
             let lo = 0, hi = nlines - 1;
             while (lo < hi) {
                 const mid = (lo + hi) >> 1;
@@ -2078,7 +2168,7 @@
             let d = Math.abs(u - lu[lo]);
             if (lo > 0) d = Math.min(d, Math.abs(u - lu[lo - 1]));
             d /= Math.sqrt(1 + sv2 / (s0 * s0 + r * r * q * q));
-            return d <= W ? 1 : d < W + 1 ? 0.5 * (1 + Math.cos(Math.PI * (d - W))) : 0;
+            return d <= width ? 1 : d < width + 1 ? 0.5 * (1 + Math.cos(Math.PI * (d - width))) : 0;
         };
         const farFrom = (h, k, l) => {
             if (!(step.bragg > 0)) return true;
@@ -2113,7 +2203,7 @@
                     const z = q0[2] + ih * qa[2] + ik * qb[2] + il * qc[2];
                     const q = Math.sqrt(x * x + y * y + z * z);
                     if (!(q > 0)) continue;
-                    if (windowAt(uOf(q), q, sv2Of(x, y, z, q)) > 0) nw++;
+                    if (windowAt(uOf(q), q, sv2Of(x, y, z, q), support) > 0) nw++;
                     if (!auto) continue;
                     for (let p = 0; p < pick.length; p++) {
                         const d = Math.abs(q - pick[p].q), w = pick[p].w;
@@ -2199,7 +2289,7 @@
                         }
                     }
                     const sv2 = sv2Of(x, y, z, q), wv = windowAt(u, q, sv2);
-                    if (wv > 0 && w < nw) {
+                    if (windowAt(u, q, sv2, support) > 0 && w < nw) {
                         wd[w] = Math.sqrt(1 + sv2 / (s0 * s0 + r * r * q * q));
                         wi[w] = f;
                         wu[w] = u / du - 0.5 - b0;
@@ -2232,9 +2322,11 @@
         // a bin of angle and |Q| whose circle about the axis the edge of the
         // grid cuts (a quarter or more of it outside) says nothing about a
         // ring: its median is that of a few patches of the sample
-        const toIndex = invert3(mulMM(Qm, gridMatrix(model))), broad = new Uint8Array(NT * nbr);
-        for (let t = 0; t < NT; t++) {
-            const th = (t + 0.5) / NT * Math.PI, st = Math.sin(th), ct = Math.cos(th);
+        const toIndex = invert3(mulMM(Qm, gridMatrix(model)));
+        const circleMask = (count, cosineAt) => {
+            const mask = new Uint8Array(count * nbr);
+            for (let t = 0; t < count; t++) {
+            const ct = cosineAt(t), st = Math.sqrt(Math.max(0, 1 - ct * ct));
             for (let b = 0; b < nbr; b++) {
                 const u = (b + b0 + 0.5) * du, q = r > 0 ? s0 / r * Math.sinh(r * u) : u * s0;
                 let inside = 0;
@@ -2249,8 +2341,19 @@
                     }
                     if (ok) inside++;
                 }
-                broad[t * nbr + b] = inside >= 24 ? 1 : 0;
+                mask[t * nbr + b] = inside > 24 ? 1 : 0;
             }
+            }
+            return mask;
+        };
+        const broad = circleMask(NT, t => Math.cos((t + 0.5) / NT * Math.PI));
+        const coarseBroad = K > 0 ? circleMask(NZ, t => -1 + (t + 0.5) * 2 / NZ) : null;
+        const allowed = new Uint8Array(nw);
+        for (let t = 0; t < nw; t++) {
+            const it = Math.min(NT - 1, Math.max(0, Math.floor(wt[t] + 0.5)));
+            const ib = Math.min(nbr - 1, Math.max(0, Math.floor(wu[t] + 0.5)));
+            allowed[t] = broad[it * nbr + ib];
+            if (!allowed[t]) { ww[t] = 0; wfar[t] = 0; }
         }
         const axialTable = (half, least) => {
             const am = groupMedians(axial, fv, least, half);
@@ -2262,6 +2365,7 @@
             }
             const at = bandPassRows(am.med, am.cnt, NT, nbr, du, step.highPass, step.smooth);
             smoothAcross(at.table, at.weight, NT, 1, nbr, 0.7, 16);
+            for (let g = 0; g < broad.length; g++) if (!broad[g]) { at.table[g] = 0; at.weight[g] = 0; }
             return at;
         };
         let kept = lines;
@@ -2317,7 +2421,7 @@
                         let d = Infinity;
                         for (let k = 0; k < ku.length; k++) d = Math.min(d, Math.abs(u - ku[k]));
                         d /= wd[t];
-                        ww[t] = d <= W ? 1 : d < W + 1 ? 0.5 * (1 + Math.cos(Math.PI * (d - W))) : 0;
+                        ww[t] = !allowed[t] ? 0 : d <= W ? 1 : d < W + 1 ? 0.5 * (1 + Math.cos(Math.PI * (d - W))) : 0;
                     }
                 }
             }
@@ -2332,11 +2436,18 @@
             // the low azimuthal orders, on coarse cells of angle and azimuth
             if (azimuthal) {
                 const zm = groupMedians(azimuthal, fv, 4);
+                for (let iz = 0; iz < NZ; iz++) for (let p = 0; p < NP; p++) for (let b = 0; b < nbr; b++) {
+                    if (!coarseBroad[iz * nbr + b]) {
+                        const g = (iz * NP + p) * nbr + b;
+                        zm.med[g] = NaN; zm.cnt[g] = 0;
+                    }
+                }
                 const zt = bandPassRows(zm.med, zm.cnt, NZ * NP, nbr, du, step.highPass, step.smooth);
                 smoothAcross(zt.table, zt.weight, NZ, NP, nbr, 0.7, 16);
                 const coef = Array.from({ length: nbas }, () => new Float64Array(NZ * nbr));
                 for (let iz = 0; iz < NZ; iz++) {
                     for (let b = 0; b < nbr; b++) {
+                        if (!coarseBroad[iz * nbr + b]) continue;
                         let filled = 0;
                         for (let p = 0; p < NP; p++) if (zt.weight[(iz * NP + p) * nbr + b] > 0) filled++;
                         if (filled < nbas) continue;
@@ -2374,7 +2485,7 @@
         if (step.local > 0 && !flat) {
             localRingAmplitudes({
                 lines: kept.map(x => Object.assign({ cover: covered[lines.indexOf(x)] }, x)), s0, r, fv, wi, wq, wd, wt, wphi, wfar, nw, NT, e, e1, e2,
-                Qm, cellQ, svAvg, least: step.local, bragg: step.bragg, log: ctx.log,
+                Qm, cellQ, svAvg, allowed, least: step.local, bragg: step.bragg, log: ctx.log,
             });
         }
         const values = copyValues(model);
@@ -3687,7 +3798,7 @@ D|0.413048 0.294953 0.187491 0.080701 0.023736 15.56995 32.39847 5.711404 61.889
             fields: {
                 materials: 'any', temperature: 'nonnegative', radiation: 'radiation', intensities: 'ringIntensities', refine: 'fraction', fitWidth: 'boolean',
                 sigma0: 'nonnegative', resolution: 'nonnegative', width: 'positive', cutoff: 'positive', highPass: 'positive', sectors: 'sectors', coverage: 'fraction',
-                positive: 'boolean', voxelWidth: 'boolean', shift: 'fraction', maskSpots: 'boolean',
+                positive: 'boolean', voxelWidth: 'boolean', shift: 'fraction', maskSpots: 'boolean', protect: 'string?',
             },
         },
         filterRings: {
@@ -3695,7 +3806,7 @@ D|0.413048 0.294953 0.187491 0.080701 0.023736 15.56995 32.39847 5.711404 61.889
             fields: {
                 materials: 'any', temperature: 'nonnegative', radiation: 'radiation', window: 'positive', highPass: 'positive', smooth: 'nonnegative',
                 axis: 'axisSpec', angleStep: 'angleStep', azimuth: 'azimuthOrder', bragg: 'nonnegative', passes: 'filterPasses',
-                local: 'localVoxels',
+                local: 'localVoxels', protect: 'string?',
             },
         },
         scale: { run: stepScale, fields: { factor: 'number', offset: 'number', positive: 'boolean' } },
@@ -3855,6 +3966,36 @@ D|0.413048 0.294953 0.187491 0.080701 0.023736 15.56995 32.39847 5.711404 61.889
         }
     }
 
+    // A supplied sample-feature mask is prior information, not inferred from
+    // the ring residual. Positive finite mask values protect data from BOTH
+    // estimation and subtraction. Environmental contamination at those voxels
+    // necessarily remains. Require identical grids to avoid ambiguous masks.
+    async function runRingProtected(model, step, ctx) {
+        if (!step.protect) return STEPS[step.op].run(model, step, ctx);
+        const mask = ctx.extras && ctx.extras[step.protect];
+        if (!mask) throw new Error(`no loaded protection mask named "${step.protect}"`);
+        if (!sameGrid(model, mask) || mask.values.length !== model.values.length) {
+            throw new Error('ring protection mask must have the same grid as the input volume');
+        }
+        const values = copyValues(model), protectedIndices = [];
+        let measured = 0;
+        for (let i = 0; i < values.length; i++) {
+            if (Number.isFinite(values[i])) measured++;
+            if (Number.isFinite(mask.values[i]) && mask.values[i] > 0 && Number.isFinite(values[i])) {
+                protectedIndices.push(i);
+                values[i] = NaN;
+            }
+        }
+        ctx.log(`${protectedIndices.length} measured voxels protected by "${step.protect}": excluded from the estimate and unchanged in the output`);
+        if (protectedIndices.length === measured) return model;
+        if (!protectedIndices.length) return STEPS[step.op].run(model, step, ctx);
+        const masked = withValues(model, values);
+        const result = await STEPS[step.op].run(masked, step, ctx);
+        const restored = copyValues(result);
+        for (const i of protectedIndices) restored[i] = model.values[i];
+        return withValues(result, restored);
+    }
+
     // Run a recipe. ctx: { cell, extras: { name: model }, tick, progress, log }.
     // Returns the processed model; after a symmetrize step, model.symmetrized is
     // 'laue' (the unified data_type_symmetrized label) and model.laueGroup the group.
@@ -3874,7 +4015,9 @@ D|0.413048 0.294953 0.187491 0.080701 0.023736 15.56995 32.39847 5.711404 61.889
                 if (RECIPROCAL_ONLY.has(step.op) && current.axesType === 'uvw') {
                     throw new Error('needs reciprocal-space (hkl) data, but these are in direct space');
                 }
-                current = await STEPS[step.op].run(current, step, Object.assign({}, ctx, { log }));
+                const context = Object.assign({}, ctx, { log });
+                current = await ((step.op === 'removeRings' || step.op === 'filterRings')
+                    ? runRingProtected(current, step, context) : STEPS[step.op].run(current, step, context));
                 for (const key of ['sigma', 'weights']) {
                     if (current[key] && current[key].length !== current.values.length) current = Object.assign({}, current, { [key]: undefined });
                 }

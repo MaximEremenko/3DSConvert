@@ -366,14 +366,14 @@ const scenarios = [
         })()`);
         const values = await evaluate(`[...document.querySelectorAll('#steps .step')[1].querySelectorAll('.stepbody input')].map(i => i.value).join(' | ')`);
         for (const want of [/aluminium, copper/, /\bauto\b/]) if (!want.test(values)) throw new Error(`no ${want} in the filter form: ${values}`);
-        // rings off as measured, symmetrize without outliers, filter again
+        // conservative preset: extra local refinement/filtering is opt-in
         await evaluate(`(() => {
             document.getElementById('clearRecipe').click();
             document.getElementById('presetBtn').click();
             [...document.querySelectorAll('#presetMenu button')].find(b => /Rings, then symmetrize/.test(b.textContent)).click();
         })()`);
         const order = await evaluate(`[...document.querySelectorAll('#steps .step .stephead b')].map(b => b.textContent).join(' | ')`);
-        if (order !== 'Remove powder rings | Ring filter at the lines (Fourier) | Symmetrize | Ring filter at the lines (Fourier)') throw new Error('steps: ' + order);
+        if (order !== 'Remove powder rings | Ring filter at the lines (Fourier) | Symmetrize') throw new Error('steps: ' + order);
     }],
     ['layout: panels move, the columns and the log resize, the columns swap; kept after a reload', async () => {
         await send('Emulation.setDeviceMetricsOverride', { width: 1400, height: 900, deviceScaleFactor: 1, mobile: false });
