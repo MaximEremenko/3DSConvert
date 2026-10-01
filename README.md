@@ -467,9 +467,13 @@ uncertainty counts below a quarter of their median: in a symmetrized volume
 the shells near the origin hold copies of a few values, whose tiny
 uncertainties would otherwise outweigh the rings (on a CORELLI m-3m volume
 at 533 K aluminium was not found before). An empty-can subtraction that
-took off more than the rings leaves them negative: when a fit of positive
-rings finds none, one with either sign is tried and kept if most lines come
-out negative. A sector
+took off more than the rings leaves them negative, and it can leave one
+material positive and another negative: the materials the positive fit
+does not find are tried again, with negative intensities only, on what it
+leaves, under the same significance and lattice tests; lines of either sign
+within one material need *positive* off. The non-negative fit is solved
+exactly (an active set that takes a line back in whenever it would lower
+the loss). A sector
 fits its own amplitudes when they beat one scale on the whole-shell lines
 by more than their number (Akaike's criterion); the subtraction blends the
 sectors smoothly by direction, so no seams are left. In binned data a voxel
@@ -489,6 +493,11 @@ directions; what it leaves varies with direction, which the ring filter
 below takes off. The *Sample-environment rings* preset runs both for
 aluminium and copper.
 
+Both ring steps take *protect*, the name of a volume loaded under Other
+volumes on the same grid (or `--extra` in the command line): its voxels with
+positive values - planes, rods or spots of the sample that cross a ring -
+are left out of every estimate and keep their measured values.
+
 **Ring filter.** In data from a crystal turned about one axis a ring of the
 sample environment depends on \|Q\| and on the angle to that axis - a
 detector pixel sees the ring at one angle to the axis at every turn, so
@@ -503,8 +512,10 @@ FFT (what is broader than four line widths, and the noise finer than 0.4
 of a width, come off), smoothed over the angle (more widely where the bins
 hold few voxels, near the axis), then the same over coarse cells of angle
 and azimuth for the Fourier orders up to 4 about the axis; three passes.
-Last, the ring's strength is fitted locally: a can's ring varies along
-itself (texture, large grains) more finely than that angular model. Over
+Optionally (*local*, off by default), the ring's strength is then fitted
+locally: a can's ring varies along itself (texture, large grains) more
+finely than that angular model, but narrow planes or rods of the sample have
+the same profile across the ring, so the fit can take them too. Over
 patches of directions holding about 30 voxels each (their angle grows as
 1/|Q|), Huber-weighted least squares of the voxels within four widths of a
 line on a quadratic background and the line's profile give the amplitude
@@ -557,12 +568,15 @@ cores. Symmetrizing without outliers (mode *clip*) keeps the spots out of
 the average - the copper (111) excess of the symmetrized volume as read
 stays that of the measured one (0.017; 0.032 with *average*) - and with the
 second filter no line is left above 4.8 (aluminium 2.1-4.8, copper 4.8 and
-3.5, against 2.9-5.1 at the sample's own shells): the preset *Rings, then
-symmetrize* runs that. It also serves a volume that was symmetrized already:
-the filter, working about one axis, breaks the symmetry a little, and the
-symmetrization puts it back (on Mantid's m-3m volume at 533 K aluminium
-2.1-6.1 and copper 1.7 and 1.4, against 2.7-6.7 and 2.4 and 1.4 with the fit
-and filter alone). The spots such a volume has already averaged in stay as
+3.5, against 2.9-5.1 at the sample's own shells). The preset *Rings, then
+symmetrize* runs the fit, the filter and the symmetrization without
+outliers; the second filter, and the local strengths, are to be added after
+a look at the result, as they do not help the sample's scattering
+everywhere. It also serves a volume that was symmetrized already: the
+filter, working about one axis, breaks the symmetry a little, and the
+symmetrization puts it back (on Mantid's m-3m volume at 533 K, with the
+second filter, aluminium 2.1-6.1 and copper 1.7 and 1.4, against 2.7-6.7 and
+2.4 and 1.4 with the fit and filter alone). The spots such a volume has already averaged in stay as
 ring intensity, and a faint material may go unfound. A second ring fit after symmetrizing finds nothing:
 what is left is no line of the fitted shape. Symmetrized, an empty-can
 volume has a comb of maxima along each ring, which a subtraction carries
@@ -570,9 +584,9 @@ into the sample's volume (the streaks along h and k in the half-integer
 planes of symmetrized, can-subtracted CORELLI volumes).
 
 Recommended order: subtract an empty-can measurement if there is one (both
-volumes unsymmetrized, on one scale), then remove the remaining rings, then
-symmetrize without outliers and filter the rings once more (the preset
-*Rings, then symmetrize*), then treat the Bragg peaks (mask,
+volumes unsymmetrized, on one scale), then remove the remaining rings and
+symmetrize without outliers (the preset *Rings, then symmetrize*), filter
+the rings once more if they still show, then treat the Bragg peaks (mask,
 punch and fill) and compute the 3D-ΔPDF. `any` instead removes every ring sharper
 than a cutoff, for phases that are not in the library.
 
