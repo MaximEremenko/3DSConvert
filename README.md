@@ -577,8 +577,6 @@ in all files, so results are easy to compare.
 - `index.html`, `css/app.css`, `js/app.js` — the browser app: markup,
   styles (light and dark themes) and the page logic, which starts the
   conversion worker.
-- `css/fonts.css` — IBM Plex Sans and Mono embedded as data URIs (see
-  Third-party code); `tools/vendor-fonts.mjs` regenerates it.
 - `js/worker.js` — the conversion worker: file mounting, loading, conversion
   planning and output, driven by messages from the page.
 - `js/converter.js` — format readers/writers and the cell/reciprocal-space
@@ -651,11 +649,6 @@ distributed under the NIST and HDF5 license terms reproduced in
 [`js/h5wasm-LICENSE.txt`](js/h5wasm-LICENSE.txt). The only change is a
 wrapper: the bundle's code sits inside a function, `h5wasmModule()`, whose
 source text the page uses to start the HDF5 engine in its Web Worker.
-
-`css/fonts.css` embeds IBM Plex Sans and IBM Plex Mono (latin and greek
-subsets, from Google Fonts), because browsers do not load font files next
-to a page opened from `file://`. They are under the SIL Open Font License
-1.1, reproduced in [`fonts/IBM-Plex-OFL.txt`](fonts/IBM-Plex-OFL.txt).
 
 `js/wgpu_fft_web.js` is a build of the browser bindings of
 [wgpuFFT](https://github.com/MaximEremenko/wgpuFFT) (Apache-2.0), with the
